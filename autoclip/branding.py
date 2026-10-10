@@ -18,6 +18,7 @@ class BrandSettings(BaseModel):
     account: str = "爱大片儿"
     enabled: bool = True
     watermark: Path
+    watermarks: list[Path] = Field(default_factory=list)
     watermark_width: float = Field(default=.27, ge=.1, le=.4)
     watermark_opacity: float = Field(default=.88, ge=.2, le=1)
     cover: bool = True
@@ -31,7 +32,13 @@ class BrandSettings(BaseModel):
         for field in ("watermark", "font"):
             if values.get(field):
                 values[field] = (path.resolve().parent / values[field]).resolve()
+        values["watermarks"] = [(path.resolve().parent / p).resolve() for p in values.get("watermarks", [])]
         return cls(**values)
+
+    def for_clip(self, index: int):
+        if not self.watermarks:
+            return self
+        return self.model_copy(update={"watermark": self.watermarks[index % len(self.watermarks)], "watermarks": []})
 
 
 def font_path(brand: BrandSettings) -> Path:
@@ -162,6 +169,7 @@ def package_clip(source: Path, root: Path, manifest: dict, index: int, series: s
     if not brand.enabled:
         base = manifest.get("base_manifest")
         return read_json(Path(base)) if base else manifest
+    brand = brand.for_clip(index)
     if manifest.get("base_manifest"):
         manifest = read_json(Path(manifest["base_manifest"]))
     clean = Path(manifest["video"])

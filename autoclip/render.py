@@ -9,10 +9,11 @@ from rich.console import Console
 from .config import Settings
 from .llm import LLM
 from .models import Clip, Line
+from .repair import voice_fits
 from .util import digest, duration, probe, run, timestamp, write_json
 
 console = Console()
-VERSION = "render-3"
+VERSION = "render-5"
 
 
 def synthesize(text: str, folder: Path, cfg: Settings):
@@ -67,6 +68,11 @@ def subtitle_chunks(text: str, limit=17):
         part = part.strip()
         result.extend(part[i:i+limit] for i in range(0,len(part),limit))
     return result or [text]
+
+
+def subtitle_display(text: str) -> str:
+    """Keep TTS punctuation for prosody, omit trailing marks from visible captions."""
+    return re.sub(r'[\s，。！？；：、,.!?;:…—]+([”’」』）)]*)$', r'\1', text.strip())
 
 
 def voice_captions(text: str, voice: Path, voice_seconds: float):
@@ -137,13 +143,14 @@ def fit_narration(beat, root, cfg, llm, lines):
         voice = synthesize(text, root, cfg)
         length = duration(voice)
         ratio = (length + .35) / available
-        if .72 <= ratio <= 1.28:
+        if voice_fits(length + .35, available, cfg):
             return text, voice, length
         if attempt < 2:
-            desired = max(15, round(len(text) * available / (length+.35)))
+            desired = max(6, round(len(text) * max(.5, available-.35) / length * .92))
             evidence = [s.model_dump() for s in lines if s.id in beat.evidence_ids]
             revision = llm.json("你是解说口播编辑。只调整表达长度，不增添人物、数字、剧情、因果或观点。只输出JSON。",
-                f"原稿：{text}\n原稿实际配音 {length:.1f} 秒，可用画面 {available:.1f} 秒。将口播改为约{desired}字，保持原意与节奏。"
+                f"原稿：{text}\n原稿实际配音 {length:.1f} 秒，可用画面 {available:.1f} 秒。将口播改为约{desired}字，最多{desired+2}字，保持核心意思与必要限定。"
+                "删去重复复述和修饰语，不要照抄超时句子；不能把推测改成事实。"
                 f"证据：{json.dumps(evidence,ensure_ascii=False)}。返回 {{\"text\":\"调整后的全文\"}}。")
             text = revision["text"].strip()
     raise ValueError(f"配音与画面时长无法匹配：{available:.1f} 秒画面 / {length:.1f} 秒配音")
@@ -178,7 +185,9 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
             target_length = voice_seconds + .35
             rows, alignment = voice_captions(text, voice, voice_seconds)
             for a,b,body in rows:
-                captions.append((cursor+a, cursor+b, body, "narration"))
+                body = subtitle_display(body)
+                if body:
+                    captions.append((cursor+a, cursor+b, body, "narration"))
         else:
             # Do not duplicate the source's burned-in subtitles. Only label the audio mode.
             captions.append((cursor, cursor+target_length, "听这句原声", "original"))
@@ -243,7 +252,7 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
         raise ValueError("成片音视频或总时长校验失败")
     # The target is a preference, not an exact cut-off. At the default 100s,
     # deliver the requested 1–3 minute format while retaining complete dialogue.
-    if not cfg.target_seconds * .6 <= final_seconds <= cfg.target_seconds * 1.8:
+    if not (cfg.min_seconds or cfg.target_seconds * .6) <= final_seconds <= (cfg.max_seconds or cfg.target_seconds * 1.8):
         raise ValueError(f"成片时长{final_seconds:.1f}秒偏离目标{cfg.target_seconds}秒，保留中间文件供检查")
     # Decode entire deliverable, detecting corrupt packets rather than trusting only metadata.
     run(["ffmpeg", "-v", "error", "-xerror", "-i", partial, "-f", "null", "-"])

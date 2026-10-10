@@ -3,7 +3,7 @@ import platform
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Settings(BaseModel):
@@ -11,6 +11,8 @@ class Settings(BaseModel):
     style: str = "auto"
     clips: int = Field(default=2, ge=0, le=10)
     target_seconds: int = Field(default=100, ge=45, le=240)
+    min_seconds: float | None = Field(default=None, ge=30)
+    max_seconds: float | None = Field(default=None, le=600)
     portrait: bool = True
     vision: bool = True
     asr_backend: str = "mlx" if platform.system() == "Darwin" and platform.machine() == "arm64" else "faster"
@@ -25,6 +27,15 @@ class Settings(BaseModel):
     llm_model: str = "deepseek-flash"
     llm_base_url: str = "https://api.deepseek.com"
     max_api_calls: int = 100
+    repair_attempts: int = Field(default=3, ge=0, le=5)
+
+    @model_validator(mode="after")
+    def duration_range(self):
+        if self.min_seconds is not None and self.min_seconds > self.target_seconds:
+            raise ValueError("min_seconds不能超过target_seconds")
+        if self.max_seconds is not None and self.max_seconds < self.target_seconds:
+            raise ValueError("max_seconds不能低于target_seconds")
+        return self
 
     @classmethod
     def load(cls, path: Path | None = None):

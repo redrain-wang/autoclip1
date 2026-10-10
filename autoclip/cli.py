@@ -18,6 +18,72 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm"}
 
 
 @app.command()
+def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目录；省略则读取本地.env")] = None,
+            config: Path = Path("configs.production.toml"), max_new: int = 3,
+            stage: str = "all", output: Path | None = None):
+    """独立生成更长的新片，自动选题、审查、配音、包装和导出，保留旧成片。"""
+    import os
+    from dotenv import load_dotenv
+    from .branding import BrandSettings, font_path
+    from .production import produce_episode
+    from .deliver import export_finished
+    if stage not in {"all", "scout", "plan"} or not 1 <= max_new <= 6:
+        raise typer.BadParameter("stage=all/scout/plan，max-new=1–6")
+    base=config.resolve().parent
+    load_dotenv(base/".env")
+    cfg=Settings.load(config)
+    cfg.output=(output or base/cfg.output).resolve()
+    history=base/"output"
+    if cfg.output==history or cfg.output in history.parents:
+        raise typer.BadParameter("新片必须使用独立目录，不能覆盖旧output目录")
+    if source is None:
+        source=Path(os.getenv("AUTOCLIP_SOURCE_DIR", "videos/雍正王朝"))
+        if not source.is_absolute():
+            source=base/source
+    source=source.resolve()
+    if not source.exists():
+        raise typer.BadParameter("素材路径不存在，请在.env设置AUTOCLIP_SOURCE_DIR或传入素材路径")
+    brand=BrandSettings.load(base/"branding.toml")
+    if not all(shutil.which(x) for x in ("ffmpeg","ffprobe")):
+        raise typer.BadParameter("请安装FFmpeg和ffprobe后重试")
+    cfg.api_key()
+    if brand.enabled:
+        from .branding import logo_bounds
+        for logo in brand.watermarks or [brand.watermark]:
+            logo_bounds(logo)
+    if brand.enabled and brand.cover:
+        font_path(brand)
+    paths=[source] if source.is_file() else sorted((p for p in source.rglob("*") if p.suffix.lower() in VIDEO_EXTENSIONS),
+        key=lambda p:[int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)",str(p))])
+    if not paths:
+        raise typer.BadParameter("素材目录没有视频")
+    cfg.output.mkdir(parents=True,exist_ok=True)
+    outcomes=[]
+    for video in paths:
+        console.rule(f"增量生产 {video.name}")
+        try:
+            outcomes.append(produce_episode(video,cfg,brand,history,max_new,stage))
+        except Exception as ex:
+            outcomes.append({"source":str(video),"status":"failed","error":str(ex)[:2000]})
+            console.print(f"{video.name} 失败：{str(ex)[:1500]}",markup=False)
+        write_json(cfg.output/"batch.json",outcomes)
+        if stage=="all":
+            latest=outcomes[-1]
+            console.print(f"{video.name}：成片 {latest.get('clips',0)} 条，候选淘汰 {len(latest.get('rejected',[]))} 条，"
+                          f"运行故障 {len(latest.get('failures',[])) + (latest.get('status')=='failed')} 项",markup=False)
+            if not latest.get("clips"):
+                for issue in latest.get("rejected",[]) + latest.get("failures",[]):
+                    console.print(f"  {issue['title']}：{issue['error'].splitlines()[0][:240]}",markup=False)
+    if stage=="all" and any(row.get("clips",0)>0 or row.get("status")=="completed" for row in outcomes):
+        export_finished(cfg.output)
+    console.print(f"新片浏览页：{build_report(cfg.output)}")
+    if stage=="all" and not any(row.get("clips",0) for row in outcomes):
+        console.print("本批未生成成片；详细原因已保存到 batch.json。处理结束不代表候选已通过。",markup=False)
+    if any(row["status"] in {"failed","partial"} for row in outcomes):
+        raise typer.Exit(1)
+
+
+@app.command()
 def doctor(config: Path = Path("configs.yongzheng.toml")):
     """检查本地工具和配置，不输出密钥，也不发起收费请求。"""
     cfg = Settings.load(config)

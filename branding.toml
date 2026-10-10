@@ -1,6 +1,7 @@
 account = "爱大片儿"
 enabled = true
 watermark = "assets/brand/爱大片儿-透明水印.png"
+watermarks = ["assets/brand/爱大片儿-透明水印.png", "assets/brand/爱大片儿-朱红白水印.png"]
 # Relative to the width of the finished video; 720px → 194px.
 watermark_width = 0.27
 watermark_opacity = 0.88

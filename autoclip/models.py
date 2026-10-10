@@ -40,7 +40,7 @@ class Clip(BaseModel):
     title: str = Field(min_length=2, max_length=32)
     angle: str
     hook: str
-    beats: list[Beat] = Field(min_length=4, max_length=18)
+    beats: list[Beat] = Field(min_length=4, max_length=24)
 
 
 class Plan(BaseModel):
@@ -50,16 +50,17 @@ class Plan(BaseModel):
     clips: list[Clip] = Field(min_length=0, max_length=10)
 
 
-def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: int, target: int):
+def evidence_matches(line, beat, context):
+    overlap = line.start < beat.end and line.end > beat.start
+    preceding = beat.mode == "narration" and 0 <= beat.start-line.end <= 15
+    recap = beat.mode == "narration" and line.id in context and line.end <= beat.start
+    return overlap or preceding or recap
+
+
+def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: int, target: int,
+                  min_seconds: float | None = None, max_seconds: float | None = None):
     errors = []
     lookup = {s.id: s for s in lines}
-    def nearby_evidence(line, beat, context):
-        overlap = line.start < beat.end and line.end > beat.start
-        # Commentary often explains the immediately preceding original line over
-        # a reaction shot. This is legitimate context, not a fabricated quote.
-        preceding = beat.mode == "narration" and 0 <= beat.start-line.end <= 15
-        recap = beat.mode == "narration" and line.id in context and line.end <= beat.start
-        return overlap or preceding or recap
     if count == 0 and len(plan.clips) > 6:
         errors.append("自动选题模式每集最多6条，避免重复和低质量凑数")
     elif count != 0 and len(plan.clips) != count:
@@ -78,9 +79,9 @@ def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: 
             previous_end = beat.end
             if any(s not in lookup for s in beat.evidence_ids):
                 errors.append(f"{label} 引用了不存在的字幕 ID")
-            elif not any(nearby_evidence(lookup[s],beat,context) for s in beat.evidence_ids):
+            elif not any(evidence_matches(lookup[s],beat,context) for s in beat.evidence_ids):
                 errors.append(f"{label} 没有落在画面区间内的字幕证据")
-            elif not any(lookup[s].confidence >= .4 and nearby_evidence(lookup[s],beat,context) for s in beat.evidence_ids):
+            elif not any(lookup[s].confidence >= .4 and evidence_matches(lookup[s],beat,context) for s in beat.evidence_ids):
                 errors.append(f"{label} 只有低置信度识别，不能据此写稿")
             context.update(s for s in beat.evidence_ids if s in lookup and lookup[s].start < beat.end and lookup[s].end > beat.start)
             if beat.mode == "original":
@@ -95,7 +96,7 @@ def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: 
         # Character-count timing is only a rough estimate; Chinese TTS and
         # punctuation vary considerably. Enforce the tighter limit after actual
         # synthesis rather than rejecting a valid story before measuring it.
-        if not target * 0.5 <= estimated <= target * 1.8:
+        if not (min_seconds * .9 if min_seconds else target * .5) <= estimated <= (max_seconds or target * 1.8):
             errors.append(f"clips[{i}] 预计时长 {estimated:.0f} 秒不在目标范围内")
     for i, a in enumerate(plan.clips):
         for b in plan.clips[i + 1:]:
