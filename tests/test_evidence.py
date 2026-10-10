@@ -93,3 +93,31 @@ def test_service_failure_is_recorded_as_failure(tmp_path, monkeypatch):
     assert data["status"] == "failed"
     assert data["rows"] == []
     assert closed == [True]
+
+
+def test_late_subtitle_gets_one_bounded_extra_sample(tmp_path, monkeypatch):
+    import autoclip.evidence as module
+    source, transcript = tmp_path/"source.mp4", tmp_path/"transcript.json"
+    source.write_bytes(b"fake-video")
+    transcript.write_text(json.dumps([dict(id=3, start=10, end=12, text="大人请坐")]))
+    calls = []
+
+    class LateCaptionLLM:
+        def __init__(self, *args):
+            self.client = SimpleNamespace(close=lambda: None)
+        def json(self, *args, **kwargs):
+            calls.append(1)
+            return {"readable": False, "text": ""} if len(calls) == 1 else {"readable": True, "text": "大人请坐"}
+        def usage(self):
+            return {"calls_this_run": len(calls)}
+
+    monkeypatch.setattr(module, "LLM", LateCaptionLLM)
+    monkeypatch.setattr(module, "run", lambda args: Path(args[-1]).write_bytes(b"jpg"))
+    data = json.loads(inspect_subtitles(source, transcript, [3], tmp_path/"report", Settings()).read_text())
+    assert len(calls) == 3
+    assert data["rows"][0]["status"] == "confirmed"
+    assert [r["time"] for r in data["rows"][0]["frames"]] == [10.7, 11.3, 11.7]
+
+
+def test_extra_agreement_cannot_outvote_conflicting_visible_text():
+    assert assess("大人请坐", readings("大人请坐") + [{"readable": True, "text": "大人快走"}])["status"] == "unresolved"

@@ -11,7 +11,7 @@ from .llm import LLM
 from .models import Line
 from .util import digest, read_json, run, source_identity, write_json
 
-VERSION = "subtitle-evidence-1"
+VERSION = "subtitle-evidence-3"
 
 
 def normalize(text: str) -> str:
@@ -19,26 +19,32 @@ def normalize(text: str) -> str:
                    if not c.isspace() and not unicodedata.category(c).startswith(("P", "Z")))
 
 
+def consensus(readings: list[dict]) -> str | None:
+    if len(readings) < 2 or any(not isinstance(r, dict) or type(r.get("readable")) is not bool
+                                or not isinstance(r.get("text"), str) for r in readings):
+        return None
+    texts = [normalize(r["text"]) for r in readings if r["readable"]]
+    return texts[0] if len(texts) >= 2 and len(texts[0]) >= 2 and len(set(texts)) == 1 else None
+
+
 def assess(original: str, readings: list[dict]) -> dict:
     """Agreement is a proposal, not a semantic or speaker verification."""
     result = {"status": "unresolved", "proposed_text": None}
-    if len(readings) != 2 or any(not isinstance(r, dict) or r.get("readable") is not True
-                                or not isinstance(r.get("text"), str) for r in readings):
-        return {**result, "reason": "画面不可读或模型返回格式不合要求"}
-    texts = [normalize(r["text"]) for r in readings]
-    if min(map(len, texts)) < 2 or texts[0] != texts[1]:
+    target = consensus(readings)
+    if target is None:
         return {**result, "reason": "两帧读数不一致或有效文字不足"}
-    similarity = SequenceMatcher(None, normalize(original), texts[0]).ratio()
+    similarity = SequenceMatcher(None, normalize(original), target).ratio()
     if similarity < .55:
         return {**result, "similarity": similarity, "reason": "画面与语音识别差异过大，可能未对齐"}
-    if normalize(original) == texts[0]:
+    if normalize(original) == target:
         return {"status": "confirmed", "proposed_text": None, "similarity": similarity,
                 "reason": "两帧可见字幕与原识别一致（忽略标点及空白）"}
-    return {"status": "proposed_correction", "proposed_text": readings[0]["text"].strip(),
+    return {"status": "proposed_correction", "proposed_text": target,
             "similarity": similarity, "reason": "两帧读数一致，保留纠错建议；尚未自动应用"}
 
 
-def inspect_subtitles(source: Path, transcript: Path, ids: list[int], output: Path, settings: Settings) -> Path:
+def inspect_subtitles(source: Path, transcript: Path, ids: list[int], output: Path, settings: Settings,
+                      neighbors: bool = False) -> Path:
     # Validate all input before any paid calls. IDs are scoped to this transcript.
     lines = [Line.model_validate(row) for row in read_json(transcript)]
     lookup = {line.id: line for line in lines}
@@ -46,11 +52,22 @@ def inspect_subtitles(source: Path, transcript: Path, ids: list[int], output: Pa
         raise ValueError("字幕ID重复，无法确定证据来源")
     if not ids or any(i not in lookup for i in ids):
         raise ValueError("请提供存在于该字幕文件的ID")
-    selected = [lookup[i] for i in dict.fromkeys(ids)]
+    selected_ids = set(ids)
+    if neighbors:
+        ordered = sorted(lines, key=lambda s: (s.start, s.end, s.id))
+        for index, line in enumerate(ordered):
+            if line.id not in ids:
+                continue
+            if index and 0 <= line.start-ordered[index-1].end <= 1.5:
+                selected_ids.add(ordered[index-1].id)
+            if index+1 < len(ordered) and 0 <= ordered[index+1].start-line.end <= 1.5:
+                selected_ids.add(ordered[index+1].id)
+    selected = sorted((lookup[i] for i in selected_ids), key=lambda s: (s.start, s.end, s.id))
     identity = source_identity(source)
     transcript_hash = hashlib.sha256(transcript.read_bytes()).hexdigest()
     fingerprint = {"version": VERSION, "source": identity, "transcript_sha256": transcript_hash,
                    "ids": [line.id for line in selected], "model": settings.llm_model,
+                   "raw_lines_digest": digest([s.model_dump() for s in lines]),
                    "endpoint": settings.llm_base_url}
     root = output.resolve() / digest(fingerprint)
     # Never replace an input file, even when the caller chose a poor output path.
@@ -65,7 +82,7 @@ def inspect_subtitles(source: Path, transcript: Path, ids: list[int], output: Pa
     try:
         for line in selected:
             frames, readings = [], []
-            for position in (.35, .65):
+            def read_frame(position):
                 at = round(line.start + (line.end-line.start)*position, 3)
                 frame = root / "frames" / f"{line.id}-{at:.3f}.jpg"
                 frame.parent.mkdir(parents=True, exist_ok=True)
@@ -82,11 +99,25 @@ def inspect_subtitles(source: Path, transcript: Path, ids: list[int], output: Pa
                     '忽略台标、水印；没有字幕、看不清或被截断则 readable=false，text=""。'
                     '不要纠正图片原字，不解释，不推断说话人。', images=[frame])
                 readings.append(reading)
+            for position in (.35, .65):
+                read_frame(position)
+            valid = [r for r in readings if isinstance(r, dict) and r.get("readable") is True
+                     and isinstance(r.get("text"), str) and normalize(r["text"])]
+            if len(valid) == 1:
+                # A subtitle can appear after speech begins; one bounded later
+                # sample may supply the second independent frame observation.
+                read_frame(.85)
+            elif len(valid) == 2 and normalize(valid[0]["text"]) != normalize(valid[1]["text"]):
+                # Test the two visible-caption spans without guessing word times.
+                read_frame(.15)
+                read_frame(.85)
             rows.append({"line": line.model_dump(), "frames": frames, "readings": readings,
                          **assess(line.text, readings)})
             ledger.update(status="running", usage=llm.usage(), counts=dict(Counter(r["status"] for r in rows)))
             write_json(report, ledger)
             print(f"字幕 {line.id}：{rows[-1]['status']}", flush=True)
+        from .alignment import align_rows
+        ledger["alignment"] = align_rows(rows, lines)
         ledger["status"] = "completed"
         write_json(report, ledger)
         return report
@@ -104,6 +135,7 @@ def main():
     parser.add_argument("source", type=Path)
     parser.add_argument("transcript", type=Path)
     parser.add_argument("--ids", required=True, help="逗号分隔的字幕ID")
+    parser.add_argument("--neighbors", action="store_true", help="同时核对间隔不超过1.5秒的前后相邻ASR句")
     parser.add_argument("--output", type=Path, default=Path("output/字幕证据"))
     parser.add_argument("--config", type=Path, default=Path("configs.production.toml"))
     args = parser.parse_args()
@@ -111,7 +143,7 @@ def main():
     load_dotenv(args.config.resolve().parent / ".env")
     report = inspect_subtitles(args.source.resolve(), args.transcript.resolve(),
                                [int(i.strip()) for i in args.ids.split(",")],
-                               args.output, Settings.load(args.config))
+                               args.output, Settings.load(args.config), neighbors=args.neighbors)
     print(f"证据报告：{report}")
 
 

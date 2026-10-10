@@ -185,7 +185,8 @@ reason解释新的看点、与旧片的区别以及为什么足以撑起长视�
     return selected
 
 
-def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: Path, maximum=3, stage="all"):
+def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: Path, maximum=3, stage="all",
+                    subtitle_layer: Path | None = None):
     identity=source_identity(video)
     root=cfg.output/(video.stem+"-"+digest(identity)[:8])
     root.mkdir(parents=True,exist_ok=True)
@@ -209,6 +210,14 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
         if any(s.end>seconds+1 for s in lines):
             raise ValueError("字幕时间超出原片，请检查外挂字幕是否匹配此版本")
         save_transcript(lines,root)
+        evidence_input = {"layer": None, "applied_ids": []}
+        if subtitle_layer is not None:
+            from .corrections import apply_layer
+            lines, evidence_input = apply_layer(video, lines, subtitle_layer)
+        # Raw transcript stays immutable evidence; only downstream prompts use
+        # these effective lines, whose contents already form cache signatures.
+        write_json(root/"transcript.effective.json", [s.model_dump() for s in lines])
+        write_json(root/"transcript-input.json", evidence_input)
         llm=LLM(cfg,root)
         maps=analyze(video,root,lines,seconds,cfg,llm)
         selection=select_stories(root,lines,maps,seconds,existing,cfg,llm,maximum)

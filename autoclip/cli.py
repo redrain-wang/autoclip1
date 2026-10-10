@@ -20,7 +20,8 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm"}
 @app.command()
 def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目录；省略则读取本地.env")] = None,
             config: Path = Path("configs.production.toml"), max_new: int = 3,
-            stage: str = "all", output: Path | None = None):
+            stage: str = "all", output: Path | None = None,
+            subtitle_layer: Path | None = typer.Option(None, help="单个素材使用的字幕纠错层；默认关闭")):
     """独立生成更长的新片，自动选题、审查、配音、包装和导出，保留旧成片。"""
     import os
     from dotenv import load_dotenv
@@ -43,6 +44,10 @@ def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目
     source=source.resolve()
     if not source.exists():
         raise typer.BadParameter("素材路径不存在，请在.env设置AUTOCLIP_SOURCE_DIR或传入素材路径")
+    if subtitle_layer is not None:
+        if not source.is_file() or not subtitle_layer.is_file():
+            raise typer.BadParameter("字幕纠错层只支持单个素材文件，且纠错层文件必须存在")
+        subtitle_layer = subtitle_layer.resolve()
     brand=BrandSettings.load(base/"branding.toml")
     if not all(shutil.which(x) for x in ("ffmpeg","ffprobe")):
         raise typer.BadParameter("请安装FFmpeg和ffprobe后重试")
@@ -62,7 +67,7 @@ def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目
     for video in paths:
         console.rule(f"增量生产 {video.name}")
         try:
-            outcomes.append(produce_episode(video,cfg,brand,history,max_new,stage))
+            outcomes.append(produce_episode(video,cfg,brand,history,max_new,stage,subtitle_layer=subtitle_layer))
         except Exception as ex:
             outcomes.append({"source":str(video),"status":"failed","error":str(ex)[:2000]})
             console.print(f"{video.name} 失败：{str(ex)[:1500]}",markup=False)

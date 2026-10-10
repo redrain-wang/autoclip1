@@ -154,7 +154,7 @@ cp .env.example .env
 
 方法论、已实现能力和后续生产建议见 [docs/方法论.md](docs/方法论.md)。
 
-字幕识别争议可使用独立的[原片字幕证据核对工具](docs/字幕证据核对.md)，保留截图和纠错依据；目前不自动覆盖生产字幕。长期任务与本轮验收结果持续维护在[迭代计划](docs/迭代计划.md)。
+字幕识别争议可使用[原片字幕证据核对工具](docs/字幕证据核对.md)，保留截图与时间对齐依据；v1.1新增可撤销纠错层，通过`produce --subtitle-layer`启用，不覆盖原始字幕或已有影片。长期任务与本轮验收结果持续维护在[迭代计划](docs/迭代计划.md)，版本变化见[更新记录](CHANGELOG.md)。
 
 接口依据：[DeepSeek图片输入](https://api-docs.deepseek.com/guides/vision/)、[DeepSeek模型](https://api-docs.deepseek.com/)、[MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper)、[Edge TTS](https://github.com/rany2/edge-tts)、[OpenCode Go](https://docs.opencode.ai/docs/go/)。
 
