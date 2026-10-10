@@ -1,0 +1,15 @@
+series = "雍正王朝"
+style = "历史权谋：分析人物动机、制度困境和普通人的共鸣，克制幽默，不强行玩梗"
+# 2 means two requested clips, not that only two highlights exist. Use 0 for auto (0–6).
+clips = 2
+target_seconds = 100
+portrait = true
+vision = true
+asr_backend = "mlx"
+asr_model = "mlx-community/whisper-large-v3-turbo"
+asr_prompt = "雍正王朝。康熙，胤禛，胤祥，胤禩，胤礽，李卫，田文镜，邬思道，年羹尧，张廷玉，索额图，佟国维，黄河，赈灾，户部。简体中文对白。"
+tts = "edge"
+voice = "zh-CN-YunxiNeural"
+tts_rate = "+8%"
+output = "output"
+max_api_calls = 100

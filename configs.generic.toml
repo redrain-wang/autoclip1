@@ -1,0 +1,15 @@
+series = "影视解说"
+style = "auto"
+# 0: choose 0–6 complete stories by quality; a positive value requests that count.
+clips = 2
+target_seconds = 100
+portrait = true
+vision = true
+asr_backend = "mlx"
+asr_model = "mlx-community/whisper-large-v3-turbo"
+asr_prompt = "以下是中文影视剧对白，使用简体中文。"
+tts = "edge"
+voice = "zh-CN-YunxiNeural"
+tts_rate = "+8%"
+output = "output"
+max_api_calls = 100
