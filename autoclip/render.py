@@ -157,6 +157,8 @@ def fit_narration(beat, root, cfg, llm, lines):
 
 
 def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, llm: LLM, lines: list[Line]):
+    from .identity import enforce_identity
+    enforce_identity(video, root, clip, cfg, llm, lines)
     key = digest({"version": VERSION, "clip": clip.model_dump(), "cfg": cfg.model_dump(mode="json")})
     folder = root / "renders" / f"{index+1:02}-{key}"
     folder.mkdir(parents=True, exist_ok=True)
@@ -166,6 +168,16 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
         from .util import read_json
         manifest = read_json(manifest_path)
         if abs(duration(final) - manifest["duration"]) < .3:
+            # Cached audio may contain a shortened version of the original plan.
+            # Recheck the actual spoken text when identity references change.
+            if cfg.identity_gate:
+                cached_timeline = manifest.get("timeline", [])
+                if len(cached_timeline) != len(clip.beats):
+                    raise ValueError("缓存成片缺少完整口播时间线，无法复核人物归属")
+                actual_clip = clip.model_copy(deep=True)
+                for beat, item in zip(actual_clip.beats, cached_timeline):
+                    beat.text = item["text"]
+                enforce_identity(video, root, actual_clip, cfg, llm, lines)
             if not manifest.get("poster") or not Path(manifest["poster"]).exists():
                 poster = folder / "poster.jpg"
                 run(["ffmpeg", "-v", "error", "-y", "-ss", "2", "-i", final, "-frames:v", "1", "-q:v", "2", poster])
@@ -231,6 +243,10 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
         write_json(folder / "voice-revision-review.json", check)
         if check.get("passed") is not True or check.get("issues") != []:
             raise ValueError("配音时长调整后的文案事实审核失败：" + str(check.get("issues")))
+        actual_clip = clip.model_copy(deep=True)
+        for beat, item in zip(actual_clip.beats, timeline):
+            beat.text = item["text"]
+        enforce_identity(video, root, actual_clip, cfg, llm, lines)
     ass = folder / "subtitles.ass"
     write_ass(ass, clip.title, cfg.series, cursor, captions, cfg.portrait)
     srt = folder / "subtitles.srt"

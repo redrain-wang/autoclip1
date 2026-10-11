@@ -19,6 +19,8 @@ class Settings(BaseModel):
     portrait: bool = True
     vision: bool = True
     research_before_produce: bool = False
+    identity_gate: bool = False
+    identity_registry: Path | None = None
     asr_backend: str = "mlx" if platform.system() == "Darwin" and platform.machine() == "arm64" else "faster"
     asr_model: str = "mlx-community/whisper-large-v3-turbo"
     asr_prompt: str = "以下是中文影视剧对白，使用简体中文。"
@@ -35,6 +37,8 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def duration_range(self):
+        if self.identity_gate and not self.vision:
+            raise ValueError("人物归属检查需要vision=true")
         if self.min_seconds is not None and self.min_seconds > self.target_seconds:
             raise ValueError("min_seconds不能超过target_seconds")
         if self.max_seconds is not None and self.max_seconds < self.target_seconds:
@@ -46,6 +50,10 @@ class Settings(BaseModel):
         import tomllib
         load_dotenv()
         data = tomllib.loads(path.read_text()) if path else {}
+        registry = os.getenv("AUTOCLIP_IDENTITY_REGISTRY") or data.get("identity_registry")
+        if registry:
+            registry = Path(registry).expanduser()
+            data["identity_registry"] = (path.resolve().parent / registry if path and not registry.is_absolute() else registry).resolve()
         data.setdefault("llm_model", os.getenv("LLM_MODEL", "deepseek-flash"))
         data.setdefault("llm_base_url", os.getenv("LLM_BASE_URL", "https://api.deepseek.com"))
         return cls(**data)

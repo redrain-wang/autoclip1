@@ -17,6 +17,72 @@ console = Console()
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm"}
 
 
+@app.command("compare-scripts")
+def script_comparison(source: Annotated[Path, typer.Argument(help="待研究的原片")],
+                      transcript: Path = typer.Option(...), start: float = typer.Option(...), end: float = typer.Option(...),
+                      config: Path = Path("configs.production.toml"), output: Path = Path("output/文案对比")):
+    """同一故事生成描述版与因果分析版，独立核对人物归属；不制作影片。"""
+    from dotenv import load_dotenv
+    from .models import Line
+    from .llm import LLM
+    from .study import compare_scripts
+    from .util import duration
+    load_dotenv(config.resolve().parent / ".env")
+    cfg = Settings.load(config)
+    marker = transcript.parent / "source.json"
+    if not marker.exists() or read_json(marker) != source_identity(source):
+        raise typer.BadParameter("字幕与原片身份不匹配")
+    if not 0 <= start < end <= duration(source) or end-start > 1100:
+        raise typer.BadParameter("研究范围须位于原片内，最长1100秒")
+    lines = [Line.model_validate(row) for row in read_json(transcript)]
+    output.mkdir(parents=True, exist_ok=True)
+    llm = LLM(cfg, output)
+    try:
+        result = compare_scripts(source, output, lines, start, end, cfg, llm)
+        console.print(f"两版文案：{output / '两版解说稿.md'}。当前不是可渲染时间线。", markup=False)
+        write_json(output / "usage.json", llm.usage())
+    finally:
+        llm.client.close()
+    if not all(v["passed"] for v in result["versions"].values()):
+        raise typer.Exit(1)
+
+
+@app.command("identity-audit")
+def identity_audit(source: Annotated[Path, typer.Argument(help="核对行为归属的原片")],
+                   plan: Path = typer.Option(..., help="待核稿件Plan JSON，不改动原文件"),
+                   transcript: Path = typer.Option(..., help="与原片匹配的transcript.json"),
+                   config: Path = Path("configs.production.toml"), anchors: Path | None = None,
+                   output: Path = Path("output/人物归属复核")):
+    """独立核对标题、观点与逐段口播的行为归属；不渲染、不修改旧片。"""
+    from dotenv import load_dotenv
+    from .identity import audit_identity
+    from .llm import LLM
+    from .models import Line, Plan
+    load_dotenv(config.resolve().parent / ".env")
+    cfg = Settings.load(config)
+    if anchors is not None:
+        cfg.identity_registry = anchors.resolve()
+    data = Plan.model_validate(read_json(plan))
+    lines = [Line.model_validate(row) for row in read_json(transcript)]
+    # Refuse a transcript copied from a different version of the episode.
+    marker = transcript.parent / "source.json"
+    if not marker.exists() or read_json(marker) != source_identity(source):
+        raise typer.BadParameter("字幕所在目录需有与原片匹配的source.json")
+    output.mkdir(parents=True, exist_ok=True)
+    llm = LLM(cfg, output)
+    passed = bool(data.clips)
+    try:
+        for i, clip in enumerate(data.clips):
+            record = audit_identity(source, output / f"clip-{i+1}", clip, cfg, llm, lines)
+            passed = passed and record["passed"]
+            console.print(f"{clip.title}：{'通过' if record['passed'] else '拒绝或待核实'}", markup=False)
+        write_json(output / "usage.json", llm.usage())
+    finally:
+        llm.client.close()
+    if not passed:
+        raise typer.Exit(1)
+
+
 @app.command()
 def research(source: Annotated[Path, typer.Argument(help="先整理剧情资料的素材文件或目录")],
              config: Path = Path("configs.production.toml"), output: Path = Path("output/剧情资料")):

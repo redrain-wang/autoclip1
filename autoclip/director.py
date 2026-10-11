@@ -195,6 +195,9 @@ def create_plan(video: Path, root: Path, lines: list[Line], seconds: float, maps
     if cache.exists():
         plan = correct_spelling(Plan.model_validate(read_json(cache)), root)
         check(plan)
+        from .identity import enforce_identity
+        for clip in plan.clips:
+            enforce_identity(video, root, clip, cfg, llm, lines)
         return plan
     system = """你是专业中文影视短视频编导。任务是写有观点、好听、剧情连贯的解说并给出可执行时间线。
 只根据给出的原片字幕和画面事实，不许凭作品记忆造剧情。将解释写成对行为的分析，不把猜测动机当成明示事实。
@@ -233,6 +236,12 @@ evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间�
 身份不足时避开依赖该身份的论点；换成泛称也不能掩盖谁提出、谁执行的混淆。"""
     if bounds:
         prompt += f"\n硬边界：所有镜头仅限{bounds[0]}–{bounds[1]}秒。最后15秒要在原声和总结之间分配，不能原声播完之后再追加画面。"
+        if cfg.identity_gate:
+            from .identity import scene_identity
+            scene = scene_identity(video, root, lines, bounds[0], bounds[1], cfg, llm)
+            names = {a['id']: a['name'] for a in scene['anchors']}
+            turns = [{**t, 'speaker_name': names.get(t['anchor_id'], '待核实')} for t in scene['turns']]
+            prompt += "\n写稿前的独立场景人物核对（未看稿件，仍有模型判断局限；unknown不得猜）：" + json.dumps(turns,ensure_ascii=False)
         from .budget import story_budget
         budget = story_budget(lines, bounds, cfg, repair)
         write_json(root / f"timing-budget-{signature}.json", budget)
@@ -353,7 +362,10 @@ evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间�
                     raise ValueError("独立审核未能解决争议：" + str(previous_issues))
             else:
                 raise ValueError("独立审核修订后仍未通过：" + str(previous_issues))
-    write_json(cache, plan.model_dump())
     plan = correct_spelling(plan, root)
     check(plan)
+    from .identity import enforce_identity
+    for clip in plan.clips:
+        enforce_identity(video, root, clip, cfg, llm, lines)
+    write_json(cache, plan.model_dump())
     return plan
