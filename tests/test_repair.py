@@ -148,3 +148,145 @@ def test_repair_evidence_candidates_exclude_future_speech_and_do_not_change_ids(
     assert detail['cited_lines'][0]['id']==99
     assert raw['beats'][2]['evidence_ids']==[99]
     assert report['outro_budget']['end']==35
+
+
+def near_minimum_clip():
+    return Clip(title="局部扩写", angle="依据", hook="冲突", beats=[
+        Beat(mode="narration", start=0, end=20, text="已有的必要解释", evidence_ids=[0], reason="依据"),
+        Beat(mode="original", start=20, end=60, evidence_ids=[1], reason="原声"),
+        Beat(mode="original", start=60, end=100, evidence_ids=[2], reason="原声"),
+        Beat(mode="original", start=100, end=140, evidence_ids=[3], reason="原声"),
+        Beat(mode="narration", start=140, end=148, text="结尾解释", evidence_ids=[4], reason="依据"),
+    ])
+
+
+def expansion_setup(monkeypatch, tmp_path, expanded_seconds=21.65):
+    from autoclip import render, util
+    clip = near_minimum_clip()
+    cfg = Settings(target_seconds=190, min_seconds=150, max_seconds=240, vision=False)
+    monkeypatch.setattr(render, "synthesize", lambda text, *args: text)
+    monkeypatch.setattr(util, "duration", lambda text: 18.65 if text == clip.beats[0].text
+                        else 6.65 if text == clip.beats[-1].text else expanded_seconds)
+    return clip, cfg
+
+
+@pytest.mark.parametrize("passed", [True, False])
+def test_small_shortfall_expands_text_only_after_measured_and_semantic_checks(tmp_path, monkeypatch, passed):
+    clip, cfg = expansion_setup(monkeypatch, tmp_path, 24.65)
+    before = clip.model_dump()
+    class Editor:
+        calls = 0
+        def json(self, system, prompt, images=None):
+            self.calls += 1
+            if self.calls == 1:
+                return {"changes": [{"beat": 0, "text": "已有的必要解释，加上有依据的冲突缘由", "reason": "依据零号字幕补充原因"}]}
+            return {"passed": passed, "issues": [] if passed else ["无依据"]}
+    editor = Editor()
+    if passed:
+        revised = prepare_voice(clip, tmp_path, cfg, editor, [], 0)
+        assert revised.beats[1:] == clip.beats[1:]
+        changed = revised.model_dump()
+        changed['beats'][0]['text'] = before['beats'][0]['text']
+        assert changed == before
+        assert (tmp_path / 'voice-preflight-0-expanded.json').exists()
+    else:
+        with pytest.raises(RepairNeeded) as error:
+            prepare_voice(clip, tmp_path, cfg, editor, [], 0)
+        assert error.value.report['stage'] == 'voice_semantic'
+    assert editor.calls == 2
+    assert clip.model_dump() == before
+
+
+@pytest.mark.parametrize("length,code", [(19.65, "duration_short"), (30, "voice_alignment")])
+def test_expansion_rejects_bad_actual_tts_before_semantic_call(tmp_path, monkeypatch, length, code):
+    clip, cfg = expansion_setup(monkeypatch, tmp_path, length)
+    class Editor:
+        calls = 0
+        def json(self, *args):
+            self.calls += 1
+            assert self.calls == 1
+            return {"changes": [{"beat": 0, "text": "已有的必要解释，更多但未通过时长检查", "reason": "依据"}]}
+    with pytest.raises(RepairNeeded) as error:
+        prepare_voice(clip, tmp_path, cfg, Editor(), [], 0)
+    assert code in {i['code'] for i in error.value.report['issues']}
+
+
+@pytest.mark.parametrize("proposal", [
+    {"declined": True, "reason": "没有必要补充"},
+    {"changes": [{"beat": 1, "text": "不能改变原声", "reason": "依据"}]},
+    {"changes": [{"beat": 0, "text": "已有的必要解释及补充", "reason": "依据", "end": 30}]},
+    {"changes": [{"beat": 0, "text": "已有的必要解释", "reason": "照抄"}]},
+    {"changes": [{"beat": 0, "text": None, "reason": "依据"}]},
+    {"changes": [{"beat": 0, "text": "已有的必要解释，加上补充", "reason": "依据"}] * 2},
+    {"changes": [{"beat": 0, "text": "已有的必要解释，加上补充", "reason": "依据"}] * 3},
+    [],
+])
+def test_expansion_decline_or_invalid_scope_falls_back_without_mutation(tmp_path, monkeypatch, proposal):
+    clip, cfg = expansion_setup(monkeypatch, tmp_path)
+    before = clip.model_dump()
+    class Editor:
+        def json(self, *args):
+            return proposal
+    with pytest.raises(RepairNeeded) as error:
+        prepare_voice(clip, tmp_path, cfg, Editor(), [], 0)
+    assert error.value.report['local_expansion']['status'] == 'declined_or_invalid'
+    assert clip.model_dump() == before
+
+
+@pytest.mark.parametrize("case", ['large_deficit', 'no_slack', 'other_issue'])
+def test_unsuitable_short_scripts_do_not_request_expansion(case):
+    from autoclip.repair import expansion_slots
+    clip = near_minimum_clip()
+    cfg = Settings(target_seconds=190, min_seconds=150, max_seconds=240)
+    report = timing_report(clip, {0: 18.65, 4: 6.65}, cfg)
+    if case == 'large_deficit':
+        report['measured_total_seconds'] = 135
+    elif case == 'no_slack':
+        clip.beats[0].end = 14
+    else:
+        report['issues'].append({'code': 'voice_alignment', 'message': 'too long'})
+    assert expansion_slots(clip, report, cfg) == []
+
+
+def test_expansion_service_failure_is_not_converted_to_editorial_rejection(tmp_path, monkeypatch):
+    clip, cfg = expansion_setup(monkeypatch, tmp_path)
+    class Unavailable:
+        def json(self, *args):
+            raise RuntimeError("模型调用失败，已重试：模型接口 HTTP 503")
+    with pytest.raises(RuntimeError) as error:
+        prepare_voice(clip, tmp_path, cfg, Unavailable(), [], 0)
+    assert not content_rejection(error.value)
+
+
+def test_expansion_can_use_two_slots_but_never_a_third():
+    from autoclip.repair import expansion_slots
+    clip = near_minimum_clip()
+    cfg = Settings(target_seconds=190, min_seconds=150, max_seconds=240)
+    report = timing_report(clip, {0: 18.65, 4: 6.65}, cfg)
+    clip.beats[0].end = 17
+    slots = expansion_slots(clip, report, cfg)
+    assert len(slots) == 2
+    assert sum(s['extra_seconds'] for s in slots) >= 6
+    assert all(s['target_voice_seconds'] + .35 <= s['maximum_output_seconds'] + .001 for s in slots)
+    clip.beats[-1].end = 145.5
+    assert expansion_slots(clip, report, cfg) == []
+
+
+def test_failed_local_shortening_preserves_measured_evidence_for_global_repair(tmp_path, monkeypatch):
+    from autoclip import render, util
+    clip = sample_clip()
+    before = clip.model_dump()
+    cfg = Settings(target_seconds=45, min_seconds=30, max_seconds=60)
+    monkeypatch.setattr(render, 'synthesize', lambda text, *args: text)
+    monkeypatch.setattr(util, 'duration', lambda text: 6.1 if text == clip.beats[0].text else 9.65)
+    def failed(*args):
+        raise ValueError('配音与画面时长无法匹配：3.6 秒画面 / 6.1 秒配音')
+    monkeypatch.setattr(render, 'fit_narration', failed)
+    with pytest.raises(RepairNeeded) as error:
+        prepare_voice(clip, tmp_path, cfg, None, [], 0)
+    report = error.value.report
+    assert report['local_repair']['beat'] == 0
+    assert report['beats'][0]['voice_seconds'] == 6.1
+    assert report['clip'] == before
+    assert report['measured_total_seconds'] == pytest.approx(36.45)
+    assert clip.model_dump() == before
