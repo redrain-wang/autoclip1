@@ -15,6 +15,7 @@ from .pipeline import console
 from .render import render_clip
 from .report import build_report
 from .repair import RepairNeeded, enrich_constraints, prepare_voice, repair_context
+from .research import background_context, prepare_research, research_context, seed_research
 from .util import digest, duration, read_json, source_identity, write_json
 
 
@@ -140,7 +141,8 @@ def completed_stories(root: Path):
 def select_stories(root, lines, maps, seconds, existing, cfg, llm, maximum):
     history = [{"title": c["title"], "angle": c["angle"],
                 "shots": [[b["start"], b["end"]] for b in c["timeline"]]} for c in existing]
-    signature = digest({"version": 3, "lines": [s.model_dump() for s in lines], "maps": maps,
+    signature = digest({"version": 4, "lines": [s.model_dump() for s in lines], "maps": maps,
+                        "background": background_context(cfg.series),
                         "history": history, "maximum": maximum, "target": cfg.target_seconds})
     cache = root / "selections" / f"{signature}.json"
     if cache.exists():
@@ -155,7 +157,8 @@ reason解释新的看点、与旧片的区别以及为什么足以撑起长视�
 输出JSON schema：{json.dumps(Selection.model_json_schema(),ensure_ascii=False)}
 已有成片：{json.dumps(history,ensure_ascii=False)}
 候选分析：{json.dumps(maps,ensure_ascii=False)}
-本集字幕：{compact(lines)}"""
+本集字幕：{compact(lines)}
+{background_context(cfg.series)}"""
     repair = ""
     for attempt in range(3):
         raw = llm.json("你是影视解说选题编辑。根据证据挖掘完整新故事，不虚构，不强行凑数。", prompt+repair)
@@ -235,7 +238,14 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
         write_json(root/"transcript.effective.json", [s.model_dump() for s in lines])
         write_json(root/"transcript-input.json", evidence_input)
         llm=LLM(cfg,root)
+        dossier = None
+        if cfg.research_before_produce:
+            status("整理人物与分集资料（自动初稿）")
+            seed_research(history,identity,root)
+            dossier = prepare_research(video,root,lines,seconds,cfg,llm)
         maps=analyze(video,root,lines,seconds,cfg,llm)
+        if dossier:
+            maps = [*maps, {"research_notes": research_context(dossier)}]
         if retry_rejected_from is None:
             selection=select_stories(root,lines,maps,seconds,existing,cfg,llm,maximum)
         else:
@@ -267,7 +277,10 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
             for attempt in range(cfg.repair_attempts+1):
                 try:
                     local=cfg.model_copy(update={"clips":1,"style":cfg.style+f"。本次唯一选题：{story.title}。角度：{story.angle}。只能剪原片{story.start}–{story.end}秒内的故事。"})
-                    plan=create_plan(video,storyroot,relevant,seconds,[story.model_dump()],local,llm,[],repair=repair,bounds=(story.start,story.end))
+                    story_maps = [story.model_dump()]
+                    if dossier:
+                        story_maps.append({"research_notes": research_context(dossier,story.start,story.end)})
+                    plan=create_plan(video,storyroot,relevant,seconds,story_maps,local,llm,[],repair=repair,bounds=(story.start,story.end))
                     clip=plan.clips[0]
                     check_footage(clip, story, existing+results)
                     write_json(storyroot/"plan.json",plan.model_dump())

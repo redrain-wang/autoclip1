@@ -10,10 +10,11 @@ from .ingest import contact_sheet
 from .llm import LLM
 from .models import Clip, Line, Plan, validate_plan
 from .repair import RepairNeeded, enrich_constraints, repair_context
+from .research import background_context
 from .util import digest, read_json, write_json
 
 console = Console()
-VERSION = "director-12"
+VERSION = "director-13"
 
 
 def compile_plan(raw: dict, lines: list[Line], bounds=None) -> Plan:
@@ -151,7 +152,7 @@ def analyze(video: Path, root: Path, lines: list[Line], seconds: float, cfg: Set
             '"visual_observations":["附时间，若无图片则留空"], "uncertainties":["不确定处"],'
             '"candidates":[{"start":0,"end":1,"angle":"具体解说角度", "hook":"不剧透的悬念",'
             '"payoff":"本段如何兑现", "evidence_ids":[1], "scores":{"conflict":0,"empathy":0,"humor":0,"reversal":0,"completeness":0},"reason":"推荐原因"}]}'
-            "。每项评分0–10。推荐0–3个有前因后果且适合解说的选题，不要把片头片尾歌词当剧情，不要硬凑幽默。每个候选时间范围应能支撑至少60秒成片。\n字幕：\n" + compact(evidence), images)
+            "。每项评分0–10。推荐0–3个有前因后果且适合解说的选题，不要把片头片尾歌词当剧情，不要硬凑幽默。每个候选时间范围应能支撑至少60秒成片。\n字幕：\n" + compact(evidence) + background_context(cfg.series), images)
         result.update(start=start, end=end)
         console.print(f"[green]{video.stem} 已理解 {start/60:.0f}–{end/60:.0f} 分钟[/green]", highlight=False)
         return result
@@ -164,7 +165,8 @@ def analyze(video: Path, root: Path, lines: list[Line], seconds: float, cfg: Set
 
 def create_plan(video: Path, root: Path, lines: list[Line], seconds: float, maps, cfg: Settings, llm: LLM, previous: list[dict], repair=None, bounds=None):
     signature_input = {"version": VERSION, "lines": [s.model_dump() for s in lines], "maps": maps,
-                       "cfg": cfg.model_dump(mode="json"), "previous": previous}
+                       "cfg": cfg.model_dump(mode="json"), "previous": previous,
+                       "background": background_context(cfg.series)}
     if bounds:
         signature_input["source_bounds"] = bounds
     if repair:
@@ -225,7 +227,10 @@ evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间�
 不同成片不要重复剧情超过40%。避开片头、片尾、ASR疑似幻觉和低信息过场。空镜不能假定说话人。
 可参考前集摘要保持人物关系一致，但不得把前集事实混作本集证据：{json.dumps(previous,ensure_ascii=False)}
 本集分段分析：{json.dumps(maps,ensure_ascii=False)}
-完整字幕（唯一对白事实来源）：\n{compact(lines)}"""
+完整字幕（ASR原始证据，仍须区分说话人与被提及者）：\n{compact(lines)}
+{background_context(cfg.series)}
+关键行为归属必须有当前场景的身份依据；不能把儿臣默认当太子，不能把字幕提及者当说话人。
+身份不足时避开依赖该身份的论点；换成泛称也不能掩盖谁提出、谁执行的混淆。"""
     if bounds:
         prompt += f"\n硬边界：所有镜头仅限{bounds[0]}–{bounds[1]}秒。最后15秒要在原声和总结之间分配，不能原声播完之后再追加画面。"
         from .budget import story_budget
@@ -304,9 +309,10 @@ evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间�
                 "如果不通过，必须在revised_clip里真正修复列出的问题，别照抄原稿，尽量只改必要的文字，保留合法时间码和证据ID。"
                 f"Clip格式：{json.dumps(Clip.model_json_schema(),ensure_ascii=False)}"
                 f"\n上一轮问题（若有必须落实修复）：{json.dumps(previous_issues,ensure_ascii=False)}"
-                f"\n待审视频：{clip.model_dump_json()}\n对应原片字幕：{compact(relevant)}", sheets)
+                f"\n待审视频：{clip.model_dump_json()}\n对应原片字幕：{compact(relevant)}" + background_context(cfg.series)
+                + "\n逐项区分行为主语、听话人和被提及者；身份不明的关键归属必须列为实质问题，不因剧名或背景资料而默认正确。", sheets)
             write_json(root / f"review-{signature}-clip{i+1}-{attempt}.json", review)
-            if review.get("passed") is True:
+            if review.get("passed") is True and review.get("issues") == []:
                 break
             previous_issues = review.get("issues", [])
             if review.get("revised_clip"):
@@ -332,10 +338,10 @@ evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间�
                     "不能把未发生事件写成已发生，也不能在缺少说话人证据时强行归属台词；不确定的具体行为应删除或改为条件/观点表达。"
                     "本次是文字争议裁决，不要声称自己看过画面。若不能根据现有证据解决实质疑点，则仍不通过。"
                     '返回JSON {"passed":true/false,"issues":[],"rationale":"裁决依据与局限","revised_clip":null或修正后的完整clip}。'
-                    f"\n争议意见：{json.dumps(previous_issues,ensure_ascii=False)}\n当前稿件：{clip.model_dump_json()}\n证据：{compact(relevant)}",
+                    f"\n争议意见：{json.dumps(previous_issues,ensure_ascii=False)}\n当前稿件：{clip.model_dump_json()}\n证据：{compact(relevant)}" + background_context(cfg.series),
                     model=adjudication_model)
                 write_json(root / f"review-{signature}-clip{i+1}-adjudication{adjudication}.json", verdict)
-                if verdict.get("passed") is True:
+                if verdict.get("passed") is True and verdict.get("issues") == []:
                     break
                 previous_issues = verdict.get("issues", [])
                 if verdict.get("revised_clip"):

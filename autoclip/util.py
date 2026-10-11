@@ -1,6 +1,7 @@
 import hashlib
 import json
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -14,9 +15,20 @@ def read_json(path: Path):
 
 def write_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    temp.replace(path)
+    # Independent episode processes may update the same batch index/profile.
+    # A shared .tmp name races even though replace itself is atomic.
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                     prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
+        temp = Path(stream.name)
+        try:
+            stream.write(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
+    try:
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def run(args: list[str], timeout=1800):

@@ -153,13 +153,14 @@ def try_recut(clip, report, root, cfg, llm, lines, attempt, video, *, allow_orig
         from .ingest import contact_sheet
         times = [(b.start+b.end)/2 for b in revised.beats]
         images = [contact_sheet(video, root, times, f'timeline-facts-{attempt}')]
+    from .research import background_context
     review = llm.json('你是影视事实与剪辑审核员，核查实测口播驱动的局部切点调整（版本1）。',
         '口播文字未改，部分画面延长、相邻原声按字幕边界缩短。字幕分段不一定等于完整句子。'
         '核查移走的原声是否破坏完整句意、必要铺垫、说话人身份或因果，保留原声是否从半句话开始。'
         '核查全部口播是否有据、画面是否对应，观点必须区别于已发生事实，不可把建议当作已确定结果。'
         '不因为程序通过时长或字幕边界就默认可用。不确定或存在实质问题必须拒绝。'
         '只返回JSON {"passed":true/false,"issues":["具体镜头与问题"]}，通过时issues必须为空。\n'
-        + json.dumps({"before": clip.model_dump(), "after": revised.model_dump(),
+        + background_context(cfg.series) + json.dumps({"before": clip.model_dump(), "after": revised.model_dump(),
                       "changes": chosen['changes'], "evidence": [s.model_dump() for s in lines]}, ensure_ascii=False), images)
     write_json(root / f'timeline-review-{attempt}.json', review)
     if not isinstance(review, dict) or review.get('passed') is not True or review.get('issues') != []:

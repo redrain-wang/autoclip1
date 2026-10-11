@@ -13,7 +13,7 @@ from .repair import voice_fits
 from .util import digest, duration, probe, run, timestamp, write_json
 
 console = Console()
-VERSION = "render-6"
+VERSION = "render-7"
 
 
 def synthesize(text: str, folder: Path, cfg: Settings):
@@ -129,7 +129,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 Dialogue: 0,0:00:00.00,{ass_time(seconds)},Title,,0,0,0,,{{\\pos({width//2},{title_y})}}{title_text}
 """
     if portrait:
-        text += f"Dialogue: 0,0:00:00.00,{ass_time(seconds)},Label,,0,0,0,,{{\\pos(360,1130)}}{ass_escape(series)} · 剧情解读\n"
+        text += f"Dialogue: 0,0:00:00.00,{ass_time(seconds)},Label,,0,0,0,,{{\\pos(360,1130)}}{ass_escape(series)}\n"
     for start,end,body,mode in captions:
         if mode == "narration":
             text += f"Dialogue: 1,{ass_time(start)},{ass_time(end)},Narration,,0,0,0,,{ass_escape(body)}\n"
@@ -224,10 +224,12 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
     changes = [{"before": b.text, "after": t["text"], "evidence": [s.model_dump() for s in lines if s.id in b.evidence_ids]}
                for b,t in zip(clip.beats,timeline) if b.text != t["text"]]
     if changes:
+        from .research import background_context
         check = llm.json("你是事实审核员，检查口播扩写/缩写有没有改变原意或新增无依据的事实。",
-                         '仅依据提供的证据审核。返回JSON {"passed":true/false,"issues":["具体问题"]}。\n' + json.dumps(changes, ensure_ascii=False))
+                         '仅依据提供的证据审核。返回JSON {"passed":true/false,"issues":["具体问题"]}。\n'
+                         + background_context(cfg.series) + json.dumps(changes, ensure_ascii=False))
         write_json(folder / "voice-revision-review.json", check)
-        if check.get("passed") is not True:
+        if check.get("passed") is not True or check.get("issues") != []:
             raise ValueError("配音时长调整后的文案事实审核失败：" + str(check.get("issues")))
     ass = folder / "subtitles.ass"
     write_ass(ass, clip.title, cfg.series, cursor, captions, cfg.portrait)

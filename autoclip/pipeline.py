@@ -11,6 +11,7 @@ from .ingest import save_transcript, transcribe
 from .llm import LLM
 from .render import render_clip
 from .report import build_report
+from .research import prepare_research, research_context
 from .util import digest, duration, source_identity, write_json
 
 console = Console()
@@ -46,8 +47,11 @@ def process(video: Path, cfg: Settings, stage="all", previous=None, brand_config
             status("对白识别完成")
             return {"episode": video.stem}
         llm = LLM(cfg, root)
+        dossier = prepare_research(video, root, lines, seconds, cfg, llm) if cfg.research_before_produce else None
         status("理解剧情与画面")
         maps = analyze(video, root, lines, seconds, cfg, llm)
+        if dossier:
+            maps = [*maps, {"research_notes": research_context(dossier)}]
         if stage == "analyze":
             status("剧情分析完成")
             return {"episode": video.stem}

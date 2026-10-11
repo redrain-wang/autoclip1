@@ -18,6 +18,70 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm"}
 
 
 @app.command()
+def research(source: Annotated[Path, typer.Argument(help="先整理剧情资料的素材文件或目录")],
+             config: Path = Path("configs.production.toml"), output: Path = Path("output/剧情资料")):
+    """建立人物背景和逐集带时间码的研究初稿；不制作或修改成片。"""
+    import fcntl
+    from dotenv import load_dotenv
+    from .ingest import transcribe, save_transcript
+    from .llm import LLM
+    from .production import load_history, seed_cache
+    from .research import prepare_research, profile, seed_research
+    from .util import duration
+    load_dotenv(config.resolve().parent / ".env")
+    cfg = Settings.load(config)
+    cfg.api_key()
+    source = source.resolve()
+    if not source.exists():
+        raise typer.BadParameter("素材不存在")
+    paths = [source] if source.is_file() else sorted(p for p in source.rglob("*")
+                                                   if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS)
+    if not paths:
+        raise typer.BadParameter("没有视频素材")
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    write_json(output / "人物背景.json", profile(cfg.series))
+    outcomes = []
+    for video in paths:
+        identity = source_identity(video)
+        root = output / (video.stem + "-" + digest(identity)[:8])
+        root.mkdir(parents=True, exist_ok=True)
+        llm = None
+        locked = False
+        with (root / ".lock").open("w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                prior, _ = load_history(config.resolve().parent / "output", identity, output)
+                seed_cache(prior, root)
+                seed_research(config.resolve().parent / "output", identity, root)
+                write_json(root / "source.json", identity)
+                console.print(f"整理 {video.name} 人物与分集资料（自动初稿）", markup=False)
+                lines = transcribe(video, root, cfg)
+                seconds = duration(video)
+                if any(s.end > seconds+1 for s in lines):
+                    raise ValueError("字幕时间超出原片，请检查版本")
+                save_transcript(lines, root)
+                llm = LLM(cfg, root)
+                dossier = prepare_research(video, root, lines, seconds, cfg, llm)
+                outcomes.append({"source": str(video), "status": "notes_ready", "document": str(root / "剧情资料.md"),
+                                 "events": sum(len(w["events"]) for w in dossier["windows"])})
+            except Exception as ex:
+                outcomes.append({"source": str(video), "status": "failed", "error": str(ex)[:1500]})
+                console.print(f"{video.name} 研究未完成：{ex}", markup=False)
+            finally:
+                if llm:
+                    write_json(root / "research-usage.json", llm.usage())
+                    llm.client.close()
+        if locked:
+            write_json(root / "research-outcome.json", outcomes[-1])
+        write_json(output / "research-batch.json", [read_json(p) for p in sorted(output.glob("*/research-outcome.json"))])
+    console.print(f"资料目录：{output}。模型初稿尚需原片身份核对，不是事实认证。", markup=False)
+    if any(row["status"] == "failed" for row in outcomes):
+        raise typer.Exit(1)
+
+
+@app.command()
 def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目录；省略则读取本地.env")] = None,
             config: Path = Path("configs.production.toml"), max_new: int = 3,
             stage: str = "all", output: Path | None = None,

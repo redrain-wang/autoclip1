@@ -18,11 +18,12 @@ class Settings(BaseModel):
     original_ratio_target: float = Field(default=.4, ge=.2, le=.8)
     portrait: bool = True
     vision: bool = True
+    research_before_produce: bool = False
     asr_backend: str = "mlx" if platform.system() == "Darwin" and platform.machine() == "arm64" else "faster"
     asr_model: str = "mlx-community/whisper-large-v3-turbo"
     asr_prompt: str = "以下是中文影视剧对白，使用简体中文。"
     chunk_seconds: int = 300
-    voice: str = "zh-CN-YunxiNeural"
+    voice: str = "zh-CN-YunyangNeural"
     tts: str = "edge"
     tts_rate: str = "+8%"
     original_volume: float = 0.035

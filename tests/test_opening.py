@@ -61,6 +61,8 @@ def test_original_segments_do_not_display_editorial_watch_instructions(tmp_path)
     text=target.read_text()
     assert '听这句原声' not in text and '必要解释' in text
     assert 'Style: Original' not in text
+    label = next(row for row in text.splitlines() if ',Label,' in row)
+    assert label.endswith('剧名') and '剧情解读' not in text
 
 
 def test_audio_mix_uses_encoded_duration_and_only_initial_block():

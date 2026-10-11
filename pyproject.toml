@@ -20,5 +20,8 @@ autoclip = "autoclip.cli:app"
 [tool.setuptools.packages.find]
 include = ["autoclip*"]
 
+[tool.setuptools.package-data]
+autoclip = ["knowledge/*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

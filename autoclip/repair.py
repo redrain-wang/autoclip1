@@ -99,6 +99,7 @@ def review_voice_changes(revised, changes, root, cfg, llm, lines, attempt, video
     """Review new text against the full context; ambiguous verdicts fail closed."""
     import json
     from .util import write_json
+    from .research import background_context
     images=[]
     if video and cfg.vision:
         from .ingest import contact_sheet
@@ -119,10 +120,10 @@ def review_voice_changes(revised, changes, root, cfg, llm, lines, attempt, video
         "特别核验‘谁提议、谁回答、谁拒绝’：字幕没有说话人标签，不能把台词相邻当成同一人说话；"
         "结合称呼、前后回应与所附画面交叉判断。不能确定主语时改为不指定说话人的准确表述，不得猜测。"
         '返回JSON {"passed":true/false,"issues":["具体镜头与问题"]}。\n'
-        + extra + json.dumps({"changes": changes, "clip": revised.model_dump(),
+        + extra + background_context(cfg.series) + json.dumps({"changes": changes, "clip": revised.model_dump(),
                       "evidence": [s.model_dump() for s in lines]}, ensure_ascii=False), images)
     write_json(root / f"voice-local-repair-{attempt}.json", {"changes": changes, "review": review})
-    if review.get("passed") is not True:
+    if review.get("passed") is not True or review.get("issues") != []:
         raise RepairNeeded({"stage": "voice_semantic", "clip": revised.model_dump(),
                             "issues": [{"code": "semantic_review", "message": str(review.get("issues", []))}]})
 
