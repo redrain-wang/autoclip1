@@ -58,7 +58,9 @@
 | `style` | `auto` 根据类型选择风格，或填写具体风格要求 |
 | `clips` | 正数1–10：请求固定数量；0：模型按质量选0–6条，不凑数 |
 | `target_seconds` | 每条参考时长，45–240秒；验收范围为参考值的0.6–1.8倍，默认100对应60–180秒，不是精确的定长剪辑 |
-| `min_seconds` / `max_seconds` | 可选的实际成片时长下限和上限；新片生产配置为150–240秒，覆盖上面的默认倍数范围 |
+| `min_seconds` / `max_seconds` | 可选的实际成片时长下限和上限；新片生产配置为120–240秒，覆盖上面的默认倍数范围 |
+| `opening` | 新片配置为`original`：优先10–18秒连续高光原声开场，完整句子最多22秒；`narration`保留旧式解说开场 |
+| `original_ratio_target` | 原声占比创作参考，新片为0.6；不靠无关对白凑比例，最终实际占比见成片浏览页 |
 | `portrait` | `true` 竖屏保留完整原画幅；`false` 1280×720横屏 |
 | `vision` | 联合画面理解，建议保持开启 |
 | `asr_backend` / `asr_model` | Apple Silicon使用MLX，其他平台可使用faster-whisper |

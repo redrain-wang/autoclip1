@@ -58,7 +58,8 @@ def evidence_matches(line, beat, context):
 
 
 def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: int, target: int,
-                  min_seconds: float | None = None, max_seconds: float | None = None):
+                  min_seconds: float | None = None, max_seconds: float | None = None,
+                  opening: str = "narration"):
     errors = []
     lookup = {s.id: s for s in lines}
     if count == 0 and len(plan.clips) > 6:
@@ -89,7 +90,24 @@ def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: 
                 estimated += beat.end - beat.start
             else:
                 estimated += max(2, len(beat.text) / 4.5)
-        if not clip.beats or clip.beats[0].mode != "narration":
+        if opening == "original":
+            if clip.beats[0].mode != "original":
+                errors.append(f"clips[{i}] 开头应保留精彩原声，之后再接解说")
+            else:
+                opening_seconds = 0.0
+                opening_end = clip.beats[0].start
+                for beat in clip.beats:
+                    if beat.mode != "original":
+                        break
+                    if beat.start > opening_end + .04:
+                        errors.append(f"clips[{i}] 原声开场必须连续，不能拼接分散片段凑时长")
+                    opening_seconds += beat.end-beat.start
+                    opening_end = beat.end
+                if not 10 <= opening_seconds <= 22:
+                    errors.append(f"clips[{i}] 原声开场实长{opening_seconds:.2f}秒，需10–22秒；优先10–18秒并保留完整句子")
+            if not any(b.mode == "narration" for b in clip.beats):
+                errors.append(f"clips[{i}] 原声开场后需要有观点的解说")
+        elif clip.beats[0].mode != "narration":
             errors.append(f"clips[{i}] 开头应有解说钩子")
         if original < 5:
             errors.append(f"clips[{i}] 至少保留5秒原声对白")

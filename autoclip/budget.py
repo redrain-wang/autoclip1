@@ -34,7 +34,7 @@ def story_budget(lines, bounds, cfg, report=None):
               "instructions": ["先为冲突、升级、结果分配完整原声，再按剩余目标时长写解说",
                                "无证据或重复解释不能用来补时长；保留审核和真实配音检查",
                                "所列空余区间只是未被剪入，必须审核其对白和画面是否属于当前故事"]}
-    original_target = min(65, max(30, span*.32))
+    original_target = min(span*.7, cfg.target_seconds*cfg.original_ratio_target)
     rate = 5.0
     clip = (report or {}).get("clip") or {}
     beats = clip.get("beats", [])

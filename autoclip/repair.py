@@ -224,6 +224,10 @@ def prepare_voice(clip, root, cfg, llm, lines, attempt, video=None):
     except RepairNeeded as error:
         report = error.report
         issues = report["issues"]
+        from .recut import try_recut
+        recut = try_recut(clip, report, root, cfg, llm, lines, attempt, video, allow_original=False)
+        if recut is not None:
+            return recut
         slots = expansion_slots(clip, report, cfg)
         if not slots and not (1 <= len(issues) <= 4 and all(i["code"] == "voice_alignment" for i in issues)):
             raise
@@ -246,6 +250,18 @@ def prepare_voice(clip, root, cfg, llm, lines, attempt, video=None):
                 # generic error used to discard the evidence and trigger the
                 # same unsuccessful full rewrite on every remaining retry.
                 from .util import write_json
+                # Preserve dialogue first. Only borrow from original audio if
+                # both unused footage and local wording adjustments failed.
+                try:
+                    partial_report = preflight_voice(revised, root, cfg, f"{attempt}-partial")
+                except RepairNeeded as measured_error:
+                    partial_report = measured_error.report
+                recut = try_recut(revised, partial_report, root, cfg, llm, lines, attempt, video)
+                if recut is not None:
+                    write_json(root / f"voice-local-repair-{attempt}.json", {
+                        "changes": changes, "review": "Full clip checked in timeline-review report",
+                        "timeline_review": f"timeline-review-{attempt}.json"})
+                    return recut
                 failed = dict(report, local_repair={"status": "voice_alignment_failed",
                     "beat": index, "error": str(error),
                     "discarded_changes": changes,

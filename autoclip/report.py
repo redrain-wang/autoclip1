@@ -29,7 +29,10 @@ def build_report(output: Path):
             poster = quote(str(Path(preview).relative_to(output.resolve()))) if preview else ""
             cover_link = (f'<a class="download" href="{quote(str(Path(clip["cover"]).relative_to(output.resolve())))}" download>下载封面</a>'
                           if clip.get("cover") else "")
-            script = "\n\n".join(f'[{b["start"]:.1f}–{b["end"]:.1f}s] '+ ('【原声】' if b['mode']=='original' else b['text']) for b in clip['timeline'])
+            from .metrics import audio_mix
+            mix = audio_mix(clip['timeline'])
+            composition = f"原声 {mix['original_ratio']:.0%} · 解说 {1-mix['original_ratio']:.0%}"
+            script = composition + "\n\n" + "\n\n".join(f'[{b["start"]:.1f}–{b["end"]:.1f}s] '+ ('【原声】' if b['mode']=='original' else b['text']) for b in clip['timeline'])
             block += f'''<article><video controls preload="metadata" poster="{poster}" src="{link}"></video><div class="body"><div class="meta">{clip['duration']:.0f} 秒 · {clip['width']} × {clip['height']}</div><h3>{html.escape(clip['title'])}</h3><p>{html.escape(clip['angle'])}</p><a class="download" href="{link}" download>下载成片</a> {cover_link}<details><summary>查看解说稿与原片时间码</summary><pre>{html.escape(script)}</pre></details></div></article>'''
         block += '</div></section>'
         cards.append(block)

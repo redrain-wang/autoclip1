@@ -1,6 +1,7 @@
 import os
 import platform
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, model_validator
@@ -13,6 +14,8 @@ class Settings(BaseModel):
     target_seconds: int = Field(default=100, ge=45, le=240)
     min_seconds: float | None = Field(default=None, ge=30)
     max_seconds: float | None = Field(default=None, le=600)
+    opening: Literal["narration", "original"] = "narration"
+    original_ratio_target: float = Field(default=.4, ge=.2, le=.8)
     portrait: bool = True
     vision: bool = True
     asr_backend: str = "mlx" if platform.system() == "Darwin" and platform.machine() == "arm64" else "faster"

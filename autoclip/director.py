@@ -13,7 +13,7 @@ from .repair import RepairNeeded, enrich_constraints, repair_context
 from .util import digest, read_json, write_json
 
 console = Console()
-VERSION = "director-11"
+VERSION = "director-12"
 
 
 def compile_plan(raw: dict, lines: list[Line], bounds=None) -> Plan:
@@ -173,7 +173,7 @@ def create_plan(video: Path, root: Path, lines: list[Line], seconds: float, maps
         signature_input["adjudication_model"] = adjudication_model
     def check(plan):
         try:
-            validate_plan(plan, lines, seconds, cfg.clips, cfg.target_seconds, cfg.min_seconds, cfg.max_seconds)
+            validate_plan(plan, lines, seconds, cfg.clips, cfg.target_seconds, cfg.min_seconds, cfg.max_seconds, cfg.opening)
         except ValueError as ex:
             report=repair_context(ex,plan.clips[0] if plan.clips else None,cfg)
             raise RepairNeeded(enrich_constraints(report,lines,bounds,cfg)) from ex
@@ -196,7 +196,7 @@ def create_plan(video: Path, root: Path, lines: list[Line], seconds: float, maps
         return plan
     system = """你是专业中文影视短视频编导。任务是写有观点、好听、剧情连贯的解说并给出可执行时间线。
 只根据给出的原片字幕和画面事实，不许凭作品记忆造剧情。将解释写成对行为的分析，不把猜测动机当成明示事实。
-不照搬原对白；不要‘这部剧告诉我们’式空话。开头一句具体矛盾抓人；中段保留关键原声；结尾兑现观点。
+不照搬原对白；不要‘这部剧告诉我们’式空话。开头用具体冲突抓人，按任务选择原声或口播；中段保留关键原声；结尾兑现观点。
 严禁添加无依据台词、未来剧情、人名、金额、官职或因果。用简体中文。人物名确实不确定时用身份指代。
 低置信度ASR不是可靠证据；分段分析也可能误判人物，要用完整字幕上下文交叉核实。没有必要不要写具体年份或精确金额。
 类型适配：权谋讲利益与困境，家庭讲处境与共情，喜剧讲铺垫与反差，悬疑讲信息差但不乱剧透。
@@ -204,7 +204,12 @@ def create_plan(video: Path, root: Path, lines: list[Line], seconds: float, maps
     schema = json.dumps(Plan.model_json_schema(), ensure_ascii=False)
     quantity = str(cfg.clips) if cfg.clips else "0–6"
     beat_count = "12–18" if cfg.target_seconds >= 150 else "7–12"
-    original_seconds = "30–75" if cfg.target_seconds >= 150 else "5–25"
+    original_target = round(cfg.target_seconds * cfg.original_ratio_target)
+    original_seconds = f"{round(original_target*.8)}–{round(original_target*1.15)}"
+    opening_instruction = ("首段必须为original：挑选10–18秒能听懂的冲突、反问或人物反应作高光开场。为保留完整句子可延至22秒。"
+        "原声开场后再用narration解释人物、处境和看点，不要先插入解说。开场从当前故事的有效冲突起点选，后续沿原片顺序推进；"
+        "不偷放后文高潮再倒回、不重复播放同一片段，也不要用寒暄、走路或静默凑开场时长。"
+        if cfg.opening == "original" else "首段narration直接抛出具体矛盾并交代必要人物和处境。")
     prompt = f"""为《{cfg.series}》本集制作 {quantity} 条不同选题的短视频，每条约 {cfg.target_seconds} 秒。
 风格要求：{cfg.style}。原片总长：{seconds:.2f} 秒。
 成片实际时长要求：{cfg.min_seconds or cfg.target_seconds*.6:.0f}–{cfg.max_seconds or cfg.target_seconds*1.8:.0f}秒；用更多完整情节和观点支撑时长，不靠重复或空话。
@@ -212,8 +217,9 @@ def create_plan(video: Path, root: Path, lines: list[Line], seconds: float, maps
 每个 beat 是一个原片连续区间，时间用原片绝对秒数。必须递增且不重叠，避免频繁跨场景跳跃。
 每条用{beat_count}个beat；narration时填解说text，original时text必须为空。
 每条至少有两处、合计{original_seconds}秒 original 保留完整关键对白，剪在句子边界，不要一个字只剩半句。
+原声目标约占{cfg.original_ratio_target:.0%}，这是创作参考而非硬配额。达到实际时长下限且已讲完独立故事就可以结束，不要为追目标时长扩空话。优先增加必要对白与反应，不把关键原声改成旁白复述。
 解说 text 以每秒4–4.5个汉字写，单段25–75个字，给它留足6–22秒原片画面；不要连续长时间口播。
-首段 narration 直接抛出具体矛盾并交代必要人物和处境，最后一段解释片中已经发生的结果，不许卖下一集关子。结尾总结必须预留10–18秒真实画面；不要把长总结塞在最后1–3秒，可以提前结束故事，原声与解说均须留足时间。
+{opening_instruction}最后一段解释片中已经发生的结果，不许卖下一集关子。结尾总结必须预留10–18秒真实画面；不要把长总结塞在最后1–3秒，可以提前结束故事，原声与解说均须留足时间。
 evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间相交。reason说明该画面如何支撑解说观点。
 原声应使观众听清完整的关键句；原声前的解说引导观众注意，原声后点破含义，不要重复复述。
 不同成片不要重复剧情超过40%。避开片头、片尾、ASR疑似幻觉和低信息过场。空镜不能假定说话人。

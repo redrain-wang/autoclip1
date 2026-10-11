@@ -3,8 +3,10 @@ style = "历史权谋：分析人物动机、制度困境和普通人的共鸣�
 # New stories only; produce selects each story independently and preserves old exports.
 clips = 0
 target_seconds = 190
-min_seconds = 150
+min_seconds = 120
 max_seconds = 240
+opening = "original"
+original_ratio_target = 0.6
 portrait = true
 vision = true
 asr_backend = "mlx"

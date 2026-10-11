@@ -56,6 +56,17 @@ def overlap_fraction(a, b):
     return overlap / max(1, min(sum(y-x for x,y in a), sum(y-x for x,y in b)))
 
 
+def check_footage(clip, story, existing):
+    """Run again after local recutting, before any render or publication."""
+    if any(b.start < story.start-.001 or b.end > story.end+.001 for b in clip.beats):
+        raise ValueError("镜头超出本选题范围，必须只用给定范围内的素材")
+    spans = [(b.start, b.end) for b in clip.beats]
+    for previous in existing:
+        old = [(b["start"], b["end"]) for b in previous["timeline"]]
+        if overlap_fraction(spans, old) > .25:
+            raise ValueError("新片重复使用旧片镜头超过25%，必须更换镜头或故事")
+
+
 def load_history(history: Path, identity: dict, exclude: Path | None = None):
     clips, prior = [], None
     for path in sorted(history.rglob("source.json"), key=lambda p:len(p.parts)):
@@ -258,17 +269,12 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                     local=cfg.model_copy(update={"clips":1,"style":cfg.style+f"。本次唯一选题：{story.title}。角度：{story.angle}。只能剪原片{story.start}–{story.end}秒内的故事。"})
                     plan=create_plan(video,storyroot,relevant,seconds,[story.model_dump()],local,llm,[],repair=repair,bounds=(story.start,story.end))
                     clip=plan.clips[0]
-                    if any(b.start<story.start-.2 or b.end>story.end+.2 for b in clip.beats):
-                        raise ValueError("镜头超出本选题范围，必须只用给定范围内的素材")
-                    spans=[(b.start,b.end) for b in clip.beats]
-                    for previous in existing+results:
-                        old=[(b["start"],b["end"]) for b in previous["timeline"]]
-                        if overlap_fraction(spans,old)>.25:
-                            raise ValueError("新片重复使用旧片镜头超过25%，必须更换镜头或故事")
+                    check_footage(clip, story, existing+results)
                     write_json(storyroot/"plan.json",plan.model_dump())
                     if stage=="plan":
                         break
                     clip=prepare_voice(clip,storyroot,local,llm,relevant,attempt,video=video)
+                    check_footage(clip, story, existing+results)
                     plan.clips[0]=clip
                     write_json(storyroot/"plan.json",plan.model_dump())
                     clean=render_clip(video,storyroot,clip,index,local,llm,lines)

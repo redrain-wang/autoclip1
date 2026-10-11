@@ -13,7 +13,7 @@ from .repair import voice_fits
 from .util import digest, duration, probe, run, timestamp, write_json
 
 console = Console()
-VERSION = "render-5"
+VERSION = "render-6"
 
 
 def synthesize(text: str, folder: Path, cfg: Settings):
@@ -122,7 +122,6 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Narration,Arial Unicode MS,{font},&H00FFFFFF,&H000000FF,&H00141414,&H80000000,-1,0,0,0,100,100,1,0,1,2,1,2,42,42,{sub_margin},1
-Style: Original,Arial Unicode MS,{font-3},&H00B4E5FF,&H000000FF,&H00141414,&H80000000,0,0,0,0,100,100,0,0,1,2,1,2,42,42,{sub_margin},1
 Style: Title,Arial Unicode MS,{title_size},&H00FFFFFF,&H000000FF,&H00121212,&H00000000,-1,0,0,0,100,100,1,0,1,2,0,8,35,35,0,1
 Style: Label,Arial Unicode MS,22,&H00B4E5FF,&H000000FF,&H00121212,&H00000000,0,0,0,0,100,100,2,0,1,1,0,8,35,35,0,1
 [Events]
@@ -132,7 +131,8 @@ Dialogue: 0,0:00:00.00,{ass_time(seconds)},Title,,0,0,0,,{{\\pos({width//2},{tit
     if portrait:
         text += f"Dialogue: 0,0:00:00.00,{ass_time(seconds)},Label,,0,0,0,,{{\\pos(360,1130)}}{ass_escape(series)} · 剧情解读\n"
     for start,end,body,mode in captions:
-        text += f"Dialogue: 1,{ass_time(start)},{ass_time(end)},{'Narration' if mode=='narration' else 'Original'},,0,0,0,,{ass_escape(body)}\n"
+        if mode == "narration":
+            text += f"Dialogue: 1,{ass_time(start)},{ass_time(end)},Narration,,0,0,0,,{ass_escape(body)}\n"
     path.write_text(text, encoding="utf-8")
 
 
@@ -188,9 +188,8 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
                 body = subtitle_display(body)
                 if body:
                     captions.append((cursor+a, cursor+b, body, "narration"))
-        else:
-            # Do not duplicate the source's burned-in subtitles. Only label the audio mode.
-            captions.append((cursor, cursor+target_length, "听这句原声", "original"))
+        # Original audio keeps the source's burned-in subtitles, without a
+        # repeated editorial label telling the viewer how to watch it.
         segment_key = digest({"beat": beat.model_dump(), "text": text, "target": target_length, "version": VERSION})
         segment = folder / f"part-{i:02}-{segment_key}.mp4"
         if not segment.exists():
@@ -260,7 +259,9 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
     raw.unlink(missing_ok=True)
     poster = folder / "poster.jpg"
     run(["ffmpeg", "-v", "error", "-y", "-ss", min(2,final_seconds/2), "-i", final, "-frames:v", "1", "-q:v", "2", poster])
+    from .metrics import audio_mix
     manifest = {"title": clip.title, "angle": clip.angle, "hook": clip.hook, "video": str(final.resolve()),
+                "audio_mix": audio_mix(timeline),
                 "poster": str(poster.resolve()),
                 "duration": final_seconds, "width": width, "height": height, "timeline": timeline,
                 "qa": {"full_decode": "passed", "audio_video_streams": "passed", "duration": "passed",
