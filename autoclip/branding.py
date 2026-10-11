@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from .util import digest, duration, read_json, run, source_identity, write_json
 
 VERSION = "brand-1"
-COVER_VERSION = "cover-3"
+COVER_VERSION = "cover-4"
 
 
 class BrandSettings(BaseModel):
@@ -134,7 +134,6 @@ def make_cover(source: Path, manifest: dict, folder: Path, series: str, brand: B
         hero_y = 450 + (740 - hero.height)//2
         canvas.alpha_composite(hero.convert("RGBA"), ((1080-hero.width)//2, hero_y))
         title_x, title_y, max_width, max_height = 76, 1240, 928, 460
-        draw.text((78, 1160), "剧情解读", font=small_font, fill=gold)
         footer_y = 1780
     else:
         hero = ImageOps.contain(frame, (1030, 700))

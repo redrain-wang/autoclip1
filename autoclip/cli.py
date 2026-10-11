@@ -17,6 +17,21 @@ console = Console()
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm"}
 
 
+@app.command("render-sample")
+def reviewed_sample(source: Annotated[Path, typer.Argument(help="风格试片原片")],
+                    plan: Path = typer.Option(...), transcript: Path = typer.Option(...),
+                    review: Path = typer.Option(..., help="绑定本稿的逐段开发核对记录"),
+                    output: Path = typer.Option(..., help="独立试片目录"),
+                    config: Path = Path("configs.production.toml")):
+    """渲染已逐段开发核对的单条试片；不等同无人复核生产，不自动改稿。"""
+    from .branding import BrandSettings
+    from .sample import render_sample
+    cfg = Settings.load(config)
+    brand = BrandSettings.load(config.resolve().parent / "branding.toml")
+    _, target = render_sample(source.resolve(), plan, transcript, review, cfg, brand, output.resolve())
+    console.print(f"开发核对试片：{target}（不代表无人复核能力）", markup=False)
+
+
 @app.command("compare-scripts")
 def script_comparison(source: Annotated[Path, typer.Argument(help="待研究的原片")],
                       transcript: Path = typer.Option(...), start: float = typer.Option(...), end: float = typer.Option(...),

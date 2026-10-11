@@ -13,7 +13,7 @@ from .repair import voice_fits
 from .util import digest, duration, probe, run, timestamp, write_json
 
 console = Console()
-VERSION = "render-7"
+VERSION = "render-8"
 
 
 def synthesize(text: str, folder: Path, cfg: Settings):
@@ -112,7 +112,7 @@ def write_ass(path: Path, title: str, series: str, seconds: float, captions, por
     font, title_size = (36,46) if portrait else (32,36)
     title_y, sub_margin = (205, 350) if portrait else (45, 35)
     title_parts = subtitle_chunks(title, 13 if portrait else 26)
-    title_text = "\\N".join(ass_escape(x) for x in title_parts[:3])
+    title_text = "\\N".join(ass_escape(subtitle_display(x)) for x in title_parts[:3])
     text = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
