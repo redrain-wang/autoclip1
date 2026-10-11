@@ -186,9 +186,14 @@ reason解释新的看点、与旧片的区别以及为什么足以撑起长视�
 
 
 def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: Path, maximum=3, stage="all",
-                    subtitle_layer: Path | None = None):
+                    subtitle_layer: Path | None = None, retry_rejected_from: Path | None = None):
     identity=source_identity(video)
     root=cfg.output/(video.stem+"-"+digest(identity)[:8])
+    if retry_rejected_from is not None:
+        if root.resolve() == retry_rejected_from.resolve():
+            raise ValueError("失败重试必须使用新批次目录，保留原失败记录")
+        if read_json(retry_rejected_from/"source.json") != identity:
+            raise ValueError("失败重试的素材与当前原片不一致")
     root.mkdir(parents=True,exist_ok=True)
     lock=(root/".lock").open("w")
     try:
@@ -220,7 +225,13 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
         write_json(root/"transcript-input.json", evidence_input)
         llm=LLM(cfg,root)
         maps=analyze(video,root,lines,seconds,cfg,llm)
-        selection=select_stories(root,lines,maps,seconds,existing,cfg,llm,maximum)
+        if retry_rejected_from is None:
+            selection=select_stories(root,lines,maps,seconds,existing,cfg,llm,maximum)
+        else:
+            from .retry import retry_selection
+            selection=retry_selection(retry_rejected_from,root,identity,lines,seconds,existing,maximum)
+            for skipped in read_json(root/"retry-selection.json")["skipped"]:
+                console.print(f"重试选题跳过：{skipped['title']}：{skipped['reason']}",markup=False)
         write_json(root/"selection.json",selection.model_dump())
         if stage=="scout":
             status("新选题检查完成",candidates=len(selection.stories))
@@ -275,7 +286,7 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                     break
                 except (ValueError,RuntimeError) as ex:
                     editorial=content_rejection(ex)
-                    repair=enrich_constraints(repair_context(ex,clip,local),relevant,(story.start,story.end))
+                    repair=enrich_constraints(repair_context(ex,clip,local),relevant,(story.start,story.end),local)
                     repair["repair_round"]=attempt+1
                     write_json(storyroot/f"attempt-{attempt}.json",{"error":str(ex)[:2500],"repair":repair,"attempt":attempt+1})
                     if not editorial or attempt==cfg.repair_attempts:

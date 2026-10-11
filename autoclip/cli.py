@@ -21,7 +21,8 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm"}
 def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目录；省略则读取本地.env")] = None,
             config: Path = Path("configs.production.toml"), max_new: int = 3,
             stage: str = "all", output: Path | None = None,
-            subtitle_layer: Path | None = typer.Option(None, help="单个素材使用的字幕纠错层；默认关闭")):
+            subtitle_layer: Path | None = typer.Option(None, help="单个素材使用的字幕纠错层；默认关闭"),
+            retry_rejected_from: Path | None = typer.Option(None, help="原批次的单集目录；仅在新批次重试未通过选题")):
     """独立生成更长的新片，自动选题、审查、配音、包装和导出，保留旧成片。"""
     import os
     from dotenv import load_dotenv
@@ -48,6 +49,11 @@ def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目
         if not source.is_file() or not subtitle_layer.is_file():
             raise typer.BadParameter("字幕纠错层只支持单个素材文件，且纠错层文件必须存在")
         subtitle_layer = subtitle_layer.resolve()
+    if retry_rejected_from is not None:
+        if not source.is_file() or not all((retry_rejected_from/name).is_file() for name in
+                                           ("source.json", "selection.json", "rejected.json")):
+            raise typer.BadParameter("重试仅支持单个素材，并需提供含source、selection及rejected记录的原单集目录")
+        retry_rejected_from = retry_rejected_from.resolve()
     brand=BrandSettings.load(base/"branding.toml")
     if not all(shutil.which(x) for x in ("ffmpeg","ffprobe")):
         raise typer.BadParameter("请安装FFmpeg和ffprobe后重试")
@@ -67,7 +73,8 @@ def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目
     for video in paths:
         console.rule(f"增量生产 {video.name}")
         try:
-            outcomes.append(produce_episode(video,cfg,brand,history,max_new,stage,subtitle_layer=subtitle_layer))
+            outcomes.append(produce_episode(video,cfg,brand,history,max_new,stage,
+                                            subtitle_layer=subtitle_layer,retry_rejected_from=retry_rejected_from))
         except Exception as ex:
             outcomes.append({"source":str(video),"status":"failed","error":str(ex)[:2000]})
             console.print(f"{video.name} 失败：{str(ex)[:1500]}",markup=False)

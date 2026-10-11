@@ -3,7 +3,7 @@
 from .diagnostics import classify_error
 
 
-def enrich_constraints(report, lines, bounds=None):
+def enrich_constraints(report, lines, bounds=None, cfg=None):
     """Offer real, temporally eligible evidence; never silently change citations."""
     import re
     from .models import Beat, evidence_matches
@@ -13,6 +13,9 @@ def enrich_constraints(report, lines, bounds=None):
         report["source_bounds"] = list(bounds)
         report["outro_budget"] = {"start": max(bounds[0],bounds[1]-15), "end":bounds[1],
                                   "instruction":"若结尾没画面，改写或替换这里的末尾原声，不能在边界之后追加总结"}
+        if cfg is not None:
+            from .budget import story_budget
+            report["timing_budget"] = story_budget(lines, bounds, cfg, report)
     if not clip:
         return report
     affected = {i["beat"] for i in report.get("issues",[]) if "beat" in i}

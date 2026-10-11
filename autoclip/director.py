@@ -13,7 +13,7 @@ from .repair import RepairNeeded, enrich_constraints, repair_context
 from .util import digest, read_json, write_json
 
 console = Console()
-VERSION = "director-10"
+VERSION = "director-11"
 
 
 def compile_plan(raw: dict, lines: list[Line], bounds=None) -> Plan:
@@ -176,13 +176,13 @@ def create_plan(video: Path, root: Path, lines: list[Line], seconds: float, maps
             validate_plan(plan, lines, seconds, cfg.clips, cfg.target_seconds, cfg.min_seconds, cfg.max_seconds)
         except ValueError as ex:
             report=repair_context(ex,plan.clips[0] if plan.clips else None,cfg)
-            raise RepairNeeded(enrich_constraints(report,lines,bounds)) from ex
+            raise RepairNeeded(enrich_constraints(report,lines,bounds,cfg)) from ex
         if bounds:
             for clip in plan.clips:
                 issues=[{"code":"source_bounds","beat":i,"message":f"镜头{i}范围{b.start:.2f}–{b.end:.2f}超出选题{bounds[0]:.2f}–{bounds[1]:.2f}"}
                         for i,b in enumerate(clip.beats) if b.start<bounds[0]-.001 or b.end>bounds[1]+.001]
                 if issues:
-                    raise RepairNeeded(enrich_constraints({"stage":"story_bounds","issues":issues,"clip":clip.model_dump()},lines,bounds))
+                    raise RepairNeeded(enrich_constraints({"stage":"story_bounds","issues":issues,"clip":clip.model_dump()},lines,bounds,cfg))
     notes_path = root / "editor_notes.json"
     # Old beat-index edits refer to the fixed-count scripts, not a new auto slate.
     notes = read_json(notes_path) if notes_path.exists() and cfg.clips != 0 else None
@@ -222,6 +222,14 @@ evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间�
 完整字幕（唯一对白事实来源）：\n{compact(lines)}"""
     if bounds:
         prompt += f"\n硬边界：所有镜头仅限{bounds[0]}–{bounds[1]}秒。最后15秒要在原声和总结之间分配，不能原声播完之后再追加画面。"
+        from .budget import story_budget
+        budget = story_budget(lines, bounds, cfg, repair)
+        write_json(root / f"timing-budget-{signature}.json", budget)
+        prompt += "\n程序提供的时长预算（不是事实证据）：" + json.dumps(budget, ensure_ascii=False)
+        prompt += ("\n先核算原声秒数和解说总字数，再输出镜头。planning_reference只是总量参考，"
+                   "不要每段都只写两三句话导致整体少几十秒；已测语速优先于通用每秒字数。"
+                   "如果原声占满了开头或结尾，要重新分配整句原声和解说，不能用1秒碎片夹长口播。"
+                   "unused_intervals中的完整对白可补背景或结果，但是否必要必须看内容；不能把所有空隙直接填上。")
     if cfg.clips == 0:
         prompt += "\n本次是按质量自动决定数量，不存在必须完成的条数。只有具备明确矛盾或情绪/笑点、充分字幕证据、完整前因后果、独立角度并能支撑目标时长的故事才入选。不要把同一故事拆成多个相似选题；没有合格故事时返回clips空列表，最多6条。每条angle写明独立看点。"
     if repair:
@@ -245,7 +253,7 @@ evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间�
             last_report["proposed_clip"]=raw.get("clips",[None])[0] if raw.get("clips") else None
             if not last_report.get("clip"):
                 last_report["clip"]=raw.get("clips",[None])[0] if raw.get("clips") else None
-            last_report=enrich_constraints(last_report,lines,bounds)
+            last_report=enrich_constraints(last_report,lines,bounds,cfg)
             error="\n上次输出需修复（镜头与实际证据）："+json.dumps(last_report,ensure_ascii=False)
     else:
         last_report["stage"] = "plan_validation"
