@@ -40,6 +40,11 @@ def check_review(review, video, plan, lines):
         path = Path(frame.get("path", ""))
         if not path.is_file() or file_hash(path) != frame.get("sha256"):
             raise ValueError("试片核对画面缺失或已改变")
+    if review.get("watermark_index") is not None and (type(review["watermark_index"]) is not int or review["watermark_index"] < 0):
+        raise ValueError("水印序号必须是非负整数")
+    if review.get("cover_source_time") is not None:
+        from .branding import cover_times
+        cover_times([b.model_dump() for b in plan.clips[0].beats],review["cover_source_time"])
     if not review.get("limitations"):
         raise ValueError("试片必须记录开发参与与核对局限")
 
@@ -82,11 +87,13 @@ def render_sample(video: Path, plan_path: Path, transcript: Path, review_path: P
     clean = render_clip(video, root, clip, 0, local, FrozenScript(), lines)
     if any(b.text != t['text'] for b,t in zip(clip.beats, clean['timeline'])):
         raise ValueError("实际口播与核对稿不一致")
+    if review.get('cover_source_time') is not None:
+        clean['cover_source_time'] = review['cover_source_time']
     clean['qa']['semantic_review'] = 'development_reviewed_sample_not_unattended'
     clean['development_review'] = str((root / 'development-review.json').resolve())
     # Keep provenance in the clean manifest as well as the packaged deliverable.
     write_json(Path(clean['video']).parent / 'manifest.json', clean)
-    finished = package_clip(video, root, clean, 0, cfg.series, brand)
+    finished = package_clip(video, root, clean, 0, cfg.series, brand.for_clip(review.get("watermark_index") or 0))
     write_json(root / 'results.json', [finished])
     write_json(root / 'status.json', {'stage': '已完成', 'mode': 'development_reviewed_sample'})
     target = export_finished(output)

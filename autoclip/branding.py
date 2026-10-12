@@ -86,14 +86,25 @@ def wrap_title(text, font, max_width):
     return lines
 
 
+def cover_times(timeline, preferred=None):
+    if preferred is not None:
+        import math
+        if (isinstance(preferred,bool) or not isinstance(preferred,(int,float))
+                or not math.isfinite(preferred)
+                or not any(b['mode']=='original' and b['start'] <= preferred < b['end'] for b in timeline)):
+            raise ValueError('封面指定时间必须位于实际保留的原声镜头内')
+        return [preferred]
+    selected = [b for b in timeline if b['mode']=='original'] + timeline[:1]
+    return [(b['start']+b['end'])/2 for b in selected[:6]]
+
+
 def make_cover(source: Path, manifest: dict, folder: Path, series: str, brand: BrandSettings):
     """Use an actual selected shot, with a deterministic typeset cover template."""
     beats = manifest["timeline"]
     # Prefer a story's original dialogue and include the opening shot as fallback.
-    selected = [b for b in beats if b["mode"] == "original"] + beats[:1]
+    stamps = cover_times(beats, manifest.get("cover_source_time"))
     frames = []
-    for i, beat in enumerate(selected[:6]):
-        stamp = (beat["start"] + beat["end"]) / 2
+    for i, stamp in enumerate(stamps):
         path = folder / f"cover-source-{i}.jpg"
         run(["ffmpeg", "-v", "error", "-y", "-ss", stamp, "-i", source,
              "-frames:v", "1", "-vf", "scale=1280:-2", "-q:v", "2", path])
@@ -160,7 +171,7 @@ def make_cover(source: Path, manifest: dict, folder: Path, series: str, brand: B
     canvas.convert("RGB").save(cover, quality=95, subsampling=0)
     return {"version": COVER_VERSION, "file": str(cover.resolve()), "width": size[0], "height": size[1],
             "source": str(source), "source_time": stamp, "source_frame": str(frame_path.resolve()),
-            "selection": "contrast_and_sharpness_among_selected_shots", "title": manifest["title"]}
+            "selection": "reviewed_selected_original_frame" if manifest.get("cover_source_time") is not None else "contrast_and_sharpness_among_selected_shots", "title": manifest["title"]}
 
 
 def package_clip(source: Path, root: Path, manifest: dict, index: int, series: str, brand: BrandSettings):
@@ -176,6 +187,9 @@ def package_clip(source: Path, root: Path, manifest: dict, index: int, series: s
     signature = digest({"version": VERSION, "video": source_identity(clean), "title": manifest["title"],
                         "series": series, "brand": brand.model_dump(mode="json"), "logo": logo_sha,
                         "font": str(font_path(brand)) if brand.cover else None})
+    if manifest.get('cover_source_time') is not None:
+        # Include explicit frame choice without invalidating ordinary covers.
+        signature = digest({'branding_signature':signature,'cover_source_time':manifest['cover_source_time']})
     folder = root / "published" / f"{index+1:02}-{signature}"
     saved = folder / "manifest.json"
     if saved.exists():

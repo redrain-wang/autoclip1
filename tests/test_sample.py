@@ -50,3 +50,25 @@ def test_stale_or_incomplete_review_cannot_render(tmp_path, change):
 def test_tts_may_not_silently_rewrite_a_reviewed_sample():
     with pytest.raises(ValueError, match='禁止自动改写'):
         FrozenScript().json('rewrite after synthesis')
+
+
+@pytest.mark.parametrize('index',[-1,True,1.5,'1'])
+def test_watermark_rotation_rejects_invalid_indices(tmp_path,index):
+    review,video,plan,lines=fixture(tmp_path)
+    review['watermark_index']=index
+    with pytest.raises(ValueError,match='水印序号'):
+        check_review(review,video,plan,lines)
+
+
+def test_cover_choice_must_belong_to_a_retained_original_shot(tmp_path):
+    review,video,plan,lines=fixture(tmp_path)
+    review['cover_source_time']=15
+    with pytest.raises(ValueError,match='实际保留'):
+        check_review(review,video,plan,lines)
+    plan.clips[0].beats[0].mode='original'
+    plan.clips[0].beats[0].text=''
+    review['plan_digest']=digest(plan.model_dump())
+    review['units']=[{'id':u['id'],'text':u['text'],'decision':'accepted','basis':'已核对','evidence_ids':[1]}
+                     for u in units_for_clip(plan.clips[0])]
+    review['watermark_index']=1
+    check_review(review,video,plan,lines)

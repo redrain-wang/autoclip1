@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .repair import RepairNeeded
 from .util import digest, write_json
 
-VERSION = "oral-edit-3"
+VERSION = "oral-edit-7"
 WRITING_RULES = """
 口播听感规则：每段推进一个问题、选择、压力或代价，原声已讲明的动作只作必要承接。
 事实、角色指责和旁白分析分开：可见行动直接说；指责用‘在田大人的解释里’‘他把这件事说成’等自然来源交代。
@@ -44,6 +44,7 @@ class FactualChangeReview(BaseModel):
     issues: list[str]
     baseline_issues: list[str] = Field(default_factory=list)
     oral_issues: list[str] = Field(default_factory=list)
+    oral_suggestions: list[str] = Field(default_factory=list)
 
 
 def prose_signals(clip):
@@ -54,6 +55,18 @@ def prose_signals(clip):
             if marks:
                 rows.append({"beat": i, "phrases": marks})
     return rows
+
+
+def oral_proposal(raw):
+    # Some providers emit an empty schema placeholder. Accept only this
+    # inert metadata key; source/timing/evidence fields remain forbidden.
+    import copy
+    cleaned = copy.deepcopy(raw)
+    if isinstance(cleaned,dict) and isinstance(cleaned.get('changes'),list):
+        for item in cleaned['changes']:
+            if isinstance(item,dict) and item.get('reason_placeholder') == '':
+                item.pop('reason_placeholder')
+    return OralProposal.model_validate(cleaned)
 
 
 def apply_oral_changes(clip, proposal):
@@ -72,14 +85,15 @@ def apply_oral_changes(clip, proposal):
     return revised
 
 
-def polish_clip(clip, lines, root, cfg, llm):
+def polish_clip(clip, lines, root, cfg, llm, context=None):
     """At most two prose proposals, each with a separate factual check; no timing/media edits."""
     from .director import compact
     ids = {i for b in clip.beats for i in b.evidence_ids}
     relevant = [s for s in lines if s.id in ids or clip.beats[0].start-30 <= s.start <= clip.beats[-1].end+20]
     folder = root/'oral-edit'/digest({'version':VERSION, 'clip':clip.model_dump(),
-                                    'lines':[s.model_dump() for s in relevant]})
+                                    'lines':[s.model_dump() for s in relevant], 'context':context})
     folder.mkdir(parents=True, exist_ok=True)
+    editable = [{"beat":i, **b.model_dump()} for i,b in enumerate(clip.beats) if b.mode=='narration']
     feedback = ''
     baseline_issues = []
     for attempt in range(2):
@@ -87,13 +101,13 @@ def polish_clip(clip, lines, root, cfg, llm):
             WRITING_RULES + '\n只修改确有必要的narration.text，保留原有标题、角度、钩子、镜头顺序、时间码、原声、证据ID与角色归属。'
             '不删光来源限定换取顺口；可以把审核式限定改成明确的角色归属。'
             '每段新字数为原段65%–120%，不把压缩掉的重复换成空话；好段可以不改。'
-            '返回changes，每项仅含beat（0起始索引）、text完整新口播、reason。未改段不返回；无改动则changes=[]。'
+            '返回changes，每项仅含beat、text完整新口播、reason。beat必须照抄下面可改口播列表给出的编号，不重新数段落；原声编号禁止返回。未改段不返回；无改动则changes=[]。'
             f'\n格式{json.dumps(OralProposal.model_json_schema(),ensure_ascii=False)}'
-            f'\n现稿{clip.model_dump_json()}\n听感信号{json.dumps(prose_signals(clip),ensure_ascii=False)}'
+            f'\n可改口播列表{json.dumps(editable,ensure_ascii=False)}\n身份核对辅助（仅解读称谓，不补剧情）{json.dumps(context,ensure_ascii=False)}\n现稿{clip.model_dump_json()}\n听感信号{json.dumps(prose_signals(clip),ensure_ascii=False)}'
             f'\n当前原片字幕{compact(relevant)}'+feedback)
         write_json(folder/f'proposal-{attempt}.json',raw)
         try:
-            proposal = OralProposal.model_validate(raw)
+            proposal = oral_proposal(raw)
             candidate = apply_oral_changes(clip,proposal)
             if signals := prose_signals(candidate):
                 raise ValueError('仍有审查措辞，请自然交代来源后重写：'+json.dumps(signals,ensure_ascii=False))
@@ -102,8 +116,6 @@ def polish_clip(clip, lines, root, cfg, llm):
             continue
         actual_changes = [dict(item.model_dump(),before=clip.beats[item.beat].text)
                           for item in proposal.changes if item.text != clip.beats[item.beat].text]
-        if not actual_changes:
-            break
         raw_review = llm.json('你是口播精修后的独立事实核对员，不能因文字更顺就放行事实变化。',
             '对照旧稿、新稿和原片字幕，只检查本次改动是否新增无据事件、错换人物、预支后文、把承诺写成结果、'
             '把未确定消息或角色指责写成已核实事实，或改变必要的因果范围。'
@@ -112,12 +124,14 @@ def polish_clip(clip, lines, root, cfg, llm):
             '自然来源归属（如在田大人的解释里）可以覆盖本段，不要求每句补也可能或证据不足。'
             '不要求猜另一种心理，不因删除重复免责声明而拒绝；实质未知与推断性质仍要保留。'
             '本次没有画面，不声称独立认出了演员身份；不得凭电视剧记忆补证据。'
-            '另检查改写段的听感：审查措辞的近义替换、来源已明确还反复排除或替代猜心、同义总结堆叠，列oral_issues。'
+            '另只按完整新稿检查所有口播段的听感（未改段也检查）；旧稿和before字段不是观众会听到的正文，不能把旧新同一句合计为重复。'
+            'oral_issues只列明显审核腔/近义替换、无益猜心、同段反复解释同一结论、或让人不知主语和因果的严重绕句，必须给新稿原句与段号。'
+            '连接词略松、可选的措辞和节奏改进列oral_suggestions，不阻止出稿；不要要求每一句都加所以/这就是等过渡，不因可理解的简洁并列而拒绝。即使changes为空也检查全稿。'
             '不要只因为一个可能或据说就拒绝；重要未知要自然保留。人格结论/不是下定评、这场问答没说透这类换词不算改善。'
             '若额外的保护/考验等猜测不推进情节或观点，可删除；已有明确行动和说出的理由足够支撑分析时不必硬猜心理。'
-            '返回JSON {"passed":true/false,"issues":["段号、具体新增错误与旧新变化"],"baseline_issues":["已有疑点"],"oral_issues":["改写段听感问题"]}。passed只评价是否引入或加重错误，不代表全稿通过；不要返回修订稿。'
+            '返回JSON {"passed":true/false,"issues":["段号、具体新增错误与旧新变化"],"baseline_issues":["已有疑点"],"oral_issues":["新稿严重听感问题"],"oral_suggestions":["可选改进"]}。passed只评价是否引入或加重错误，不代表全稿通过；不要返回修订稿。'
             f'\n变更{json.dumps(actual_changes,ensure_ascii=False)}\n完整新稿{candidate.model_dump_json()}'
-            f'\n原片字幕{compact(relevant)}')
+            f'\n身份核对辅助{json.dumps(context,ensure_ascii=False)}\n原片字幕{compact(relevant)}')
         write_json(folder/f'factual-review-{attempt}.json',raw_review)
         try:
             verdict = FactualChangeReview.model_validate(raw_review)
@@ -134,7 +148,7 @@ def polish_clip(clip, lines, root, cfg, llm):
     write_json(folder/'result.json',{'version':VERSION,'status':'text_checked_not_timed_or_identity_certified',
                'before_digest':digest(clip.model_dump()),'after_digest':digest(candidate.model_dump()),
                'before_signals':prose_signals(clip),'after_signals':prose_signals(candidate),
-               'changes':actual_changes,'clip':candidate.model_dump(),'baseline_issues':baseline_issues,
+               'changes':actual_changes,'clip':candidate.model_dump(),'baseline_issues':baseline_issues,'oral_suggestions':verdict.oral_suggestions,
                'limitations':'文本改动检查不是完整人物/画面/剪辑验收；仍须正常审核与真实配音测时'})
     return candidate
 

@@ -117,7 +117,8 @@ def test_short_director_polishes_before_final_identity_check(tmp_path,monkeypatc
     assert events==['model','oral_edit','model','identity']
 
 
-def test_outline_writer_runs_oral_editor_before_saving_plan(tmp_path,monkeypatch):
+@pytest.mark.parametrize('char_budget',[45,90])
+def test_outline_writer_runs_oral_editor_before_saving_plan(tmp_path,monkeypatch,char_budget):
     import autoclip.outline as outline
     from autoclip.util import write_json,source_identity
     video=tmp_path/'video.mp4';video.write_bytes(b'fixture')
@@ -128,7 +129,7 @@ def test_outline_writer_runs_oral_editor_before_saving_plan(tmp_path,monkeypatch
     for i in range(1,5):
         start=16+(i-1)*20
         slots.append({'id':i,'mode':'narration','start':start,'end':start+20,'evidence_ids':[i],
-                      'allowed_evidence_ids':[i],'instruction':'说明选择代价','target_chars':45})
+                      'allowed_evidence_ids':[i],'instruction':'说明选择代价','target_chars':char_budget})
         lines.append(Line(id=i,start=start+1,end=start+5,text='剧情依据'))
     transcript=tmp_path/'transcript.json';write_json(transcript,[s.model_dump() for s in lines])
     path=tmp_path/'outline.json';write_json(path,{'source':source_identity(video),'title':'追款选择','angle':'选择代价','hook':'为何难办',
@@ -147,6 +148,7 @@ def test_outline_writer_runs_oral_editor_before_saving_plan(tmp_path,monkeypatch
     assert len(seen)==1 and result.clips[0].beats[1].text.startswith('在问话者的解释里')
     assert saved==result.model_dump()
     assert saved['clips'][0]['beats'][0]==seen[0]['beats'][0]
+    assert read_json(tmp_path/'run/draft-plan.json')['clips'][0]['beats'][1]['text']==text
 
 
 def test_existing_doubts_are_retained_for_full_review_not_marked_resolved(tmp_path):
@@ -172,3 +174,38 @@ def test_factually_unchanged_near_synonym_of_audit_language_cannot_pass(tmp_path
     with pytest.raises(RepairNeeded,match='两轮仍未通过'):
         polish_clip(fixture_clip(),[],tmp_path,Settings(),Model())
     assert len(calls)==4 and not list(tmp_path.rglob('result.json'))
+
+
+def test_no_change_proposal_still_requires_whole_script_listening_review(tmp_path):
+    clip=fixture_clip();clip.beats[1].text=proposal()['changes'][0]['text']
+    calls=[]
+    class Model:
+        def json(self,*args):
+            calls.append(args)
+            return {'changes':[]} if len(calls)%2==1 else {'passed':True,'issues':[],
+                'oral_issues':['beat 3未改段仍重复免责声明']}
+    with pytest.raises(RepairNeeded,match='两轮仍未通过'):
+        polish_clip(clip,[],tmp_path,Settings(),Model())
+    assert len(calls)==4 and not list(tmp_path.rglob('result.json'))
+
+
+def test_only_empty_metadata_placeholder_is_tolerated_source_fields_stay_forbidden():
+    from autoclip.editorial import oral_proposal
+    raw=proposal();raw['changes'][0]['reason_placeholder']=''
+    assert oral_proposal(raw).changes[0].beat==1
+    assert 'reason_placeholder' in raw['changes'][0]
+    raw['changes'][0]['evidence_ids']=[999]
+    with pytest.raises(ValidationError):oral_proposal(raw)
+
+
+def test_optional_listening_suggestions_do_not_reject_a_clear_script(tmp_path):
+    clip=fixture_clip();clip.beats[1].text=proposal()['changes'][0]['text']
+    calls=[]
+    class Model:
+        def json(self,*args):
+            calls.append(args)
+            return {'changes':[]} if len(calls)==1 else {'passed':True,'issues':[],
+                'oral_suggestions':['结尾可以略微压缩']}
+    after=polish_clip(clip,[],tmp_path,Settings(),Model())
+    assert len(calls)==2 and after.model_dump()==clip.model_dump()
+    assert read_json(next(tmp_path.rglob('result.json')))['oral_suggestions']==['结尾可以略微压缩']

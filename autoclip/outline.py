@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pydantic import BaseModel, Field
 
 from .models import Beat, Clip, Line, Plan, validate_plan
-from .editorial import WRITING_RULES, VERSION as EDITORIAL_VERSION, polish_clip
+from .editorial import WRITING_RULES, polish_clip
 from .util import digest, duration, read_json, source_identity, write_json
 
 
@@ -39,7 +39,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
             raise ValueError('提纲越界或引用不存在的证据')
         if any(lookup[i].start >= slot['end'] for i in slot['allowed_evidence_ids']):
             raise ValueError('提纲提供了当前镜头之后的剧情证据')
-    signature = digest({'v':4, 'editorial_version':EDITORIAL_VERSION, 'outline':outline, 'lines':[s.model_dump() for s in lines], 'cfg':cfg.model_dump(mode='json')})
+    signature = digest({'v':4, 'writing_rules':WRITING_RULES, 'outline':outline, 'lines':[s.model_dump() for s in lines], 'cfg':cfg.model_dump(mode='json')})
     folder = root/'outline-drafts'/signature
     folder.mkdir(parents=True, exist_ok=True)
 
@@ -50,7 +50,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
         permitted = {b['id']: b for b in slots}
         selected = {i for b in slots for i in b['allowed_evidence_ids']}
         evidence = [s for s in lines if s.id in selected]
-        constraints = [{**b, 'min_chars':round(b['target_chars']*.7),'max_chars':round(b['target_chars']*1.4)} for b in slots]
+        constraints = [{**b, 'min_chars':round(b['target_chars']*.45),'max_chars':round(b['target_chars']*1.4)} for b in slots]
         prompt = (f"作品{cfg.series}，长解说主问题：{outline['hook']}，观点：{outline['angle']}。"
             f"全片章节顺序：{[c['title'] for c in chapters]}。本次只写第{number+1}章{chapter['title']}。"
             "以连贯口语解释利益、选择、代价和因果，每个段落推进一个论点；原声已经展示事件，旁白不能只再说一遍。\n"
@@ -77,7 +77,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
                     raise ValueError('写稿必须精确覆盖本章的口播编号')
                 for b in draft.items:
                     slot = permitted[b.id]
-                    if not round(slot['target_chars']*.7) <= len(b.text) <= round(slot['target_chars']*1.4):
+                    if not round(slot['target_chars']*.45) <= len(b.text) <= round(slot['target_chars']*1.4):
                         raise ValueError(f'段{b.id}有{len(b.text)}字，不在要求范围内')
                     if not set(b.evidence_ids).issubset(slot['allowed_evidence_ids']):
                         raise ValueError(f'段{b.id}引用了未允许的证据')
@@ -85,7 +85,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
                 return draft
             except ValueError as ex:
                 feedback = ('\n上轮输出全文：'+json.dumps(raw,ensure_ascii=False)+'\n程序实数字数问题：'+str(ex)
-                    +'。要求每段至少min_chars、最多max_chars，不能维持原短稿。展开选择依据、作用及局限形成4–6句连贯分析，'
+                    +'。字数只是预估：在min_chars–max_chars内即可，不强迫每段达到target_chars。短桥保留精简，长段才展开必要选择与代价，'
                     +'而不是只报动作；返回本章全部口播，所有段落同时满足长度要求。')
                 if attempt == 2:
                     # Keep valid paragraphs; repair only failed lengths/citations.
@@ -94,7 +94,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
                         raise
                     for index, b in enumerate(draft.items):
                         slot = permitted[b.id]
-                        low, high = round(slot['target_chars']*.7), round(slot['target_chars']*1.4)
+                        low, high = round(slot['target_chars']*.45), round(slot['target_chars']*1.4)
                         if low <= len(b.text) <= high and set(b.evidence_ids).issubset(slot['allowed_evidence_ids']):
                             continue
                         local_feedback = ''
@@ -128,8 +128,9 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
     plan = Plan(episode_summary=outline['hook'], genre='历史剧', style=cfg.style,
                 clips=[Clip(title=outline['title'],angle=outline['angle'],hook=outline['hook'],beats=beats)])
     validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+    write_json(root/'draft-plan.json',plan.model_dump())
     if cfg.oral_edit:
-        plan.clips[0] = polish_clip(plan.clips[0],lines,root,cfg,llm)
+        plan.clips[0] = polish_clip(plan.clips[0],lines,root,cfg,llm,outline.get('characters_note'))
         validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
     write_json(root/'plan.json',plan.model_dump())
     return plan
