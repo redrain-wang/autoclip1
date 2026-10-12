@@ -93,17 +93,19 @@
 
 ### 模型密钥
 
-标准配置：
+生产默认使用OpenCode Go订阅，配置已指定Go专用接口与DeepSeek V4.1 Flash：
 
 ```dotenv
-DEEPSEEK_API_KEY=你的密钥
-LLM_BASE_URL=https://api.deepseek.com
-LLM_MODEL=deepseek-flash
+OPENCODE_API_KEY=你的Go密钥
+LLM_BASE_URL=https://opencode.ai/zen/go/v1
+LLM_MODEL=deepseek-v4.1-flash
 ```
 
-若旧环境把 DeepSeek 官方密钥存成了 `DASHSCOPE_API_KEY`，只有确认它确实来自 DeepSeek 后，才能设置 `DEEPSEEK_USE_DASHSCOPE_ALIAS=true` 使用此兼容别名。程序默认不将百炼密钥发送给DeepSeek；新环境应直接使用 `DEEPSEEK_API_KEY`。
+`configs.production.toml`中的模型和接口优先于环境变量。不要把Go专用地址写成按量付费的Zen地址`/zen/v1`。程序使用自己的客户端名称和稳定的`x-opencode-session`标识，不伪装为其他客户端；额度或权限失败时不会自动转到DeepSeek官方付费接口。Go有使用限额，额度不是无限；服务端的超额计费设置需在OpenCode控制台管理。参阅[Go官方说明](https://opencode.ai/docs/go/)。
 
-支持 OpenAI 兼容接口。若切换 OpenCode Go，将 `llm_base_url`、`llm_model` 写入配置，基址使用 `https://opencode.ai/zen/go/v1`，读取 `OPENCODE_API_KEY`。需确认所选模型支持图片和JSON模式；不支持图片时显式关闭 `vision`，不要将文字分析当作视觉理解。
+已用实际Go key验证文本JSON及带图请求，服务端返回`deepseek-v4.1-flash`；图片测试正确读取水印和剧名，不代表人物归属准确率已通过验收。请求缓存保留实际接口和返回模型，新请求与旧缓存统计分开解释。
+
+若主动改用DeepSeek官方，在所用配置中明确设置`llm_base_url = "https://api.deepseek.com"`、`llm_model = "deepseek-flash"`并设置`DEEPSEEK_API_KEY`。若旧环境将官方密钥存成`DASHSCOPE_API_KEY`，确认它确实来自DeepSeek后才可启用`DEEPSEEK_USE_DASHSCOPE_ALIAS=true`。Go只使用`OPENCODE_API_KEY`；两个平台的密钥不混用。
 
 ## 产物
 

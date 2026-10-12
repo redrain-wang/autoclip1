@@ -3,6 +3,7 @@ import json
 import time
 import threading
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -16,7 +17,12 @@ class LLM:
         self.root = root
         self.calls = 0
         self._lock = threading.Lock()
-        self.client = httpx.Client(timeout=httpx.Timeout(240, connect=30), headers={"Authorization": f"Bearer {settings.api_key()}"})
+        headers = {"Authorization": f"Bearer {settings.api_key()}", "User-Agent": "autoclip-director/1.1"}
+        if urlparse(settings.llm_base_url).hostname == "opencode.ai":
+            # A genuine, stable local conversation identifier for Go routing.
+            # Do not impersonate another agent or include a filesystem path.
+            headers["x-opencode-session"] = "autoclip-" + digest({"root": str(root.resolve())})
+        self.client = httpx.Client(timeout=httpx.Timeout(240, connect=30), headers=headers)
 
     def json(self, system: str, prompt: str, images: list[Path] | None = None, *, model: str | None = None):
         images = images or []
@@ -51,7 +57,8 @@ class LLM:
                 if raw.startswith("```"):
                     raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
                 result = json.loads(raw)
-                write_json(cache, {"result": result, "usage": body.get("usage", {}), "model": body.get("model"), "created": time.time()})
+                write_json(cache, {"result": result, "usage": body.get("usage", {}), "model": body.get("model"),
+                                   "requested_model": payload["model"], "endpoint": self.settings.llm_base_url, "created": time.time()})
                 return result
             except (httpx.TransportError, RuntimeError, json.JSONDecodeError) as ex:
                 last_error = str(ex)
@@ -60,6 +67,7 @@ class LLM:
 
     def usage(self):
         values = [read_json(p).get("usage", {}) for p in (self.root / "llm").glob("*.json")]
-        return {"cached_requests": len(values), "calls_this_run": self.calls,
+        return {"endpoint": self.settings.llm_base_url, "requested_model": self.settings.llm_model,
+                "cached_requests": len(values), "calls_this_run": self.calls,
                 "prompt_tokens": sum(v.get("prompt_tokens", 0) for v in values),
                 "completion_tokens": sum(v.get("completion_tokens", 0) for v in values)}

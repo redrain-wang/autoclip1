@@ -1,3 +1,6 @@
+llm_base_url = "https://opencode.ai/zen/go/v1"
+llm_model = "deepseek-v4.1-flash"
+# Go errors never switch automatically to a separately billed endpoint.
 series = "雍正王朝"
 style = "历史权谋：分析人物动机、制度困境和普通人的共鸣，克制幽默，不强行玩梗"
 # New stories only; produce selects each story independently and preserves old exports.
