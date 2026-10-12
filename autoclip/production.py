@@ -201,6 +201,8 @@ reason解释新的看点、与旧片的区别以及为什么足以撑起长视�
 
 def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: Path, maximum=3, stage="all",
                     subtitle_layer: Path | None = None, retry_rejected_from: Path | None = None):
+    if cfg.duration_profile == "long":
+        raise ValueError("加长解说请使用write-outline → measure-plan → render-sample；常规自动选题尚未验证长稿")
     identity=source_identity(video)
     root=cfg.output/(video.stem+"-"+digest(identity)[:8])
     if retry_rejected_from is not None:

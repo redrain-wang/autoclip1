@@ -40,7 +40,7 @@ class Clip(BaseModel):
     title: str = Field(min_length=2, max_length=32)
     angle: str
     hook: str
-    beats: list[Beat] = Field(min_length=4, max_length=24)
+    beats: list[Beat] = Field(min_length=4, max_length=96)
 
 
 class Plan(BaseModel):
@@ -67,6 +67,8 @@ def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: 
     elif count != 0 and len(plan.clips) != count:
         errors.append(f"需要 {count} 条视频")
     for i, clip in enumerate(plan.clips):
+        if target <= 240 and len(clip.beats) > 24:
+            errors.append(f"clips[{i}] 短片最多24个镜头；加长解说需使用长片配置")
         previous_end = -1.0
         estimated = 0
         original = 0
@@ -114,7 +116,8 @@ def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: 
         # Character-count timing is only a rough estimate; Chinese TTS and
         # punctuation vary considerably. Enforce the tighter limit after actual
         # synthesis rather than rejecting a valid story before measuring it.
-        if not (min_seconds * .9 if min_seconds else target * .5) <= estimated <= (max_seconds or target * 1.8):
+        estimate_ceiling = (max_seconds or target * 1.8) * (1.2 if target > 240 else 1)
+        if not (min_seconds * .9 if min_seconds else target * .5) <= estimated <= estimate_ceiling:
             errors.append(f"clips[{i}] 预计时长 {estimated:.0f} 秒不在目标范围内")
     for i, a in enumerate(plan.clips):
         for b in plan.clips[i + 1:]:

@@ -17,6 +17,40 @@ console = Console()
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm"}
 
 
+@app.command("write-outline")
+def outline_script(source: Annotated[Path, typer.Argument(help="带证据提纲的原片")],
+                   outline: Path = typer.Option(...), transcript: Path = typer.Option(...),
+                   output: Path = typer.Option(...), config: Path = Path("configs.long.toml")):
+    """按绑定原片的章节提纲写稿；只输出计划，仍须人物及内容核对。"""
+    from dotenv import load_dotenv
+    from .llm import LLM
+    from .outline import compose_outline
+    load_dotenv(config.resolve().parent / ".env")
+    cfg = Settings.load(config)
+    output.mkdir(parents=True, exist_ok=True)
+    llm = LLM(cfg, output)
+    try:
+        compose_outline(source, transcript, outline, output, cfg, llm)
+        console.print(f"章节稿已生成：{output / 'plan.json'}（尚未审片）", markup=False)
+    finally:
+        write_json(output / "writer-usage.json", llm.usage())
+        llm.client.close()
+
+
+@app.command("measure-plan")
+def measure_outline(source: Annotated[Path, typer.Argument(help="已写稿的原片")],
+                    plan: Path = typer.Option(...), transcript: Path = typer.Option(...),
+                    output: Path = typer.Option(...), config: Path = Path("configs.long.toml")):
+    """实配测时并提出既有口播画面的子区间，不自动改稿或批准成片。"""
+    from .sample import measure_sample_plan
+    cfg = Settings.load(config)
+    report = measure_sample_plan(source, plan, transcript, cfg, output)
+    console.print(f"实配测时：{report['measured_total_seconds']}秒；待核对计划：{output / 'plan-timed.json'}", markup=False)
+    if report['issues']:
+        console.print(str(report['issues']), markup=False)
+        raise typer.Exit(1)
+
+
 @app.command("render-sample")
 def reviewed_sample(source: Annotated[Path, typer.Argument(help="风格试片原片")],
                     plan: Path = typer.Option(...), transcript: Path = typer.Option(...),
@@ -179,6 +213,8 @@ def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目
     base=config.resolve().parent
     load_dotenv(base/".env")
     cfg=Settings.load(config)
+    if cfg.duration_profile == "long":
+        raise typer.BadParameter("长稿配置用于write-outline → measure-plan → render-sample；produce仍用于短片自动选题")
     cfg.output=(output or base/cfg.output).resolve()
     history=base/"output"
     if cfg.output==history or cfg.output in history.parents:

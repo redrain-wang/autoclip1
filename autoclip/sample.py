@@ -63,6 +63,16 @@ def render_sample(video: Path, plan_path: Path, transcript: Path, review_path: P
     root.mkdir(parents=True, exist_ok=True)
     write_json(root / "development-review.json", review)
     write_json(root / "plan.json", plan.model_dump())
+    # Reuse exact voice/rate/backend cache from the explicit measurement stage.
+    import shutil
+    prior_voices = output/'voice-preflight'/'voices'
+    if prior_voices.exists():
+        target_voices = root/'voices'
+        target_voices.mkdir(exist_ok=True)
+        for cached in prior_voices.iterdir():
+            if (cached.suffix == '.mp3' and '.part.' not in cached.name) or cached.name.endswith('.boundaries.jsonl'):
+                target = target_voices/cached.name
+                if not target.exists(): shutil.copy2(cached,target)
     lengths = {i: duration(synthesize(b.text, root, local)) for i, b in enumerate(clip.beats) if b.mode == 'narration'}
     timing = timing_report(clip, lengths, local)
     write_json(root / "timing.json", timing)
@@ -81,3 +91,53 @@ def render_sample(video: Path, plan_path: Path, transcript: Path, review_path: P
     target = export_finished(output)
     build_report(output)
     return finished, target
+
+
+def measure_sample_plan(video, plan_path, transcript, cfg, output):
+    """Measure frozen text and propose footage trims, before development review."""
+    from concurrent.futures import ThreadPoolExecutor
+    from .render import synthesize
+    from .repair import timing_report, voice_fits
+    plan = Plan.model_validate(read_json(plan_path))
+    lines = [Line.model_validate(x) for x in read_json(transcript)]
+    if read_json(transcript.parent/'source.json') != source_identity(video):
+        raise ValueError('配音预检字幕与原片版本不匹配')
+    seconds = duration(video)
+    validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+    stage = output/'voice-preflight'
+    stage.mkdir(parents=True, exist_ok=True)
+    clip = plan.clips[0]
+    unique = list(dict.fromkeys(b.text for b in clip.beats if b.mode=='narration'))
+    def voice(text):
+        return text, duration(synthesize(text,stage,cfg))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        measured = dict(pool.map(voice,unique))
+    lengths = {i:measured[b.text] for i,b in enumerate(clip.beats) if b.mode=='narration'}
+    changes = []
+    for i,b in enumerate(clip.beats):
+        if b.mode != 'narration' or voice_fits(lengths[i]+.35,b.end-b.start,cfg):
+            continue
+        spoken = lengths[i]+.35
+        if spoken >= .72*(b.end-b.start):
+            continue  # Overlong narration requires a separately reviewed rewrite.
+        original = b.model_dump()
+        selected = max(1, spoken/.9)
+        b.start = round(b.end-selected,3)
+        try:
+            validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+        except ValueError:
+            b.start = original['start']
+            b.end = round(b.start+selected,3)
+            try:
+                validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+            except ValueError:
+                b.start,b.end = original['start'],original['end']
+                continue
+        changes.append({'beat':i,'before':[original['start'],original['end']], 'after':[b.start,b.end],
+                        'reason':'保留口播、原声和引用，仅从既有口播画面范围内选取与实配匹配的子区间'})
+    report = timing_report(clip,lengths,cfg)
+    report['footage_changes'] = changes
+    report['status'] = 'measured_not_reviewed'
+    write_json(output/'timing-preflight.json',report)
+    write_json(output/'plan-timed.json',plan.model_dump())
+    return report

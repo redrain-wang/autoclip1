@@ -16,6 +16,7 @@ class LLM:
         self.settings = settings
         self.root = root
         self.calls = 0
+        self.model_calls = {}
         self._lock = threading.Lock()
         headers = {"Authorization": f"Bearer {settings.api_key()}", "User-Agent": "autoclip-director/1.1"}
         if urlparse(settings.llm_base_url).hostname == "opencode.ai":
@@ -42,6 +43,7 @@ class LLM:
                 if self.calls >= self.settings.max_api_calls:
                     raise RuntimeError("已达到本次 API 调用次数上限；提高 max_api_calls 后重试。")
                 self.calls += 1
+                self.model_calls[payload["model"]] = self.model_calls.get(payload["model"], 0) + 1
             try:
                 response = self.client.post(self.settings.llm_base_url.rstrip("/") + "/chat/completions", json=payload)
                 if response.status_code >= 400:
@@ -67,7 +69,8 @@ class LLM:
 
     def usage(self):
         values = [read_json(p).get("usage", {}) for p in (self.root / "llm").glob("*.json")]
-        return {"endpoint": self.settings.llm_base_url, "requested_model": self.settings.llm_model,
+        return {"endpoint": self.settings.llm_base_url, "configured_model": self.settings.llm_model,
+                "calls_this_run_by_model": dict(self.model_calls),
                 "cached_requests": len(values), "calls_this_run": self.calls,
                 "prompt_tokens": sum(v.get("prompt_tokens", 0) for v in values),
                 "completion_tokens": sum(v.get("completion_tokens", 0) for v in values)}

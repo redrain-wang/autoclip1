@@ -11,9 +11,10 @@ class Settings(BaseModel):
     series: str = "自动识别"
     style: str = "auto"
     clips: int = Field(default=2, ge=0, le=10)
-    target_seconds: int = Field(default=100, ge=45, le=240)
+    duration_profile: Literal["short", "long"] = "short"
+    target_seconds: int = Field(default=100, ge=45, le=1200)
     min_seconds: float | None = Field(default=None, ge=30)
-    max_seconds: float | None = Field(default=None, le=600)
+    max_seconds: float | None = Field(default=None, le=1200)
     opening: Literal["narration", "original"] = "narration"
     original_ratio_target: float = Field(default=.4, ge=.2, le=.8)
     portrait: bool = True
@@ -26,7 +27,11 @@ class Settings(BaseModel):
     asr_prompt: str = "以下是中文影视剧对白，使用简体中文。"
     chunk_seconds: int = 300
     voice: str = "zh-CN-YunyangNeural"
-    tts: str = "edge"
+    tts: Literal["edge", "azure", "macos"] = "edge"
+    edge_endpoint: Literal["bing", "msedge"] = "msedge"
+    macos_voice: str = "Tingting"
+    macos_rate: int = Field(default=240, ge=120, le=450)
+    azure_speech_region: str | None = Field(default=None, pattern=r"^[a-z0-9-]+$")
     tts_rate: str = "+8%"
     original_volume: float = 0.035
     output: Path = Path("output")
@@ -37,6 +42,10 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def duration_range(self):
+        if self.duration_profile == "short" and (self.target_seconds > 240 or (self.max_seconds or 0) > 600):
+            raise ValueError("加长解说需显式设置duration_profile=long；短片配置不自动放宽")
+        if self.duration_profile == "long" and self.target_seconds < 300:
+            raise ValueError("加长解说target_seconds至少300秒")
         if self.identity_gate and not self.vision:
             raise ValueError("人物归属检查需要vision=true")
         if self.min_seconds is not None and self.min_seconds > self.target_seconds:
@@ -48,12 +57,13 @@ class Settings(BaseModel):
     @classmethod
     def load(cls, path: Path | None = None):
         import tomllib
-        load_dotenv()
+        load_dotenv(path.resolve().parent / ".env" if path else None)
         data = tomllib.loads(path.read_text()) if path else {}
         registry = os.getenv("AUTOCLIP_IDENTITY_REGISTRY") or data.get("identity_registry")
         if registry:
             registry = Path(registry).expanduser()
             data["identity_registry"] = (path.resolve().parent / registry if path and not registry.is_absolute() else registry).resolve()
+        data.setdefault("azure_speech_region", os.getenv("AZURE_SPEECH_REGION") or None)
         data.setdefault("llm_model", os.getenv("LLM_MODEL", "deepseek-flash"))
         data.setdefault("llm_base_url", os.getenv("LLM_BASE_URL", "https://api.deepseek.com"))
         return cls(**data)

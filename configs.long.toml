@@ -1,0 +1,27 @@
+llm_base_url = "https://opencode.ai/zen/go/v1"
+llm_model = "deepseek-v4.1-flash"
+# Go errors never switch automatically to a separately billed endpoint.
+series = "雍正王朝"
+style = "15–20分钟因果解读：一个总问题，多个有证据的章节；解释人物选择、利益、代价和其他可能，不把指责当作内心事实"
+# Source-bound outline → measured narration → reviewed sample. Not the short produce path.
+duration_profile = "long"
+clips = 1
+target_seconds = 1050
+min_seconds = 900
+max_seconds = 1200
+opening = "original"
+original_ratio_target = 0.6
+portrait = true
+vision = true
+asr_backend = "mlx"
+asr_model = "mlx-community/whisper-large-v3-turbo"
+asr_prompt = "雍正王朝。康熙，胤禛，胤祥，胤禩，胤礽，李卫，田文镜，邬思道，年羹尧，张廷玉，索额图，佟国维，黄河，赈灾，户部。简体中文对白。"
+tts = "edge"
+edge_endpoint = "msedge"
+voice = "zh-CN-YunyangNeural"
+research_before_produce = true
+identity_gate = true
+identity_registry = "output/人物锚点/registry.json"
+tts_rate = "+8%"
+output = "output/加长解读"
+max_api_calls = 100

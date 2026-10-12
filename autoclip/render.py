@@ -1,9 +1,7 @@
-import asyncio
 import json
 import re
 from pathlib import Path
 
-import edge_tts
 from rich.console import Console
 
 from .config import Settings
@@ -17,32 +15,29 @@ VERSION = "render-8"
 
 
 def synthesize(text: str, folder: Path, cfg: Settings):
-    name = digest({"text": text, "voice": cfg.voice, "rate": cfg.tts_rate, "backend": cfg.tts})
+    effective_voice = cfg.macos_voice if cfg.tts == "macos" else cfg.voice
+    effective_rate = cfg.macos_rate if cfg.tts == "macos" else cfg.tts_rate
+    name = digest({"text": text, "voice": effective_voice, "rate": effective_rate, "backend": cfg.tts})
     target = folder / "voices" / (name + ".mp3")
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and target.stat().st_size > 100:
         return target
     partial = target.with_suffix(".part.mp3")
     if cfg.tts == "edge":
-        async def speak():
-            for attempt in range(3):
-                try:
-                    await edge_tts.Communicate(text, cfg.voice, rate=cfg.tts_rate).save(str(partial), str(target.with_suffix(".boundaries.jsonl")))
-                    return
-                except Exception:
-                    if attempt == 2:
-                        raise RuntimeError("配音服务失败；重试或显式将 tts 改为 macos 使用系统语音。") from None
-                    await asyncio.sleep(2 ** attempt)
-        asyncio.run(speak())
+        from .speech import edge_synthesize
+        edge_synthesize(text, partial, target.with_suffix(".boundaries.jsonl"), cfg)
+    elif cfg.tts == "azure":
+        from .speech import azure_synthesize
+        azure_synthesize(text, partial, cfg)
     elif cfg.tts == "macos":
         spoken = target.with_suffix(".txt")
         spoken.write_text(text, encoding="utf-8")
         aiff = target.with_suffix(".aiff")
-        run(["say", "-v", "Tingting", "-r", "240", "-f", spoken, "-o", aiff])
+        run(["say", "-v", cfg.macos_voice, "-r", cfg.macos_rate, "-f", spoken, "-o", aiff])
         run(["ffmpeg", "-v", "error", "-y", "-i", aiff, partial])
         aiff.unlink(missing_ok=True)
     else:
-        raise ValueError("tts 必须是 edge 或 macos")
+        raise ValueError("tts 必须是 edge、azure 或 macos")
     if duration(partial) <= 0:
         raise ValueError("配音输出为空")
     partial.replace(target)
@@ -280,6 +275,8 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
     from .metrics import audio_mix
     manifest = {"title": clip.title, "angle": clip.angle, "hook": clip.hook, "video": str(final.resolve()),
                 "audio_mix": audio_mix(timeline),
+                "speech": {"backend": cfg.tts, "voice": cfg.macos_voice if cfg.tts == "macos" else cfg.voice,
+                           "rate": cfg.macos_rate if cfg.tts == "macos" else cfg.tts_rate},
                 "poster": str(poster.resolve()),
                 "duration": final_seconds, "width": width, "height": height, "timeline": timeline,
                 "qa": {"full_decode": "passed", "audio_video_streams": "passed", "duration": "passed",

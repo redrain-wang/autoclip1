@@ -18,6 +18,8 @@ console = Console()
 
 
 def process(video: Path, cfg: Settings, stage="all", previous=None, brand_config=Path("branding.toml")):
+    if cfg.duration_profile == "long" and stage in {"all", "plan"}:
+        raise ValueError("加长解说请使用write-outline → measure-plan → render-sample；常规批量编导尚未验证长稿")
     identity = source_identity(video)
     root = cfg.output / (video.stem + "-" + digest(identity)[:8])
     root.mkdir(parents=True, exist_ok=True)
