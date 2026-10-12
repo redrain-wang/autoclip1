@@ -1,4 +1,6 @@
 series = "雍正王朝"
+# Refine narration for listeners, then check factual changes before TTS.
+oral_edit = true
 style = "历史权谋：分析人物动机、制度困境和普通人的共鸣，克制幽默，不强行玩梗"
 # 2 means two requested clips, not that only two highlights exist. Use 0 for auto (0–6).
 clips = 2

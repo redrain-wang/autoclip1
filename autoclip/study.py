@@ -5,6 +5,7 @@ import json
 from pydantic import BaseModel, Field
 
 from .models import Clip, Beat
+from .editorial import WRITING_RULES
 from .util import source_identity, write_json
 
 
@@ -40,14 +41,14 @@ def compare_scripts(video, root, lines, start, end, cfg, llm):
         f"作品{cfg.series}，范围{start}–{end}秒。只依据本段，先写current当前剧情描述版，再写analysis因果分析版。"
         "两个版本各4–8段口播，合计约260–400汉字，不是完整视频时长。每段指定实际证据ID；不需要重复复述所有对白。"
         "analysis回答一个具体问题：人物有哪些选择、行为的收益代价、反对解释是否成立，最后落到已发生的结果。"
-        "B版至少两段口播text本身解释因果或选择代价，至少一段口播交代另一种解释与证据局限；"
+        "B版至少两段口播text本身解释因果或选择代价，涉及指责或动机时自然交代来源或分析性质；"
         "不能只把这些内容放进interpretation或alternative备注，不能沿着A版逐句复述。"
         "人物指责别人的动机要说清是谁的指责，不能直接升级成客观事实。推断写在interpretation，用限定语融入口播text。"
         "alternative记录其他解释；纯事实段两项可为空。角色自述与指责不是自动核实的客观事实。"
         "为避免ASR姓名错字，优先使用本段明确的姓氏职称，不补写未经确认的完整姓名。"
         "不要照抄明显不通的ASR错句或未经核定的文言引文，用稳妥的白话概括；避免把指责者和被指责者调换。"
         "这次只比稿，不全面更换风格、不仿写任何其他创作者原稿。"
-        f"\n独立原片人物核对（不确定处不能猜）：{json.dumps(turns,ensure_ascii=False)}"
+        + WRITING_RULES + f"\n独立原片人物核对（不确定处不能猜）：{json.dumps(turns,ensure_ascii=False)}"
         f"\n格式{json.dumps(Comparison.model_json_schema(),ensure_ascii=False)}\n字幕\n{compact(evidence)}")
     versions = Comparison.model_validate(raw)
     outcomes = {}
@@ -71,8 +72,8 @@ def compare_scripts(video, root, lines, start, end, cfg, llm):
                 "不能用含糊代词掩盖归属；核心论点无法成立则保留疑点，不编证据。"
                 "减少复述，不照抄ASR错字或文言。每段证据只能选当前字幕ID。"
                 + ("这是B因果分析版：口播text中至少两段讲明不同选择的收益代价、话语策略或结果的原因，"
-                   "至少一段口播说明其他解释及证据局限，不能只写在备注里。" if name == "analysis" else "这是A剧情描述版，只概括已发生事件。")
-                + f"\n原稿{script.model_dump_json()}\n人物核对问题{json.dumps(verdict['issues'],ensure_ascii=False)}"
+                   "来源与分析性质自然融入口播；不强制另猜一种心理。" if name == "analysis" else "这是A剧情描述版，只概括已发生事件。")
+                + WRITING_RULES + f"\n原稿{script.model_dump_json()}\n人物核对问题{json.dumps(verdict['issues'],ensure_ascii=False)}"
                 + f"\n口播深度问题{json.dumps(depth['issues'],ensure_ascii=False)}"
                 + f"\n盲核对发言{json.dumps(turns,ensure_ascii=False)}\n字幕{compact(evidence)}"
                 + f"\n返回完整一版，格式{json.dumps(ScriptVersion.model_json_schema(),ensure_ascii=False)}")
@@ -119,7 +120,7 @@ def assess_depth(raw, script):
     if len({q.paragraph for q in review.causal}) < 2:
         issues.append("口播正文至少两段需要因果、选择代价或策略分析，不能只有剧情复述")
     if not review.limitation:
-        issues.append("口播正文缺少其他解释或证据局限")
+        issues.append("口播正文缺少来源归属或必要推断边界")
     return {"passed": not issues, "issues": issues, "review": review.model_dump()}
 
 
@@ -127,10 +128,10 @@ def review_depth(script, evidence, llm):
     from .director import compact
     raw = llm.json("你是解说稿编辑，只评价听众实际听到的口播，不给备注加分。",
         "检查这些口播是否解释了人物选择、收益代价、话语策略或结果产生原因；只复述人物的指责不算分析。"
-        "至少找出两个不同段落中的有效分析causal，以及至少一处限定推断或其他解释limitation。"
+        "至少找出两个不同段落中的有效分析causal，以及至少一处来源归属或必要推断边界limitation；角色归属语就是有效边界，不要求审核式免责声明。"
         "逐字摘录text并解释分析增量，无增量则留空。issues列出无证据推断、指责被写成客观事实或其他具体问题。"
         "不需要刻意找问题，也不能把一句因为所以自动算作分析。"
-        f"\n格式{json.dumps(DepthReview.model_json_schema(),ensure_ascii=False)}"
+        + WRITING_RULES + f"\n格式{json.dumps(DepthReview.model_json_schema(),ensure_ascii=False)}"
         f"\n口播{json.dumps([p.text for p in script.paragraphs],ensure_ascii=False)}\n原片字幕{compact(evidence)}")
     try:
         return assess_depth(raw, script)

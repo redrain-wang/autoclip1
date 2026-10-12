@@ -20,6 +20,7 @@ class Settings(BaseModel):
     portrait: bool = True
     vision: bool = True
     research_before_produce: bool = False
+    oral_edit: bool = False
     identity_gate: bool = False
     identity_registry: Path | None = None
     asr_backend: str = "mlx" if platform.system() == "Darwin" and platform.machine() == "arm64" else "faster"

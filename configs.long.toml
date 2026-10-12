@@ -2,6 +2,8 @@ llm_base_url = "https://opencode.ai/zen/go/v1"
 llm_model = "deepseek-v4.1-flash"
 # Go errors never switch automatically to a separately billed endpoint.
 series = "雍正王朝"
+# Refine narration for listeners, then check factual changes before TTS.
+oral_edit = true
 style = "15–20分钟因果解读：一个总问题，多个有证据的章节；解释人物选择、利益、代价和其他可能，不把指责当作内心事实"
 # Source-bound outline → measured narration → reviewed sample. Not the short produce path.
 duration_profile = "long"

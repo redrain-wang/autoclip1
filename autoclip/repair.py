@@ -111,6 +111,7 @@ def review_voice_changes(revised, changes, root, cfg, llm, lines, attempt, video
             last=max([beat.end]+[s.end for s in cited])
             times.extend([max(0,first-3),first+.2,(first+last)/2,last-.2])
         images=[contact_sheet(video,root,times,f"voice-facts-{attempt}")]
+    from .editorial import WRITING_RULES
     extra = ("本次为局部扩写，还须拦截凑字数的空话、重复复述，以及新增内容超出原引用依据。"
              "解释或人物动机推测必须明确是分析，不能当成已经发生的事实。" if expansion else "")
     review = llm.json("你是影视口播事实审核员，核查局部时长改写后的文案。",
@@ -120,7 +121,7 @@ def review_voice_changes(revised, changes, root, cfg, llm, lines, attempt, video
         "特别核验‘谁提议、谁回答、谁拒绝’：字幕没有说话人标签，不能把台词相邻当成同一人说话；"
         "结合称呼、前后回应与所附画面交叉判断。不能确定主语时改为不指定说话人的准确表述，不得猜测。"
         '返回JSON {"passed":true/false,"issues":["具体镜头与问题"]}。\n'
-        + extra + background_context(cfg.series) + json.dumps({"changes": changes, "clip": revised.model_dump(),
+        + WRITING_RULES + extra + background_context(cfg.series) + json.dumps({"changes": changes, "clip": revised.model_dump(),
                       "evidence": [s.model_dump() for s in lines]}, ensure_ascii=False), images)
     write_json(root / f"voice-local-repair-{attempt}.json", {"changes": changes, "review": review})
     if review.get("passed") is not True or review.get("issues") != []:
@@ -170,6 +171,7 @@ def expand_short_voice(clip, report, slots, root, llm, lines, attempt):
     import json
     from .budget import spoken_characters
     from .util import write_json
+    from .editorial import WRITING_RULES
     result = llm.json("你是影视解说编辑，进行一次有证据的局部口播扩写（版本2）。",
         "这条片子仅略短，所有镜头和口播已经匹配。从候选slots中选择最值得补充的1–2段口播改写全文，镜头、原声和引用不得改变。"
         "余量最大的镜头不一定最值得扩写，请按证据与必要解释选择。各段extra_seconds是可分配上限，不要求每段都用满；"
@@ -180,7 +182,7 @@ def expand_short_voice(clip, report, slots, root, llm, lines, attempt):
         "目标配音秒数和有效字数只是参考，实测仍须通过。"
         '若没有值得增加的内容，返回 {"declined":true,"reason":"原因"}；否则返回 '
         '{"changes":[{"beat":镜头索引,"text":"扩写后完整口播","reason":"增加什么必要信息及引用依据"}]}。\n'
-        + json.dumps({"slots": slots,
+        + WRITING_RULES + json.dumps({"slots": slots,
                       "missing_seconds": round(report["required_total_seconds"][0] - report["measured_total_seconds"], 3),
                       "clip": clip.model_dump(),
                       "evidence": [s.model_dump() for s in lines]}, ensure_ascii=False))

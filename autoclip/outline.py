@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pydantic import BaseModel, Field
 
 from .models import Beat, Clip, Line, Plan, validate_plan
+from .editorial import WRITING_RULES, VERSION as EDITORIAL_VERSION, polish_clip
 from .util import digest, duration, read_json, source_identity, write_json
 
 
@@ -38,7 +39,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
             raise ValueError('提纲越界或引用不存在的证据')
         if any(lookup[i].start >= slot['end'] for i in slot['allowed_evidence_ids']):
             raise ValueError('提纲提供了当前镜头之后的剧情证据')
-    signature = digest({'v':3, 'outline':outline, 'lines':[s.model_dump() for s in lines], 'cfg':cfg.model_dump(mode='json')})
+    signature = digest({'v':4, 'editorial_version':EDITORIAL_VERSION, 'outline':outline, 'lines':[s.model_dump() for s in lines], 'cfg':cfg.model_dump(mode='json')})
     folder = root/'outline-drafts'/signature
     folder.mkdir(parents=True, exist_ok=True)
 
@@ -52,8 +53,8 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
         constraints = [{**b, 'min_chars':round(b['target_chars']*.7),'max_chars':round(b['target_chars']*1.4)} for b in slots]
         prompt = (f"作品{cfg.series}，长解说主问题：{outline['hook']}，观点：{outline['angle']}。"
             f"全片章节顺序：{[c['title'] for c in chapters]}。本次只写第{number+1}章{chapter['title']}。"
-            "以连贯口语解释利益、选择、代价和因果，每个段落推进一个论点；原声已经展示事件，旁白不能只再说一遍。"
-            "可以用贴切类比解释机制，但不是额外历史事实。对动机的推断要限定，并允许另一种解释；不能每段都机械免责声明。"
+            "以连贯口语解释利益、选择、代价和因果，每个段落推进一个论点；原声已经展示事件，旁白不能只再说一遍。\n"
+            "可以用贴切类比解释机制，但不是额外历史事实。角色指责自然交代来源，真实未知留白；不强制补另一种心理猜测。"
             "提纲instruction也是编辑角度，不能当作额外剧情证据。身份开发备注可辅助称谓，不能推导未给的内心。"
             "不用开场白、结尾求关注、某某告诉我们、听这句原声；相邻段不要重复同一个观点。"
             "不得引用未提供的后续剧情或影视记忆，姓名/金额/官职有疑点就采用已核定称谓或省略细节。"
@@ -64,6 +65,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
             "证据只从本段allowed_evidence_ids选，必须支持主张，至少一项要落在本镜头或已播放过的前文。"
             f"\n人物核对备注：{outline.get('characters_note','')}\n段落{json.dumps(constraints,ensure_ascii=False)}"
             f"\n格式{json.dumps(ChapterDraft.model_json_schema(),ensure_ascii=False)}\n原片ASR\n{compact(evidence)}")
+        prompt += WRITING_RULES
         feedback = ''
         for attempt in range(3):
             candidate = path if path.exists() else folder/f'chapter-{number}-attempt-2.json'
@@ -103,7 +105,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
                                 f"\n编辑角度{slot['instruction']}\n原稿{b.model_dump_json()}"
                                 f"\n允许证据{compact([s for s in evidence if s.id in slot['allowed_evidence_ids']])}\n证据ID仅限{slot['allowed_evidence_ids']}"
                                 + f'\n只返回数据对象，形如{{"id":{b.id},"text":"完整中文口播","evidence_ids":[真实字幕编号]}}。不要输出JSON schema或properties。'
-                                + local_feedback)
+                                + WRITING_RULES + local_feedback)
                             write_json(folder/f'chapter-{number}-beat-{b.id}-repair-{local_attempt}.json',patched)
                             try:
                                 revised = WrittenBeat.model_validate(patched)
@@ -126,5 +128,8 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
     plan = Plan(episode_summary=outline['hook'], genre='历史剧', style=cfg.style,
                 clips=[Clip(title=outline['title'],angle=outline['angle'],hook=outline['hook'],beats=beats)])
     validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+    if cfg.oral_edit:
+        plan.clips[0] = polish_clip(plan.clips[0],lines,root,cfg,llm)
+        validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
     write_json(root/'plan.json',plan.model_dump())
     return plan

@@ -8,6 +8,7 @@ from .util import digest, read_json, source_identity, write_json, duration
 
 
 class FrozenScript:
+    frozen_script = True
     def json(self, *args, **kwargs):
         raise ValueError("试片稿已核对，禁止自动改写；请调整时间线或文字后重新核对")
 
