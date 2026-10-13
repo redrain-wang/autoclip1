@@ -77,14 +77,24 @@ def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: 
             label = f"clips[{i}].beats[{j}]"
             if beat.end > source_duration:
                 errors.append(f"{label} 越过原片结尾")
-            if beat.start < previous_end - 0.05:
+            # Explicit long-form teaser: only the first original shot can move
+            # ahead of the story. The main timeline remains chronological.
+            teaser = opening == "original_teaser"
+            if beat.start < previous_end - 0.05 and not (teaser and j == 1):
                 errors.append(f"{label} 必须按原片时间递增，不能重复或倒置剧情")
+            if teaser and j > 0 and max(beat.start,clip.beats[0].start) < min(beat.end,clip.beats[0].end)-.04:
+                errors.append(f"{label} 正文不能重复播放前置高光区间")
             previous_end = beat.end
+            def eligible(line):
+                # The first bridge may discuss only the teaser viewers have
+                # already seen. Later body shots cannot borrow unseen future.
+                return (evidence_matches(line,beat,context)
+                        or (teaser and j==1 and beat.mode=='narration' and line.id in context))
             if any(s not in lookup for s in beat.evidence_ids):
                 errors.append(f"{label} 引用了不存在的字幕 ID")
-            elif not any(evidence_matches(lookup[s],beat,context) for s in beat.evidence_ids):
+            elif not any(eligible(lookup[s]) for s in beat.evidence_ids):
                 errors.append(f"{label} 没有落在画面区间内的字幕证据")
-            elif not any(lookup[s].confidence >= .4 and evidence_matches(lookup[s],beat,context) for s in beat.evidence_ids):
+            elif not any(lookup[s].confidence >= .4 and eligible(lookup[s]) for s in beat.evidence_ids):
                 errors.append(f"{label} 只有低置信度识别，不能据此写稿")
             context.update(s for s in beat.evidence_ids if s in lookup and lookup[s].start < beat.end and lookup[s].end > beat.start)
             if beat.mode == "original":
@@ -92,7 +102,7 @@ def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: 
                 estimated += beat.end - beat.start
             else:
                 estimated += max(2, len(beat.text) / 4.5)
-        if opening == "original":
+        if opening in {"original", "original_teaser"}:
             if clip.beats[0].mode != "original":
                 errors.append(f"clips[{i}] 开头应保留精彩原声，之后再接解说")
             else:
@@ -105,7 +115,11 @@ def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: 
                         errors.append(f"clips[{i}] 原声开场必须连续，不能拼接分散片段凑时长")
                     opening_seconds += beat.end-beat.start
                     opening_end = beat.end
-                if not 10 <= opening_seconds <= 22:
+                if opening == "original_teaser" and (len(clip.beats)<2 or clip.beats[1].mode != "narration"):
+                    errors.append(f"clips[{i}] 前置高光必须是一段连续原声，随后用解说明确接回正文")
+                if opening == "original_teaser" and not 18 <= opening_seconds <= 22:
+                    errors.append(f"clips[{i}] 前置高光实长{opening_seconds:.2f}秒，需18–22秒并保留完整对白")
+                elif opening == "original" and not 10 <= opening_seconds <= 22:
                     errors.append(f"clips[{i}] 原声开场实长{opening_seconds:.2f}秒，需10–22秒；优先10–18秒并保留完整句子")
             if not any(b.mode == "narration" for b in clip.beats):
                 errors.append(f"clips[{i}] 原声开场后需要有观点的解说")

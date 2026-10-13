@@ -31,13 +31,15 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
     all_slots = [b for c in chapters for b in c['beats']]
     if len({b['id'] for b in all_slots}) != len(all_slots):
         raise ValueError('提纲镜头编号重复')
-    for slot in all_slots:
+    teaser_ids = set(all_slots[0]['evidence_ids']) if cfg.opening=='original_teaser' else set()
+    for index,slot in enumerate(all_slots):
         # Validate source intervals and direct evidence before spending tokens.
         Beat(mode=slot['mode'], start=slot['start'], end=slot['end'], text='待写稿' if slot['mode']=='narration' else '',
              evidence_ids=slot['evidence_ids'], reason=slot['instruction'])
         if slot['end'] > duration(video) or any(i not in lookup for i in slot['allowed_evidence_ids']):
             raise ValueError('提纲越界或引用不存在的证据')
-        if any(lookup[i].start >= slot['end'] for i in slot['allowed_evidence_ids']):
+        shown_teaser = teaser_ids if index==1 else set()
+        if any(lookup[i].start >= slot['end'] and i not in shown_teaser for i in slot['allowed_evidence_ids']):
             raise ValueError('提纲提供了当前镜头之后的剧情证据')
     signature = digest({'v':4, 'writing_rules':WRITING_RULES, 'outline':outline, 'lines':[s.model_dump() for s in lines], 'cfg':cfg.model_dump(mode='json')})
     folder = root/'outline-drafts'/signature
@@ -58,6 +60,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
             "提纲instruction也是编辑角度，不能当作额外剧情证据。身份开发备注可辅助称谓，不能推导未给的内心。"
             "不用开场白、结尾求关注、某某告诉我们、听这句原声；相邻段不要重复同一个观点。"
             "不得引用未提供的后续剧情或影视记忆，姓名/金额/官职有疑点就采用已核定称谓或省略细节。"
+            "若使用前置高光，开场后的第一段只用已展示片段提出问题并明确回到较早的正文；不能把前置事件写成此时刚发生。正文不重复播放这段高光。"
             "注意ASR老师可能是老十，皇阿嬷是皇阿玛，田文靖/谢文静可能是田大人；不要把这些错词朗读。"
             "对白引用不能照抄明显ASR错字或文言，不照搬参考作者原稿。"
             "每段text字数在给定min_chars和max_chars内，带必要推理与限定，不用重复和空话凑数。"
@@ -127,8 +130,8 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
                   evidence_ids=texts[b['id']].evidence_ids if b['mode']=='narration' else b['evidence_ids'],reason=b['instruction']) for b in all_slots]
     plan = Plan(episode_summary=outline['hook'], genre='历史剧', style=cfg.style,
                 clips=[Clip(title=outline['title'],angle=outline['angle'],hook=outline['hook'],beats=beats)])
-    validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
     write_json(root/'draft-plan.json',plan.model_dump())
+    validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
     if cfg.oral_edit:
         plan.clips[0] = polish_clip(plan.clips[0],lines,root,cfg,llm,outline.get('characters_note'))
         validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)

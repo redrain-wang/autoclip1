@@ -75,3 +75,46 @@ def test_audio_mix_uses_encoded_duration_and_only_initial_block():
     assert mix['opening_seconds']==12
     assert mix['opening_mode']=='original'
     assert audio_mix([])['original_ratio']==0
+
+
+def teaser_plan():
+    plan,lines=opening_plan()
+    plan.clips[0].beats[0]=Beat(mode='original',start=200,end=220,evidence_ids=[6],reason='前置高光')
+    lines.append(Line(id=6,start=201,end=219,text='谁能担待？朕来担待。'))
+    return plan,lines
+
+
+def test_explicit_teaser_can_jump_once_and_preserves_legacy_original_rules():
+    plan,lines=teaser_plan()
+    validate_plan(plan,lines,220,1,190,120,240,'original_teaser')
+    with pytest.raises(ValueError,match='必须按原片时间递增'):
+        validate_plan(plan,lines,220,1,190,120,240,'original')
+    with pytest.raises(ValueError,match='长片提纲'):
+        Settings(opening='original_teaser')
+    assert Settings(opening='original_teaser',duration_profile='long',target_seconds=1050).opening=='original_teaser'
+
+
+def test_first_bridge_can_discuss_shown_teaser_but_not_unseen_future():
+    plan,lines=teaser_plan()
+    plan.clips[0].beats[1].evidence_ids=[6]
+    validate_plan(plan,lines,220,1,190,120,240,'original_teaser')
+    lines.append(Line(id=7,start=180,end=190,text='尚未展示的结局'))
+    plan.clips[0].beats[1].evidence_ids=[7]
+    with pytest.raises(ValueError,match='字幕证据'):
+        validate_plan(plan,lines,220,1,190,120,240,'original_teaser')
+    plan.clips[0].beats[1].evidence_ids=[1]
+    plan.clips[0].beats[3].evidence_ids=[6]
+    with pytest.raises(ValueError,match='字幕证据'):
+        validate_plan(plan,lines,220,1,190,120,240,'original_teaser')
+
+
+@pytest.mark.parametrize('case',['repeat','second_jump','short','long','no_bridge'])
+def test_teaser_does_not_allow_repeats_extra_jumps_or_invalid_opening(case):
+    plan,lines=teaser_plan();b=plan.clips[0].beats
+    if case=='repeat':b[-1].start=201;b[-1].end=220;b[-1].evidence_ids=[6]
+    if case=='second_jump':b[3].start=12;b[3].end=25;b[3].evidence_ids=[1]
+    if case=='short':b[0].end=216
+    if case=='long':b[0].end=225
+    if case=='no_bridge':b[1].mode='original';b[1].text=''
+    with pytest.raises(ValueError):
+        validate_plan(plan,lines,240,1,190,120,240,'original_teaser')

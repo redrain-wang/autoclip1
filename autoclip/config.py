@@ -15,7 +15,7 @@ class Settings(BaseModel):
     target_seconds: int = Field(default=100, ge=45, le=1200)
     min_seconds: float | None = Field(default=None, ge=30)
     max_seconds: float | None = Field(default=None, le=1200)
-    opening: Literal["narration", "original"] = "narration"
+    opening: Literal["narration", "original", "original_teaser"] = "narration"
     original_ratio_target: float = Field(default=.4, ge=.2, le=.8)
     portrait: bool = True
     vision: bool = True
@@ -43,6 +43,8 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def duration_range(self):
+        if self.opening == "original_teaser" and self.duration_profile != "long":
+            raise ValueError("高光前置目前用于长片提纲与定稿渲染，需duration_profile=long")
         if self.duration_profile == "short" and (self.target_seconds > 240 or (self.max_seconds or 0) > 600):
             raise ValueError("加长解说需显式设置duration_profile=long；短片配置不自动放宽")
         if self.duration_profile == "long" and self.target_seconds < 300:

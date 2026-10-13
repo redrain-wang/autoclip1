@@ -89,7 +89,7 @@ def polish_clip(clip, lines, root, cfg, llm, context=None):
     """At most two prose proposals, each with a separate factual check; no timing/media edits."""
     from .director import compact
     ids = {i for b in clip.beats for i in b.evidence_ids}
-    relevant = [s for s in lines if s.id in ids or clip.beats[0].start-30 <= s.start <= clip.beats[-1].end+20]
+    relevant = [s for s in lines if s.id in ids or min(b.start for b in clip.beats)-30 <= s.start <= max(b.end for b in clip.beats)+20]
     folder = root/'oral-edit'/digest({'version':VERSION, 'clip':clip.model_dump(),
                                     'lines':[s.model_dump() for s in relevant], 'context':context})
     folder.mkdir(parents=True, exist_ok=True)
