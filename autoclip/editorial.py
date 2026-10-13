@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .repair import RepairNeeded
 from .util import digest, write_json
 
-VERSION = "oral-edit-7"
+VERSION = "oral-edit-8"
 WRITING_RULES = """
 口播听感规则：每段推进一个问题、选择、压力或代价，原声已讲明的动作只作必要承接。
 事实、角色指责和旁白分析分开：可见行动直接说；指责用‘在田大人的解释里’‘他把这件事说成’等自然来源交代。
@@ -20,6 +20,10 @@ WRITING_RULES = """
 ‘客观定论、控诉方的推论、证据只到……、单凭这场问答不能断定’等审查措辞留在审核记录，不进入解说正文。
 开头提出当前证据支持的具体问题，章节用不同难处递进，结尾回扣人物自己的选择和代价；不预支未来情节。
 少用‘等于、换句话说、所以’重复解释同一观点，不堆金句，也不为了时长反复说‘规矩还是规矩’。
+区分下令、承诺、执行与完成：调任命令已下不写成人已离京，答应还款不写成钱已入库。
+一句话的因果范围要准确：本场暂缓收款不能写成此前一分钱没收回；此前有例外也不等于所有人免还。
+对白发言者、听话者、被提及者分开；反应镜头不能证明画面中人物正在说这句话。身份无法落实时不依赖该归属立论。
+旁白承接本段画面正在发生的事，不给无关的诵读、送别或下一场养伤画面强加人物与意义。
 """
 
 # These signals flag prose for rewriting. They are never automatically removed.

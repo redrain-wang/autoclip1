@@ -120,6 +120,9 @@ def test_short_director_polishes_before_final_identity_check(tmp_path,monkeypatc
 @pytest.mark.parametrize('char_budget',[45,90])
 def test_outline_writer_runs_oral_editor_before_saving_plan(tmp_path,monkeypatch,char_budget):
     import autoclip.outline as outline
+    import autoclip.continuity as continuity
+    monkeypatch.setattr(continuity,'load_continuity',lambda *a: {'signature':'prior-episode', 'episodes':[
+        {'episode':3,'events':[], 'dialogue':[{'id':55,'start':20,'end':24,'text':'前集曾答应归还银子'}]}]})
     from autoclip.util import write_json,source_identity
     video=tmp_path/'video.mp4';video.write_bytes(b'fixture')
     write_json(tmp_path/'source.json',source_identity(video))
@@ -135,7 +138,9 @@ def test_outline_writer_runs_oral_editor_before_saving_plan(tmp_path,monkeypatch
     path=tmp_path/'outline.json';write_json(path,{'source':source_identity(video),'title':'追款选择','angle':'选择代价','hook':'为何难办',
                                                'chapters':[{'title':'第一章','beats':slots}]})
     class Model:
-        def json(self,*args):return {'items':[{'id':i,'text':text,'evidence_ids':[i]} for i in range(1,5)]}
+        def json(self,*args):
+            assert '前集曾答应归还银子' in args[1]
+            return {'items':[{'id':i,'text':text,'evidence_ids':[i]} for i in range(1,5)]}
     seen=[]
     def polish(clip,*args):
         seen.append(clip.model_dump());clip=clip.model_copy(deep=True)

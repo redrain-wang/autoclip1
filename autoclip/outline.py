@@ -26,6 +26,8 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
     if outline.get('source') != source_identity(video) or read_json(transcript.parent/'source.json') != source_identity(video):
         raise ValueError('提纲或字幕不属于当前原片版本')
     lines = [Line.model_validate(x) for x in read_json(transcript)]
+    from .continuity import load_continuity, continuity_prompt
+    previous = load_continuity(video, cfg, root)
     lookup = {s.id: s for s in lines}
     chapters = outline['chapters']
     all_slots = [b for c in chapters for b in c['beats']]
@@ -41,7 +43,8 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
         shown_teaser = teaser_ids if index==1 else set()
         if any(lookup[i].start >= slot['end'] and i not in shown_teaser for i in slot['allowed_evidence_ids']):
             raise ValueError('提纲提供了当前镜头之后的剧情证据')
-    signature = digest({'v':4, 'writing_rules':WRITING_RULES, 'outline':outline, 'lines':[s.model_dump() for s in lines], 'cfg':cfg.model_dump(mode='json')})
+    signature = digest({'v':5, 'writing_rules':WRITING_RULES, 'outline':outline, 'lines':[s.model_dump() for s in lines],
+                        'continuity_signature': previous['signature'], 'cfg':cfg.model_dump(mode='json')})
     folder = root/'outline-drafts'/signature
     folder.mkdir(parents=True, exist_ok=True)
 
@@ -69,6 +72,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
             f"\n人物核对备注：{outline.get('characters_note','')}\n段落{json.dumps(constraints,ensure_ascii=False)}"
             f"\n格式{json.dumps(ChapterDraft.model_json_schema(),ensure_ascii=False)}\n原片ASR\n{compact(evidence)}")
         prompt += WRITING_RULES
+        prompt += continuity_prompt(previous, compact(evidence))
         feedback = ''
         for attempt in range(3):
             candidate = path if path.exists() else folder/f'chapter-{number}-attempt-2.json'

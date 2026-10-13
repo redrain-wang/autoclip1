@@ -138,7 +138,12 @@ def correct_spelling(plan: Plan, root: Path) -> Plan:
     return Plan.model_validate(data)
 
 
-def analyze(video: Path, root: Path, lines: list[Line], seconds: float, cfg: Settings, llm: LLM):
+def analyze(video: Path, root: Path, lines: list[Line], seconds: float, cfg: Settings, llm: LLM, previous=None):
+    from .continuity import load_continuity, continuity_prompt
+    import math
+    previous = previous if previous is not None else load_continuity(video, cfg, root)
+    write_json(root / 'analysis-coverage.json', {'duration': seconds, 'all_windows_completed': False,
+                                               'status': 'analyzing'})
     def window(start):
         end = min(seconds, start + 300)
         evidence = [s for s in lines if s.start < end and s.end > start]
@@ -159,7 +164,16 @@ def analyze(video: Path, root: Path, lines: list[Line], seconds: float, cfg: Set
         return result
     # API requests are independent; three workers keep throughput bounded.
     with ThreadPoolExecutor(max_workers=3) as pool:
-        maps = list(pool.map(window, range(0, int(seconds)+1, 300)))
+        maps = list(pool.map(window, range(0, math.ceil(seconds), 300)))
+    write_json(root / 'analysis-coverage.json', {
+        'duration': seconds, 'all_windows_completed': True, 'stopped_after_candidate': False,
+        'transcript_lines': len(lines), 'visual_mode': 'sampled_frames' if cfg.vision else 'no_frames',
+        'windows': [{'start': m['start'], 'end': m['end'], 'candidates': len(m.get('candidates', [])),
+                     'dialogue_lines': sum(s.start < m['end'] and s.end > m['start'] for s in lines)} for m in maps]})
+    if previous.get('episodes'):
+        # Interpret across episodes only after completing the current ledger.
+        maps.append({'prior_episode_context': continuity_prompt(previous, compact(lines)),
+                     'continuity_signature': previous['signature']})
     write_json(root / "analysis.json", maps)
     return maps
 

@@ -181,7 +181,8 @@ def test_passive_address_normalization_does_not_grant_active_actions(action, exp
     assert assess_review(raw, units, lines, anchors, [10.15], "雍正王朝", {"turns": []})["passed"] is expected
 
 
-def test_cached_render_checks_actual_spoken_text(tmp_path, monkeypatch):
+@pytest.mark.parametrize('legacy',[False,True])
+def test_cached_render_checks_actual_spoken_text(tmp_path, monkeypatch, legacy):
     import autoclip.identity as identity
     import autoclip.render as render
     from autoclip.models import Beat, Clip
@@ -190,7 +191,14 @@ def test_cached_render_checks_actual_spoken_text(tmp_path, monkeypatch):
     clip = Clip(title="八阿哥交出户部", angle="八阿哥交出户部", hook="八阿哥交出户部", beats=[
         Beat(mode="narration", start=10, end=20, text="八阿哥交出户部", evidence_ids=[1], reason="测试") for _ in range(4)])
     cfg = Settings(identity_gate=True)
-    key = digest({"version": render.VERSION, "clip": clip.model_dump(), "cfg": cfg.model_dump(mode="json")})
+    source = tmp_path/'source.mp4'
+    source.write_bytes(b'source')
+    inputs = {"version": render.VERSION, "clip": clip.model_dump(), "cfg": cfg.model_dump(mode="json")}
+    if legacy:
+        write_json(tmp_path/'source.json',render.source_identity(source))
+    else:
+        inputs['source'] = render.source_identity(source)
+    key = digest(inputs)
     folder = tmp_path / "renders" / f"01-{key}"
     folder.mkdir(parents=True)
     (folder / "video.mp4").write_bytes(b"cached")

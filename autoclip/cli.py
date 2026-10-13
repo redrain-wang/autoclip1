@@ -17,6 +17,27 @@ console = Console()
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm"}
 
 
+@app.command('episode-context')
+def episode_context(source: Path, config: Path = Path('configs.production.toml'),
+                    output: Path = Path('output/前情检查')):
+    """检查下一次分析会带入哪些前集资料；不调用模型或制作影片。"""
+    from .continuity import load_continuity, continuity_prompt
+    cfg = Settings.load(config)
+    context = load_continuity(source, cfg, output)
+    (output/'前情输入.txt').write_text(continuity_prompt(context), encoding='utf-8')
+    console.print(f"本集{context['current_episode']}；参考前集{[e['episode'] for e in context['episodes']]}；资料：{output.resolve()}", markup=False)
+
+
+@app.command('edit-narration')
+def narration_edit(plan: Path = typer.Option(...), output: Path = typer.Option(...),
+                   text: str = typer.Option(...), beat: int | None = None,
+                   at: str | None = None, manifest: Path | None = None):
+    """按段号（从0计）或成片时间改一句解说，保存新稿与差异，不改旧成片。"""
+    from .revision import edit_narration
+    result = edit_narration(plan, output, text, beat, at, manifest)
+    console.print(f"已生成修订稿：{output.resolve()}；修改段号{result['beat']}，接现有测时与核对流程。", markup=False)
+
+
 @app.command("write-outline")
 def outline_script(source: Annotated[Path, typer.Argument(help="带证据提纲的原片")],
                    outline: Path = typer.Option(...), transcript: Path = typer.Option(...),

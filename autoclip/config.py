@@ -36,6 +36,10 @@ class Settings(BaseModel):
     tts_rate: str = "+8%"
     original_volume: float = 0.035
     output: Path = Path("output")
+    # Runtime locations are excluded from legacy plan/review fingerprints.
+    continuity_history: Path | None = Field(default=None, exclude=True)
+    previous_episodes: int = Field(default=3, ge=0, exclude=True)
+    media_cache: Path | None = Field(default=None, exclude=True)
     llm_model: str = "deepseek-flash"
     llm_base_url: str = "https://api.deepseek.com"
     max_api_calls: int = 100
@@ -62,6 +66,11 @@ class Settings(BaseModel):
         import tomllib
         load_dotenv(path.resolve().parent / ".env" if path else None)
         data = tomllib.loads(path.read_text()) if path else {}
+        if path:
+            base = path.resolve().parent
+            for name, default in (("continuity_history", "output"), ("media_cache", "output/.media-cache")):
+                location = Path(data.get(name, default)).expanduser()
+                data[name] = (base / location).resolve()
         registry = os.getenv("AUTOCLIP_IDENTITY_REGISTRY") or data.get("identity_registry")
         if registry:
             registry = Path(registry).expanduser()

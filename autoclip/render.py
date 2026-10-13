@@ -9,18 +9,35 @@ from .editorial import WRITING_RULES, require_oral_style
 from .llm import LLM
 from .models import Clip, Line
 from .repair import voice_fits
-from .util import digest, duration, probe, run, timestamp, write_json
+from .util import digest, duration, probe, run, timestamp, write_json, source_identity
 
 console = Console()
 VERSION = "render-8"
 
 
 def synthesize(text: str, folder: Path, cfg: Settings):
+    import fcntl
+    import shutil
     effective_voice = cfg.macos_voice if cfg.tts == "macos" else cfg.voice
     effective_rate = cfg.macos_rate if cfg.tts == "macos" else cfg.tts_rate
     name = digest({"text": text, "voice": effective_voice, "rate": effective_rate, "backend": cfg.tts})
-    target = folder / "voices" / (name + ".mp3")
+    legacy = folder / 'voices' / (name + '.mp3')
+    target = (cfg.media_cache or folder) / "voices" / (name + ".mp3")
     target.parent.mkdir(parents=True, exist_ok=True)
+    with target.with_suffix('.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if target.exists() and target.stat().st_size > 100:
+            return target
+        if legacy != target and legacy.exists() and legacy.stat().st_size > 100:
+            for suffix in ('.mp3', '.boundaries.jsonl'):
+                old = legacy.with_suffix(suffix)
+                if old.exists():
+                    shutil.copy2(old, target.with_suffix(suffix))
+            return target
+        return _synthesize(text, target, cfg)
+
+
+def _synthesize(text, target, cfg):
     if target.exists() and target.stat().st_size > 100:
         return target
     partial = target.with_suffix(".part.mp3")
@@ -157,8 +174,23 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
     if cfg.oral_edit and not getattr(llm,"frozen_script",False):
         require_oral_style(clip)
     enforce_identity(video, root, clip, cfg, llm, lines)
-    key = digest({"version": VERSION, "clip": clip.model_dump(), "cfg": cfg.model_dump(mode="json")})
+    from .media_cache import cached_shot, shot_inputs
+    source = source_identity(video)
+    key = digest({"version": VERSION, "source": source, "clip": clip.model_dump(), "cfg": cfg.model_dump(mode="json")})
     folder = root / "renders" / f"{index+1:02}-{key}"
+    # Keep exact older deliveries reusable only when their source binding exists.
+    # Older render keys lacked a source fingerprint; never trust them unbound.
+    from .util import read_json
+    if not (folder/'manifest.json').exists():
+        legacy_key = digest({'version': VERSION, 'clip': clip.model_dump(), 'cfg': cfg.model_dump(mode='json')})
+        legacy = root/'renders'/f'{index+1:02}-{legacy_key}'
+        if (legacy/'manifest.json').exists() and (legacy/'video.mp4').exists():
+            for marker in (root/'source.json', root/'development-review.json'):
+                if marker.exists():
+                    bound = read_json(marker)
+                    if (bound.get('source', bound)) == source:
+                        folder = legacy
+                        break
     folder.mkdir(parents=True, exist_ok=True)
     final = folder / "video.mp4"
     manifest_path = folder / "manifest.json"
@@ -183,6 +215,7 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
                 write_json(manifest_path, manifest)
             return manifest
     captions, timeline, segments = [], [], []
+    cache_hits = 0
     cursor = 0.0
     width, height = (720,1280) if cfg.portrait else (1280,720)
     for i, beat in enumerate(clip.beats):
@@ -200,9 +233,7 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
                     captions.append((cursor+a, cursor+b, body, "narration"))
         # Original audio keeps the source's burned-in subtitles, without a
         # repeated editorial label telling the viewer how to watch it.
-        segment_key = digest({"beat": beat.model_dump(), "text": text, "target": target_length, "version": VERSION})
-        segment = folder / f"part-{i:02}-{segment_key}.mp4"
-        if not segment.exists():
+        def encode(segment):
             args = ["ffmpeg", "-v", "error", "-y", "-ss", beat.start, "-t", source_length, "-i", video]
             if voice:
                 args += ["-i", voice]
@@ -224,8 +255,10 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
                      "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-threads", "4",
                      "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", segment]
             run(args)
+        inputs = shot_inputs(source, beat, target_length, voice, cfg)
+        segment, actual, reused = cached_shot(cfg.media_cache or root/'shot-cache', inputs, encode)
+        cache_hits += int(reused)
         # Concat uses 25fps packets. Use actual encoded duration for all subsequent subtitle offsets.
-        actual = duration(segment)
         timeline.append({**beat.model_dump(), "text": text, "output_start": cursor, "output_end": cursor+actual,
                          "speed": source_length/target_length, "subtitle_alignment": alignment})
         cursor += actual
@@ -282,6 +315,7 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
     run(["ffmpeg", "-v", "error", "-y", "-ss", min(2,final_seconds/2), "-i", final, "-frames:v", "1", "-q:v", "2", poster])
     from .metrics import audio_mix
     manifest = {"title": clip.title, "angle": clip.angle, "hook": clip.hook, "video": str(final.resolve()),
+                "shot_cache": {"reused": cache_hits, "encoded": len(segments)-cache_hits},
                 "audio_mix": audio_mix(timeline),
                 "speech": {"backend": cfg.tts, "voice": cfg.macos_voice if cfg.tts == "macos" else cfg.voice,
                            "rate": cfg.macos_rate if cfg.tts == "macos" else cfg.tts_rate},

@@ -68,12 +68,16 @@ def ground_window(raw: dict, lines) -> list[dict]:
     return sorted(events, key=lambda e: e["start"])
 
 
-def prepare_research(video, root, lines, seconds, cfg, llm):
+def prepare_research(video, root, lines, seconds, cfg, llm, previous=None):
     from .director import compact
+    from .continuity import load_continuity
+    previous = previous if previous is not None else load_continuity(video, cfg, root)
     context = profile(cfg.series)
     inputs = {"version": VERSION, "source": source_identity(video), "series_profile": context,
               "transcript_hash": digest([s.model_dump() for s in lines]),
               "model": cfg.llm_model, "endpoint": cfg.llm_base_url}
+    # Facts are extracted from this episode first. Prior context enters selection
+    # and interpretation later, so old events cannot contaminate this ledger.
     signature = digest(inputs)
     cache = root / "research" / f"{signature}.json"
     if cache.exists():

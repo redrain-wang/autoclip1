@@ -49,9 +49,11 @@ def process(video: Path, cfg: Settings, stage="all", previous=None, brand_config
             status("对白识别完成")
             return {"episode": video.stem}
         llm = LLM(cfg, root)
-        dossier = prepare_research(video, root, lines, seconds, cfg, llm) if cfg.research_before_produce else None
+        from .continuity import load_continuity
+        continuity = load_continuity(video, cfg, root)
+        dossier = prepare_research(video, root, lines, seconds, cfg, llm, continuity) if cfg.research_before_produce else None
         status("理解剧情与画面")
-        maps = analyze(video, root, lines, seconds, cfg, llm)
+        maps = analyze(video, root, lines, seconds, cfg, llm, continuity)
         if dossier:
             maps = [*maps, {"research_notes": research_context(dossier)}]
         if stage == "analyze":

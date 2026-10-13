@@ -234,12 +234,24 @@ def test_real_render_has_audio_video_and_valid_timeline(tmp_path, monkeypatch):
     run(["ffmpeg","-v","error","-y","-f","lavfi","-i","sine=frequency=440:sample_rate=48000","-t","9.5",voice])
     monkeypatch.setattr(renderer,"synthesize",lambda text,root,cfg: voice)
     lines, plan = fixture_plan()
-    cfg = Settings(target_seconds=45, output=tmp_path)
+    cfg = Settings(target_seconds=45, output=tmp_path, media_cache=tmp_path/'shared-shots')
     result = render_clip(source, tmp_path, plan.clips[0], 0, cfg, None, lines)
     assert 39 < duration(Path(result["video"])) < 41
     assert result["width"] == 720 and result["height"] == 1280
     assert result["qa"]["full_decode"] == "passed"
     assert all(a["output_end"] == b["output_start"] for a,b in zip(result["timeline"],result["timeline"][1:]))
+    assert result['shot_cache'] == {'encoded': 4, 'reused': 0}
+    # A different script/root reuses every untouched shot, with real FFmpeg.
+    revision = plan.clips[0].model_copy(deep=True)
+    changed_index = next(i for i,b in enumerate(revision.beats) if b.mode=='narration')
+    revision.beats[changed_index].text = '借款人提出了自己的理由，执行者还要考虑这会给其他人留下什么例子。'
+    new_voice = tmp_path/'changed-voice.mp3'
+    run(['ffmpeg','-v','error','-y','-f','lavfi','-i','sine=frequency=660:sample_rate=48000','-t','9.5',new_voice])
+    monkeypatch.setattr(renderer,'synthesize',lambda text,root,cfg: new_voice if text==revision.beats[changed_index].text else voice)
+    revised = render_clip(source,tmp_path/'revision',revision,0,cfg,None,lines)
+    assert revised['shot_cache'] == {'encoded': 1, 'reused': 3}
+    assert revised['timeline'][changed_index]['text'] == revision.beats[changed_index].text
+    assert Path(result['video']).exists() and Path(revised['video']) != Path(result['video'])
     from PIL import Image, ImageDraw
     import autoclip.branding as branding
     logo = tmp_path / "logo.png"

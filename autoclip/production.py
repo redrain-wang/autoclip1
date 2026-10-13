@@ -240,12 +240,14 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
         write_json(root/"transcript.effective.json", [s.model_dump() for s in lines])
         write_json(root/"transcript-input.json", evidence_input)
         llm=LLM(cfg,root)
+        from .continuity import load_continuity, continuity_prompt
+        previous = load_continuity(video, cfg, root)
         dossier = None
         if cfg.research_before_produce:
             status("整理人物与分集资料（自动初稿）")
             seed_research(history,identity,root)
-            dossier = prepare_research(video,root,lines,seconds,cfg,llm)
-        maps=analyze(video,root,lines,seconds,cfg,llm)
+            dossier = prepare_research(video,root,lines,seconds,cfg,llm,previous)
+        maps=analyze(video,root,lines,seconds,cfg,llm,previous)
         if dossier:
             maps = [*maps, {"research_notes": research_context(dossier)}]
         if retry_rejected_from is None:
@@ -280,6 +282,9 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                 try:
                     local=cfg.model_copy(update={"clips":1,"style":cfg.style+f"。本次唯一选题：{story.title}。角度：{story.angle}。只能剪原片{story.start}–{story.end}秒内的故事。"})
                     story_maps = [story.model_dump()]
+                    if previous.get('episodes'):
+                        story_maps.append({'prior_episode_context': continuity_prompt(previous, compact(relevant)),
+                                           'continuity_signature': previous['signature']})
                     if dossier:
                         story_maps.append({"research_notes": research_context(dossier,story.start,story.end)})
                     plan=create_plan(video,storyroot,relevant,seconds,story_maps,local,llm,[],repair=repair,bounds=(story.start,story.end))
