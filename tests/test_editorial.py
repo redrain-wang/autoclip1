@@ -118,9 +118,16 @@ def test_short_director_polishes_before_final_identity_check(tmp_path,monkeypatc
 
 
 @pytest.mark.parametrize('char_budget',[45,90])
-def test_outline_writer_runs_oral_editor_before_saving_plan(tmp_path,monkeypatch,char_budget):
+@pytest.mark.parametrize('use_brief',[False,True])
+def test_outline_writer_runs_oral_editor_before_saving_plan(tmp_path,monkeypatch,char_budget,use_brief):
     import autoclip.outline as outline
     import autoclip.continuity as continuity
+    import autoclip.conflict as conflict
+    brief_calls=[]
+    def prepare_brief(*args):
+        brief_calls.append(args)
+        return {'question':'承诺之后有没有实际归还', 'ending':'本段止于答应还款'}
+    monkeypatch.setattr(conflict,'prepare_conflict_brief',prepare_brief)
     monkeypatch.setattr(continuity,'load_continuity',lambda *a: {'signature':'prior-episode', 'episodes':[
         {'episode':3,'events':[], 'dialogue':[{'id':55,'start':20,'end':24,'text':'前集曾答应归还银子'}]}]})
     from autoclip.util import write_json,source_identity
@@ -140,6 +147,7 @@ def test_outline_writer_runs_oral_editor_before_saving_plan(tmp_path,monkeypatch
     class Model:
         def json(self,*args):
             assert '前集曾答应归还银子' in args[1]
+            assert ('承诺之后有没有实际归还' in args[1]) == use_brief
             return {'items':[{'id':i,'text':text,'evidence_ids':[i]} for i in range(1,5)]}
     seen=[]
     def polish(clip,*args):
@@ -147,11 +155,12 @@ def test_outline_writer_runs_oral_editor_before_saving_plan(tmp_path,monkeypatch
         clip.beats[1].text='在问话者的解释里，这个借款理由只说清了个人处境，却没有回答同一条还款要求为什么要给他例外。'
         return clip
     monkeypatch.setattr(outline,'polish_clip',polish);monkeypatch.setattr(outline,'duration',lambda p:100)
-    cfg=Settings(target_seconds=100,min_seconds=60,max_seconds=180,opening='original',oral_edit=True)
+    cfg=Settings(target_seconds=100,min_seconds=60,max_seconds=180,opening='original',oral_edit=True,conflict_brief=use_brief)
     result=outline.compose_outline(video,transcript,path,tmp_path/'run',cfg,Model())
     saved=read_json(tmp_path/'run/plan.json')
     assert len(seen)==1 and result.clips[0].beats[1].text.startswith('在问话者的解释里')
     assert saved==result.model_dump()
+    assert len(brief_calls)==int(use_brief)
     assert saved['clips'][0]['beats'][0]==seen[0]['beats'][0]
     assert read_json(tmp_path/'run/draft-plan.json')['clips'][0]['beats'][1]['text']==text
 

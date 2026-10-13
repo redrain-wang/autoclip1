@@ -11,14 +11,17 @@ from pydantic import BaseModel, Field
 from .research import profile
 from .util import digest, read_json, source_identity, write_json
 
-VERSION = "identity-5"
+VERSION = "identity-6"
 
 
 def reference_board(anchors, images, root):
     from PIL import Image, ImageDraw
-    canvas = Image.new("RGB", (800, 240*((len(images)+3)//4)), "#111111")
+    views = [(i, a, p) for i,(a,p) in enumerate(zip(anchors, images))]
+    views += [(i, ref, Path(ref['resolved_image'])) for i,a in enumerate(anchors) for ref in a.get('references', [])]
+    views.sort(key=lambda row: row[0])
+    canvas = Image.new("RGB", (800, 240*((len(views)+3)//4)), "#111111")
     draw = ImageDraw.Draw(canvas)
-    for i, (a, p) in enumerate(zip(anchors, images)):
+    for i, (reference_id, a, p) in enumerate(views):
         with Image.open(p) as original:
             crop = a.get("crop")
             if crop:
@@ -28,101 +31,17 @@ def reference_board(anchors, images, root):
             original.thumbnail((195, 210))
             x, y = (i%4)*200, (i//4)*240
             canvas.paste(original, (x, y+25))
-            draw.text((x+5, y+5), f"R{i}", fill="white")
+            draw.text((x+5, y+5), f"R{reference_id}", fill="white")
     target = root / "reference-board.jpg"
     target.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(target, quality=92)
     return target
 
 
-class SceneFrame(BaseModel):
-    id: int
-    visible: list[str]
-    uncertain: bool
-
-
-class SceneTurn(BaseModel):
-    evidence_ids: list[int] = Field(min_length=1)
-    speaker: str
-    frame_ids: list[int]
-    basis: str
-
-
-class SceneMap(BaseModel):
-    frames: list[SceneFrame]
-    turns: list[SceneTurn]
-
-
 def scene_identity(video, root, lines, start, end, cfg, llm, times=None):
-    """Establish visible characters and dialogue turns before seeing any script."""
-    from PIL import Image, ImageDraw
-    from .director import compact
-    from .ingest import contact_sheet
-    anchors, images = load_anchors(cfg.identity_registry, cfg.series)
-    relevant = [s for s in lines if s.start >= start and s.end <= end]
-    if times is None:
-        times = sorted(set(round(start+i*(end-start)/35, 3) for i in range(36)))
-    signature = digest({"v": 3, "source": source_identity(video), "anchors": anchors,
-                        "lines": [s.model_dump() for s in relevant], "times": times,
-                        "model": cfg.llm_model, "endpoint": cfg.llm_base_url})
-    folder = root / "scene-identity" / signature
-    folder.mkdir(parents=True, exist_ok=True)
-    cache = folder / "scene.json"
-    if cache.exists():
-        return read_json(cache)
-    refs = {f"R{i}": a["id"] for i,a in enumerate(anchors)}
-    sheets = []
-    for offset in range(0,len(times),8):
-        source = contact_sheet(video,folder,times[offset:offset+8],f"scene-{offset}")
-        target = source.with_name(source.stem + "-ids.jpg")
-        with Image.open(source) as sheet:
-            draw = ImageDraw.Draw(sheet)
-            for j in range(min(8,len(times)-offset)):
-                x,y=(j%2)*480,(j//2)*294
-                draw.rectangle((x,y,x+480,y+23), fill="#111111")
-                draw.text((x+5,y+5),f"F{offset+j} SOURCE {times[offset+j]:.3f}s",fill="white")
-            sheet.save(target,quality=90)
-        sheets.append(target)
-    reference = [reference_board(anchors,images,folder)] if images else []
-    names = {f"R{i}": {"name": a["name"], "aliases": a["aliases"]} for i,a in enumerate(anchors)}
-    raw = llm.json("你是原片人物与对话整理员。没有解说稿需要维护，只核对当前原片证据。",
-        "第一张为R编号人脸参考（如果参考为空则没有），其后为F编号场景帧。先按脸部比对每帧出现了哪些R人物；"
-        "不要根据字幕里的姓名认脸，不要把听话人当说话人。参考里没有的人物保持未知，不能挑最像者凑数。"
-        "这是离散静帧，不能声称看到了嘴唇运动或口型与声音同步。脸部相符仍不足以单独确认说话人。"
-        "然后将字幕分成连续发言turns，结合完整问答、同场人物、独有身份自称和点名后回应确认speaker=R编号或unknown。"
-        "例如有明确身份和在场画面时可用独有自称辅助，但儿臣或臣不唯一；画面切换不必然更换发言者。"
-        "每条turn必须记录支持判断的F编号frame_ids、字幕evidence_ids与basis；没有证据就unknown，不要求猜全。"
-        "每个F编号必须出现一次，visible列R编号，无法比对则为空并uncertain=true；uncertain指匹配本身有疑问，不是背景有其他陌生人。"
-        "每条字幕最多属于一个turn。引用帧时间必须靠近该发言，不能用几十秒前的同一人物充作当前说话人证明。"
-        f"\n参考命名：{json.dumps(names,ensure_ascii=False)}\n有效F编号0–{len(times)-1}，frame_ids填数字。"
-        f"\n格式{json.dumps(SceneMap.model_json_schema(),ensure_ascii=False)}\n字幕：{compact(relevant)}",reference+sheets)
-    data = SceneMap.model_validate(raw)
-    if sorted(f.id for f in data.frames) != list(range(len(times))):
-        raise ValueError("场景人物核对遗漏或重复帧编号")
-    frames = {f.id:f for f in data.frames}
-    ids = {s.id for s in relevant}
-    lookup = {s.id:s for s in relevant}
-    seen, turns = set(), []
-    for f in data.frames:
-        if any(r not in refs for r in f.visible):
-            raise ValueError("场景人物引用未知参考编号")
-    for turn in data.turns:
-        if any(i not in ids or i in seen for i in turn.evidence_ids) or any(f not in frames for f in turn.frame_ids):
-            raise ValueError("场景发言引用无效或重复字幕/帧")
-        seen.update(turn.evidence_ids)
-        first = min(lookup[i].start for i in turn.evidence_ids)
-        last = max(lookup[i].end for i in turn.evidence_ids)
-        supported = (turn.speaker in refs and bool(turn.basis.strip()) and
-                     any(first-1 <= times[f] <= last+1 and turn.speaker in frames[f].visible
-                         and not frames[f].uncertain for f in turn.frame_ids))
-        turns.append({**turn.model_dump(), "anchor_id": refs[turn.speaker] if supported else None,
-                      "status": "model_supported" if supported else "unresolved"})
-    result = {"signature":signature,"anchors":anchors,"times":times,"frames":data.model_dump()["frames"],
-              "turns":turns,"unassigned_ids":sorted(ids-seen),"source":source_identity(video),
-              "sheets": [str(p.resolve()) for p in sheets], "reference": [str(p.resolve()) for p in reference],
-              "limitations":"模型独立画面/问答核对，不是人脸识别准确率或人工逐句认证"}
-    write_json(cache,result)
-    return result
+    """Reusable source observations are independent of any draft or interpretation."""
+    from .speakers import recognize_scene
+    return recognize_scene(video, root, lines, start, end, cfg, llm, times)
 
 
 def file_hash(path):
@@ -157,7 +76,27 @@ def load_anchors(path, series):
             raise ValueError("人物锚点图片已改变，须重新核对")
         if not row.get("name") or not row.get("aliases"):
             raise ValueError("人物锚点缺少姓名或别名")
-        records.append({**row, "image_number": len(images)+1})
+        additional = []
+        for ref in row.get('references', []):
+            if ref.get('status') != 'reviewed':
+                continue
+            if not ref.get('basis') or not ref.get('reviewer'):
+                raise ValueError('补充人物参考缺少核对依据')
+            ref_video = Path(ref['source']['path'])
+            if str(ref_video) not in sources:
+                sources[str(ref_video)] = source_identity(ref_video)
+            if sources[str(ref_video)] != ref['source']:
+                raise ValueError('补充人物参考原片版本已改变')
+            ref_image = (path.parent/ref['image']).resolve()
+            if file_hash(ref_image) != ref['image_sha256']:
+                raise ValueError('补充人物参考图片已改变')
+            additional.append({**ref, 'resolved_image':str(ref_image)})
+        record = {**row, "image_number": len(images)+1}
+        if additional:
+            record['references'] = additional
+        else:
+            record.pop('references',None)
+        records.append(record)
         images.append(image)
     return records, images
 
@@ -260,6 +199,11 @@ def assess_review(raw, units, lines, anchors, frame_times, series, scene=None):
                 names = [a for a, name in aliases.items() if name == observed] or [observed]
                 if len(set(claim.evidence_ids)) < 2 or not any(name in texts for name in names):
                     problems.append("没有点名及回应的证据，不能以儿臣等非唯一称呼认人")
+                if scene is not None and anchors and claim.role not in {'mentioned','addressee'}:
+                    observed_ids = {a['id'] for a in anchors if a['name'] == observed}
+                    if not any(t['anchor_id'] in observed_ids and set(t['evidence_ids']) & set(claim.evidence_ids)
+                               for t in scene['turns']):
+                        problems.append('点名不能绕过独立发言核对：被问者不等于发出问话的人')
             else:
                 problems.append("身份依据不足")
             if problems:
@@ -270,16 +214,14 @@ def assess_review(raw, units, lines, anchors, frame_times, series, scene=None):
 
 def audit_identity(video, root, clip, cfg, llm, lines):
     from .director import compact
-    from .ingest import contact_sheet
     anchors, reference_images = load_anchors(cfg.identity_registry, cfg.series)
     units = units_for_clip(clip)
     first, last = min(b.start for b in clip.beats), max(b.end for b in clip.beats)
     cited = {i for b in clip.beats for i in b.evidence_ids}
     relevant = [s for s in lines if s.id in cited or first-30 <= s.start <= last+20]
-    # Multiple chronological observations reduce reaction-shot/speaker confusion.
-    times = sorted(set(round(t, 3) for b in clip.beats for t in
-                       (b.start+.15, (b.start+b.end)/2, b.end-.15)))
-    scene = scene_identity(video, root, relevant, min(s.start for s in relevant), max(s.end for s in relevant), cfg,llm,times)
+    # Observe utterances independently of the draft's edit points.
+    scene = scene_identity(video, root, relevant, min(s.start for s in relevant), max(s.end for s in relevant), cfg,llm)
+    times = scene["times"]
     sheets = [Path(p) for p in scene["sheets"]]
     reference_images = [Path(p) for p in scene["reference"]]
     inputs = {"version": VERSION, "source": source_identity(video), "clip": clip.model_dump(),

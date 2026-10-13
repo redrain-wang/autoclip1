@@ -43,7 +43,13 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
         shown_teaser = teaser_ids if index==1 else set()
         if any(lookup[i].start >= slot['end'] and i not in shown_teaser for i in slot['allowed_evidence_ids']):
             raise ValueError('提纲提供了当前镜头之后的剧情证据')
-    signature = digest({'v':5, 'writing_rules':WRITING_RULES, 'outline':outline, 'lines':[s.model_dump() for s in lines],
+    brief = None
+    if cfg.conflict_brief:
+        from .conflict import prepare_conflict_brief, brief_context
+        brief = brief_context(prepare_conflict_brief(video,root,lines,min(b['start'] for b in all_slots),
+                                                     max(b['end'] for b in all_slots),cfg,llm,outline['hook']))
+    signature = digest({'v':6, 'writing_rules':WRITING_RULES, 'outline':outline, 'lines':[s.model_dump() for s in lines],
+                        'conflict_brief':brief,
                         'continuity_signature': previous['signature'], 'cfg':cfg.model_dump(mode='json')})
     folder = root/'outline-drafts'/signature
     folder.mkdir(parents=True, exist_ok=True)
@@ -72,6 +78,8 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
             f"\n人物核对备注：{outline.get('characters_note','')}\n段落{json.dumps(constraints,ensure_ascii=False)}"
             f"\n格式{json.dumps(ChapterDraft.model_json_schema(),ensure_ascii=False)}\n原片ASR\n{compact(evidence)}")
         prompt += WRITING_RULES
+        if brief is not None:
+            prompt += '\n全片冲突提纲（编辑建议，不是额外事实；沿用既有镜头与证据）：'+json.dumps(brief,ensure_ascii=False)
         prompt += continuity_prompt(previous, compact(evidence))
         feedback = ''
         for attempt in range(3):

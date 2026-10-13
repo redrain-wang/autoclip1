@@ -17,6 +17,44 @@ console = Console()
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm"}
 
 
+@app.command('identify-scene')
+def identify_scene(source: Path, transcript: Path = typer.Option(...), start: float = typer.Option(...),
+                   end: float = typer.Option(...), config: Path = Path('configs.production.toml'),
+                   output: Path = Path('output/场景人物核对')):
+    """独立整理原片人物与逐条发言，复用本剧参考和原片缓存，不读取解说稿。"""
+    from .identity import scene_identity
+    _source_analysis(source,transcript,start,end,config,output,scene_identity)
+
+
+@app.command('story-brief')
+def story_brief(source: Path, transcript: Path = typer.Option(...), start: float = typer.Option(...),
+                end: float = typer.Option(...), config: Path = Path('configs.production.toml'),
+                output: Path = Path('output/完整冲突提纲')):
+    """整理一个问题的起因、推进和结果，生成提纲，不剪片或强制拆片。"""
+    from .conflict import prepare_conflict_brief
+    _source_analysis(source,transcript,start,end,config,output,prepare_conflict_brief)
+
+
+def _source_analysis(source,transcript,start,end,config,output,operation):
+    from .models import Line
+    from .llm import LLM
+    from .util import duration
+    cfg=Settings.load(config)
+    if read_json(transcript.parent/'source.json') != source_identity(source):
+        raise typer.BadParameter('字幕与原片版本不匹配')
+    if not 0 <= start < end <= duration(source):
+        raise typer.BadParameter('分析范围须位于当前原片内')
+    lines=[Line.model_validate(x) for x in read_json(transcript)]
+    output.mkdir(parents=True,exist_ok=True)
+    llm=LLM(cfg,output)
+    try:
+        operation(source,output,lines,start,end,cfg,llm)
+        console.print(f'分析记录：{output.resolve()}；不是成片或事实认证。',markup=False)
+    finally:
+        write_json(output/'usage.json',llm.usage())
+        llm.client.close()
+
+
 @app.command('episode-context')
 def episode_context(source: Path, config: Path = Path('configs.production.toml'),
                     output: Path = Path('output/前情检查')):

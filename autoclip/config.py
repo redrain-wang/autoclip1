@@ -40,6 +40,7 @@ class Settings(BaseModel):
     continuity_history: Path | None = Field(default=None, exclude=True)
     previous_episodes: int = Field(default=3, ge=0, exclude=True)
     media_cache: Path | None = Field(default=None, exclude=True)
+    conflict_brief: bool = Field(default=False, exclude=True)
     llm_model: str = "deepseek-flash"
     llm_base_url: str = "https://api.deepseek.com"
     max_api_calls: int = 100

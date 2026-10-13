@@ -141,7 +141,7 @@ def completed_stories(root: Path):
 def select_stories(root, lines, maps, seconds, existing, cfg, llm, maximum):
     history = [{"title": c["title"], "angle": c["angle"],
                 "shots": [[b["start"], b["end"]] for b in c["timeline"]]} for c in existing]
-    signature = digest({"version": 4, "lines": [s.model_dump() for s in lines], "maps": maps,
+    signature = digest({"version": 5, "lines": [s.model_dump() for s in lines], "maps": maps,
                         "background": background_context(cfg.series),
                         "history": history, "maximum": maximum, "target": cfg.target_seconds})
     cache = root / "selections" / f"{signature}.json"
@@ -150,6 +150,7 @@ def select_stories(root, lines, maps, seconds, existing, cfg, llm, maximum):
     prompt = f"""为《{cfg.series}》本集寻找尚未制作的独立长解说选题，最多{maximum}条，合适才选，可以0条。
 每条目标{cfg.target_seconds}秒成片，最低{cfg.min_seconds or 150}秒，需足够情节与原声支撑。
 优先选有完整冲突、升级、结果的故事，可合并同一故事的相邻场景；单独一两句话的碎片不要选。
+reason先讲清这条要回答的问题、矛盾怎样推进、结尾实际走到哪里；没有反转不硬造反转，不为时长拼入无关支线。
 不得重做历史成片的同一个故事或观点，不能仅换标题。新选题之间也应不同。
 start/end是原片绝对秒数，每条范围120–1100秒，最长不能超过原片{seconds}秒。
 分析摘要只是线索，人物/金额等必须核对原始字幕，ASR姓名不确定用身份指代。
@@ -276,12 +277,18 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
             storyroot=root/"stories"/digest(story.model_dump())
             storyroot.mkdir(parents=True,exist_ok=True)
             relevant=[s for s in lines if s.start>=story.start and s.end<=story.end]
+            brief = None
             repair=None
             clip=None
             for attempt in range(cfg.repair_attempts+1):
                 try:
+                    if cfg.conflict_brief and brief is None:
+                        from .conflict import prepare_conflict_brief, brief_context
+                        brief = prepare_conflict_brief(video,storyroot,lines,story.start,story.end,cfg,llm,story.angle)
                     local=cfg.model_copy(update={"clips":1,"style":cfg.style+f"。本次唯一选题：{story.title}。角度：{story.angle}。只能剪原片{story.start}–{story.end}秒内的故事。"})
                     story_maps = [story.model_dump()]
+                    if brief is not None:
+                        story_maps.append({'conflict_brief':brief_context(brief)})
                     if previous.get('episodes'):
                         story_maps.append({'prior_episode_context': continuity_prompt(previous, compact(relevant)),
                                            'continuity_signature': previous['signature']})

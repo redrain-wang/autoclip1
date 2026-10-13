@@ -92,28 +92,14 @@ def test_reference_label_suffix_is_normalized_only_when_identity_matches():
 
 
 @pytest.mark.parametrize("frame_time,expected", [(10.5, "model_supported"), (99.0, "unresolved")])
-def test_blind_scene_cannot_use_faraway_face_as_current_speaker(tmp_path, monkeypatch, frame_time, expected):
-    import autoclip.identity as identity
-    import autoclip.ingest as ingest
-    from PIL import Image
-    source = tmp_path / "source.mp4"
-    source.write_bytes(b"fixture")
-    image = tmp_path / "frame.jpg"
-    Image.new("RGB", (480, 270), "gray").save(image)
-    sheet = tmp_path / "sheet.jpg"
-    Image.new("RGB", (960, 294), "gray").save(sheet)
-    monkeypatch.setattr(ingest, "contact_sheet", lambda *args: sheet)
-    monkeypatch.setattr(identity, "load_anchors", lambda *args: ([
-        {"id": "eight", "name": "胤禩", "aliases": ["八爷"]}], [image]))
-
-    class Model:
-        def json(self, *args):
-            return {"frames": [{"id": 0, "visible": ["R0"], "uncertain": False}],
-                    "turns": [{"evidence_ids": [1], "speaker": "R0", "frame_ids": [0], "basis": "参考人物相同"}]}
-
-    result = identity.scene_identity(source, tmp_path / "run", [Line(id=1, start=10, end=11, text="对白")],
-                                     10, 11, Settings(series="雍正王朝"), Model(), [frame_time])
-    assert result["turns"][0]["status"] == expected
+def test_blind_scene_cannot_use_faraway_face_as_current_speaker(frame_time, expected):
+    from autoclip.speakers import ground_speakers
+    lines = [Line(id=1,start=8,end=9,text='八爷，您的意思呢'),Line(id=2,start=10,end=11,text='儿臣愿意')]
+    raw = {'lines':[{'evidence_id':2,'speaker':'R0','basis_type':'address_response',
+                     'context_ids':[1,2],'frame_ids':[0],'basis':'点名后回应'}]}
+    turns = ground_speakers(raw,lines,[2],[{'id':0,'visible':['R0'],'uncertain':False}],
+                           [frame_time],[{'id':'eight','name':'胤禩','aliases':['八爷']}])
+    assert turns[0]['status']==expected
 
 
 def test_anchor_images_and_source_version_are_checked(tmp_path):
