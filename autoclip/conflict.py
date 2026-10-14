@@ -28,14 +28,14 @@ class ConflictBrief(BaseModel):
     omit: list[str] = Field(default_factory=list)
 
 
-def prepare_conflict_brief(video, root, lines, start, end, cfg, llm, question=''):
+def prepare_conflict_brief(video, root, lines, start, end, cfg, llm, question='', notes=''):
     from .director import compact
     selected = [s for s in lines if s.start < end and s.end > start]
     if not selected:
         raise ValueError('故事范围内没有可整理的字幕')
     lookup = {s.id:s for s in selected}
     inputs = {'version':VERSION,'source':source_identity(video),'start':start,'end':end,
-              'lines':[s.model_dump() for s in selected],'question':question,
+              'lines':[s.model_dump() for s in selected],'question':question,'notes':notes,
               'model':cfg.llm_model,'endpoint':cfg.llm_base_url}
     path = root/'conflict-briefs'/f'{digest(inputs)}.json'
     if path.exists():
@@ -55,6 +55,7 @@ def prepare_conflict_brief(video, root, lines, start, end, cfg, llm, question=''
             '人物称谓不明确时只描述原片可确认的关系，不凭儿臣、官服、ASR错名认人；角色指责和已经落实的事实要分开。'
             '疑似转写错字的人名、刑罚和官职不照抄扩写，保留清楚的称谓或省去不影响主问题的细节。'
             '提纲是选题建议，仍需现有内容核对。证据只能用当前字幕ID，不借其他集或未来剧情。'
+            f'\n当前原片核对备注（只辅助明确的称谓归属，不扩展成新情节）：{notes}'
             f'\n格式{json.dumps(ConflictBrief.model_json_schema(),ensure_ascii=False)}\n本段字幕{compact(selected)}')
         write_json(path.with_suffix('.raw.json'),raw)
     data = ConflictBrief.model_validate(raw)

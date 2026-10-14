@@ -47,7 +47,8 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
     if cfg.conflict_brief:
         from .conflict import prepare_conflict_brief, brief_context
         brief = brief_context(prepare_conflict_brief(video,root,lines,min(b['start'] for b in all_slots),
-                                                     max(b['end'] for b in all_slots),cfg,llm,outline['hook']))
+                                                     max(b['end'] for b in all_slots),cfg,llm,outline['hook'],
+                                                     notes=outline.get('characters_note','')))
     signature = digest({'v':6, 'writing_rules':WRITING_RULES, 'outline':outline, 'lines':[s.model_dump() for s in lines],
                         'conflict_brief':brief,
                         'continuity_signature': previous['signature'], 'cfg':cfg.model_dump(mode='json')})

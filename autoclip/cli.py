@@ -76,6 +76,28 @@ def narration_edit(plan: Path = typer.Option(...), output: Path = typer.Option(.
     console.print(f"已生成修订稿：{output.resolve()}；修改段号{result['beat']}，接现有测时与核对流程。", markup=False)
 
 
+@app.command('plan-outline')
+def automatic_outline(source: Path, transcript: Path = typer.Option(...), output: Path = typer.Option(...),
+                      config: Path = Path('configs.long-yunjian.toml'), start: float = 0,
+                      end: float | None = None, notes: Path | None = None, structure: Path | None = None):
+    """从本集原片与前情生成长片章节和镜头提纲，保存自动初稿，不批准或渲染影片。"""
+    from .planning import plan_outline
+    from .models import Line
+    from .llm import LLM
+    from .util import duration
+    cfg=Settings.load(config)
+    if read_json(transcript.parent/'source.json') != source_identity(source):
+        raise typer.BadParameter('字幕与原片版本不匹配')
+    lines=[Line.model_validate(x) for x in read_json(transcript)]
+    llm=LLM(cfg,output)
+    try:
+        plan_outline(source,output,lines,duration(source),cfg,llm,start,end,
+                     notes.read_text(encoding='utf-8') if notes else '',structure)
+        console.print(f'自动提纲：{output / "outline.auto.json"}，可接write-outline；尚未核对成片。',markup=False)
+    finally:
+        write_json(output/'planner-usage.json',llm.usage());llm.client.close()
+
+
 @app.command("write-outline")
 def outline_script(source: Annotated[Path, typer.Argument(help="带证据提纲的原片")],
                    outline: Path = typer.Option(...), transcript: Path = typer.Option(...),

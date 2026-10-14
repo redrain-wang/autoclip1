@@ -124,8 +124,9 @@ def test_outline_writer_runs_oral_editor_before_saving_plan(tmp_path,monkeypatch
     import autoclip.continuity as continuity
     import autoclip.conflict as conflict
     brief_calls=[]
-    def prepare_brief(*args):
+    def prepare_brief(*args,**kwargs):
         brief_calls.append(args)
+        assert kwargs['notes'] == '本场问话者已根据连续问答核对'
         return {'question':'承诺之后有没有实际归还', 'ending':'本段止于答应还款'}
     monkeypatch.setattr(conflict,'prepare_conflict_brief',prepare_brief)
     monkeypatch.setattr(continuity,'load_continuity',lambda *a: {'signature':'prior-episode', 'episodes':[
@@ -143,6 +144,7 @@ def test_outline_writer_runs_oral_editor_before_saving_plan(tmp_path,monkeypatch
         lines.append(Line(id=i,start=start+1,end=start+5,text='剧情依据'))
     transcript=tmp_path/'transcript.json';write_json(transcript,[s.model_dump() for s in lines])
     path=tmp_path/'outline.json';write_json(path,{'source':source_identity(video),'title':'追款选择','angle':'选择代价','hook':'为何难办',
+                                               'characters_note':'本场问话者已根据连续问答核对',
                                                'chapters':[{'title':'第一章','beats':slots}]})
     class Model:
         def json(self,*args):

@@ -36,6 +36,9 @@ def test_conflict_brief_is_a_source_bound_editorial_suggestion_without_forced_tw
     replay=prepare_conflict_brief(video,tmp_path,lines,0,15,Settings(),Model())
     assert replay['opening_evidence_ids']==[] and replay['opening_reason']==''
     assert len(calls)==1
+    corrected=prepare_conflict_brief(video,tmp_path,lines,0,15,Settings(),Model(),notes='本场问话者已纠正')
+    assert len(calls)==2 and '本场问话者已纠正' in calls[-1]
+    assert corrected['inputs']['notes']=='本场问话者已纠正'
 
 
 def test_noncontinuous_opening_is_not_used_as_one_original_clip(tmp_path):
