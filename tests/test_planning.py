@@ -115,3 +115,58 @@ def test_outline_precheck_allows_teaser_bridge_and_defers_unwritten_duration(tmp
     checked, _ = module.check_outline(video, tmp_path/'transcript.json', tmp_path/'outline.json', cfg)
     assert checked == outline
     assert before == {p: p.read_bytes() for p in tmp_path.iterdir()}
+
+
+def test_story_first_supports_chronological_original_opening(tmp_path):
+    from autoclip.planning import chapter_budgets, validate_chapter
+    args=fixture(tmp_path)
+    video,structure,drafts,lines,seconds,cfg=args
+    cfg.opening='original';cfg.narrative_mode='story_first'
+    structure.opening_start=0;structure.opening_end=20
+    structure.chapters[0].start=20;structure.chapters[0].end=100
+    for slot in drafts[0]['beats']:
+        slot['start']+=20;slot['end']+=20;slot['evidence_ids']=[slot['evidence_ids'][0]+1]
+    lines.append(Line(id=4,start=81,end=95,text='最后一句'))
+    validate_structure(structure,0,140,cfg)
+    budgets=chapter_budgets(structure,cfg)
+    validate_chapter(drafts[0],structure.chapters[0],structure,lines,0,budgets[0],cfg)
+    result=compile_outline(video,structure,drafts,lines,seconds,cfg)
+    assert result['narrative_mode']=='story_first'
+    assert result['chapters'][0]['beats'][0]['start']==0
+    assert all(b['start']>=20 for b in result['chapters'][0]['beats'][1:])
+
+
+def test_chapter_budget_and_bad_evidence_repaired_before_whole_compilation(tmp_path):
+    from autoclip.planning import validate_chapter
+    _,structure,drafts,lines,_,cfg=fixture(tmp_path)
+    with pytest.raises(ValueError,match='超过预算'):
+        validate_chapter(drafts[0],structure.chapters[0],structure,lines,0,10,cfg)
+    drafts[0]['beats'][2]['evidence_ids']=[999]
+    with pytest.raises(ValueError,match='无效或未来'):
+        validate_chapter(drafts[0],structure.chapters[0],structure,lines,0,100,cfg)
+
+
+def test_only_failed_chapter_is_retried(tmp_path,monkeypatch):
+    import autoclip.planning as module
+    args=fixture(tmp_path)
+    video,structure,_,lines,seconds,cfg=args
+    structure.chapters=[module.Chapter(title='前半',start=0,end=40,purpose='起因'),
+                        module.Chapter(title='后半',start=40,end=80,purpose='结果')]
+    monkeypatch.setattr(module,'load_continuity',lambda *a:{'signature':'prior'})
+    monkeypatch.setattr(module,'continuity_prompt',lambda *a:'')
+    monkeypatch.setattr(module,'prepare_conflict_brief',lambda *a,**k:{})
+    monkeypatch.setattr(module,'brief_context',lambda _: {})
+    counts={1:0,2:0}
+    class Model:
+        def json(self,system,prompt):
+            if '先定章节' in prompt:return structure.model_dump()
+            chapter=1 if '只安排第1章' in prompt else 2
+            counts[chapter]+=1
+            beats=[{'mode':'narration' if i%2==0 else 'original','start':i*20,'end':(i+1)*20,
+                    'instruction':'叙事','evidence_ids':[i],'target_chars':90 if i%2==0 else 0}
+                   for i in range((chapter-1)*2,chapter*2)]
+            if chapter==1 and counts[1]==1:beats[0]['start']=-1
+            return {'beats':beats}
+    result=module.plan_outline(video,tmp_path/'run',lines,seconds,cfg,Model())
+    assert counts=={1:2,2:1}
+    assert result['chapters'][1]['beats'][0]['start']==40

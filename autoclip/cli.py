@@ -17,6 +17,29 @@ console = Console()
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm"}
 
 
+@app.command('series-report')
+def series_report(output: Path = typer.Option(...), feedback: Path | None = None):
+    """汇总整剧制作记录，可选关联本地平台反馈CSV；不发布影片。"""
+    from .feedback import summarize_project
+    summarize_project(output,feedback)
+    console.print(f'制作报告：{output / "project-report.json"}',markup=False)
+
+
+@app.command('series')
+def series_production(source: Path, output: Path = typer.Option(...), series: str | None = None,
+                      config: Path | None = None, library: Path | None = None,
+                      voice_manifest: Path | None = None, model_path: Path | None = None,
+                      voice_python: Path | None = None, limit: int | None = None, stage: str = 'all'):
+    """整剧自动长解说：仅声纹建档需人工，其余自动续跑、核对、修复和导出。"""
+    from .series import run_series
+    result = run_series(source,output,series,config,library,voice_manifest,model_path,voice_python,limit,stage)
+    console.print(json.dumps(result,ensure_ascii=False,indent=2),markup=False)
+    if result['status'] == 'partial_failure':
+        raise typer.Exit(1)
+    if result['status'] == 'waiting_voice_confirmation':
+        raise typer.Exit(2)
+
+
 @app.command('voice-prepare')
 def voice_prepare(sources: list[Path], series: str = typer.Option(...),
                   transcript: list[Path] = typer.Option(None, help='依次提供各集 transcript.json，可重复'),

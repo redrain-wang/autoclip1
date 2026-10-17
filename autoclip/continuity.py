@@ -40,7 +40,7 @@ def load_continuity(video, cfg, root=None):
     Missing history is normal and does not prevent current-episode production.
     """
     video = Path(video).resolve()
-    current = episode_number(video)
+    current = cfg.episode_order.get(str(video), episode_number(video))
     history = Path(cfg.continuity_history or cfg.output)
     skipped, grouped = [], {}
     checked_sources = {}
@@ -49,7 +49,7 @@ def load_continuity(video, cfg, root=None):
         if not isinstance(identity, dict) or not identity.get('path'):
             return None
         source = Path(identity['path']).resolve()
-        number = episode_number(source)
+        number = cfg.episode_order.get(str(source), episode_number(source))
         if number is None or current is None or not 0 < number < current or source.parent != video.parent:
             return None
         key = digest(identity)
@@ -69,6 +69,8 @@ def load_continuity(video, cfg, root=None):
             if number is None:
                 continue
             folder = marker.parent
+            if cfg.episode_order and folder.parent != history:
+                continue  # Managed projects expose only current episode records, never retired runs.
             dossier = _read(folder/'research.json', skipped) if (folder/'research.json').exists() else None
             settings = _read(folder/'settings.json', skipped) if (folder/'settings.json').exists() else None
             series = (dossier or {}).get('series_profile', {}).get('series') or (settings or {}).get('series')
@@ -101,6 +103,10 @@ def load_continuity(video, cfg, root=None):
         candidates = {}
         for result_path in sorted(history.rglob('results.json')) if numbers else []:
             folder = result_path.parent
+            if cfg.episode_order:
+                state = folder/'status.json'
+                if folder.parent != history or not state.exists() or (_read(state, skipped) or {}).get('stage') != '已完成':
+                    continue
             marker = folder/'source.json'
             review_path = folder/'development-review.json'
             review = _read(review_path, skipped) if review_path.exists() else None

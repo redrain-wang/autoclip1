@@ -81,6 +81,8 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
     def write_chapter(pair):
         number, chapter = pair
         slots = [b for b in chapter['beats'] if b['mode']=='narration']
+        if not slots:
+            return ChapterDraft(items=[])
         path = folder/f'chapter-{number}.json'
         permitted = {b['id']: b for b in slots}
         selected = {i for b in slots for i in b['allowed_evidence_ids']}
@@ -102,7 +104,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
             "不用开场白、结尾求关注、某某告诉我们、听这句原声；相邻段不要重复同一个观点。"
             "不得引用未提供的后续剧情或影视记忆，姓名/金额/官职有疑点就采用已核定称谓或省略细节。"
             "若使用前置高光，开场后的第一段只用已展示片段提出问题并明确回到较早的正文；不能把前置事件写成此时刚发生。正文不重复播放这段高光。"
-            "注意ASR老师可能是老十，皇阿嬷是皇阿玛，田文靖/谢文静可能是田大人；不要把这些错词朗读。"
+            "ASR姓名可能有误，依据本剧已确认名字和明确称呼核对，不凭影视记忆改名。"
             "对白引用不能照抄明显ASR错字或文言，不照搬参考作者原稿。"
             "每段text字数在给定min_chars和max_chars内，带必要推理与限定，不用重复和空话凑数。"
             "只能输出指定narration的id、text、evidence_ids，不能改时间、增加段落或写original台词。"
@@ -172,7 +174,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
     texts = {b.id:b for d in drafts for b in d.items}
     beats = [Beat(mode=b['mode'],start=b['start'],end=b['end'],text=texts[b['id']].text if b['mode']=='narration' else '',
                   evidence_ids=texts[b['id']].evidence_ids if b['mode']=='narration' else b['evidence_ids'],reason=b['instruction']) for b in all_slots]
-    plan = Plan(episode_summary=outline['hook'], genre='历史剧', style=cfg.style,
+    plan = Plan(episode_summary=outline['hook'], genre='剧情解读', style=cfg.style,
                 clips=[Clip(title=outline['title'],angle=outline['angle'],hook=outline['hook'],beats=beats)])
     write_json(root/'draft-plan.json',plan.model_dump())
     validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)

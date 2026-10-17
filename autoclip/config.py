@@ -12,6 +12,7 @@ class Settings(BaseModel):
     style: str = "auto"
     clips: int = Field(default=2, ge=0, le=10)
     duration_profile: Literal["short", "long"] = "short"
+    narrative_mode: Literal["analysis", "story_first"] = "analysis"
     target_seconds: int = Field(default=100, ge=45, le=1200)
     min_seconds: float | None = Field(default=None, ge=30)
     max_seconds: float | None = Field(default=None, le=3600)
@@ -39,6 +40,7 @@ class Settings(BaseModel):
     # Runtime locations are excluded from legacy plan/review fingerprints.
     continuity_history: Path | None = Field(default=None, exclude=True)
     previous_episodes: int = Field(default=3, ge=0, exclude=True)
+    episode_order: dict[str, int] = Field(default_factory=dict, exclude=True)
     media_cache: Path | None = Field(default=None, exclude=True)
     conflict_brief: bool = Field(default=False, exclude=True)
     llm_model: str = "deepseek-flash"
