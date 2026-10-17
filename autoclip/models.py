@@ -59,7 +59,7 @@ def evidence_matches(line, beat, context):
 
 def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: int, target: int,
                   min_seconds: float | None = None, max_seconds: float | None = None,
-                  opening: str = "narration"):
+                  opening: str = "narration", *, check_duration: bool = True):
     errors = []
     lookup = {s.id: s for s in lines}
     if count == 0 and len(plan.clips) > 6:
@@ -131,7 +131,7 @@ def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: 
         # punctuation vary considerably. Enforce the tighter limit after actual
         # synthesis rather than rejecting a valid story before measuring it.
         estimate_ceiling = (max_seconds or target * 1.8) * (1.2 if target > 240 else 1)
-        if not (min_seconds * .9 if min_seconds else target * .5) <= estimated <= estimate_ceiling:
+        if check_duration and not (min_seconds * .9 if min_seconds else target * .5) <= estimated <= estimate_ceiling:
             errors.append(f"clips[{i}] 预计时长 {estimated:.0f} 秒不在目标范围内")
     for i, a in enumerate(plan.clips):
         for b in plan.clips[i + 1:]:

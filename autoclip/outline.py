@@ -20,30 +20,52 @@ class ChapterDraft(BaseModel):
     items: list[WrittenBeat]
 
 
-def compose_outline(video, transcript, outline_path, root, cfg, llm):
-    from .director import compact
+def check_outline(video, transcript, outline_path, cfg):
+    """Check source/evidence/timeline without writing files or calling a model.
+
+    Narration has not been written: duration is checked after drafting and TTS.
+    """
     outline = read_json(outline_path)
     if outline.get('source') != source_identity(video) or read_json(transcript.parent/'source.json') != source_identity(video):
         raise ValueError('提纲或字幕不属于当前原片版本')
     lines = [Line.model_validate(x) for x in read_json(transcript)]
-    from .continuity import load_continuity, continuity_prompt
-    previous = load_continuity(video, cfg, root)
     lookup = {s.id: s for s in lines}
     chapters = outline['chapters']
-    story_first = outline.get('narrative_mode') == 'story_first'
     all_slots = [b for c in chapters for b in c['beats']]
+    if not chapters or any(not c['beats'] for c in chapters):
+        raise ValueError('提纲须包含非空章节和镜头')
     if len({b['id'] for b in all_slots}) != len(all_slots):
         raise ValueError('提纲镜头编号重复')
     teaser_ids = set(all_slots[0]['evidence_ids']) if cfg.opening=='original_teaser' else set()
+    seconds = duration(video)
+    beats = []
     for index,slot in enumerate(all_slots):
         # Validate source intervals and direct evidence before spending tokens.
-        Beat(mode=slot['mode'], start=slot['start'], end=slot['end'], text='待写稿' if slot['mode']=='narration' else '',
-             evidence_ids=slot['evidence_ids'], reason=slot['instruction'])
-        if slot['end'] > duration(video) or any(i not in lookup for i in slot['allowed_evidence_ids']):
+        beats.append(Beat(mode=slot['mode'], start=slot['start'], end=slot['end'], text='待写稿' if slot['mode']=='narration' else '',
+                          evidence_ids=slot['evidence_ids'], reason=slot['instruction']))
+        if slot['end'] > seconds or any(i not in lookup for i in slot['allowed_evidence_ids'] + slot['evidence_ids']):
             raise ValueError('提纲越界或引用不存在的证据')
+        if not set(slot['evidence_ids']).issubset(slot['allowed_evidence_ids']):
+            raise ValueError(f"镜头{slot['id']}的直接证据未包含在允许证据中")
         shown_teaser = teaser_ids if index==1 else set()
-        if any(lookup[i].start >= slot['end'] and i not in shown_teaser for i in slot['allowed_evidence_ids']):
-            raise ValueError('提纲提供了当前镜头之后的剧情证据')
+        future = [i for i in slot['allowed_evidence_ids'] if lookup[i].start >= slot['end'] and i not in shown_teaser]
+        if future:
+            raise ValueError(f"镜头{slot['id']}结束于{slot['end']}秒，提纲提供了当前镜头之后的剧情证据：{future}")
+    skeleton = Plan(episode_summary=outline['hook'], genre='', style=cfg.style,
+                    clips=[Clip(title=outline['title'], angle=outline['angle'], hook=outline['hook'], beats=beats)])
+    validate_plan(skeleton, lines, seconds, 1, cfg.target_seconds,
+                  cfg.min_seconds, cfg.max_seconds, cfg.opening, check_duration=False)
+    return outline, lines
+
+
+def compose_outline(video, transcript, outline_path, root, cfg, llm):
+    from .director import compact
+    from .continuity import load_continuity, continuity_prompt
+    outline, lines = check_outline(video, transcript, outline_path, cfg)
+    previous = load_continuity(video, cfg, root)
+    chapters = outline['chapters']
+    story_first = outline.get('narrative_mode') == 'story_first'
+    all_slots = [b for c in chapters for b in c['beats']]
     brief = None
     if cfg.conflict_brief:
         from .conflict import prepare_conflict_brief, brief_context

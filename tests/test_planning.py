@@ -53,3 +53,65 @@ def test_reports_all_slot_errors_for_one_bounded_repair(tmp_path):
     assert '须1–40秒' in str(caught.value)
     assert '却引用其后台词' in str(caught.value)
     assert '重叠' in str(caught.value)
+
+
+@pytest.mark.parametrize('problem, message', [
+    ('overlap', '不能重复或倒置'),
+    ('repeat_teaser', '正文不能重复播放'),
+    ('missing_direct_evidence', '不存在的证据'),
+    ('unavailable_direct_evidence', '直接证据未包含'),
+    ('empty', '非空章节'),
+    ('unrelated_evidence', '画面区间内'),
+    ('low_confidence', '低置信度'),
+])
+def test_supplied_outline_fails_before_continuity_or_model(tmp_path, monkeypatch, problem, message):
+    from autoclip import outline as module, continuity
+    from autoclip.util import write_json
+    args = fixture(tmp_path)
+    video, _, _, lines, seconds, cfg = args
+    outline = compile_outline(*args)
+    slots = outline['chapters'][0]['beats']
+    if problem == 'overlap':
+        slots[3]['start'] = 39
+    elif problem == 'repeat_teaser':
+        slots[-1].update(start=100, end=120)
+    elif problem == 'missing_direct_evidence':
+        slots[2]['evidence_ids'] = [999]
+    elif problem == 'unavailable_direct_evidence':
+        slots[2]['allowed_evidence_ids'] = []
+    elif problem == 'empty':
+        outline['chapters'] = []
+    elif problem == 'unrelated_evidence':
+        slots[-1]['evidence_ids'] = [0]
+    elif problem == 'low_confidence':
+        lines[1].confidence = .1
+    write_json(tmp_path/'source.json', outline['source'])
+    write_json(tmp_path/'transcript.json', [s.model_dump() for s in lines])
+    write_json(tmp_path/'outline.json', outline)
+    monkeypatch.setattr(module, 'duration', lambda _: seconds)
+    monkeypatch.setattr(continuity, 'load_continuity', lambda *a: pytest.fail('检查失败前不能准备前情'))
+    class Model:
+        def json(self, *args):
+            pytest.fail('无效时间线不能调用模型')
+    with pytest.raises(ValueError, match=message):
+        module.compose_outline(video, tmp_path/'transcript.json', tmp_path/'outline.json',
+                               tmp_path/'run', cfg, Model())
+    assert not (tmp_path/'run').exists()
+
+
+def test_outline_precheck_allows_teaser_bridge_and_defers_unwritten_duration(tmp_path, monkeypatch):
+    from autoclip import outline as module
+    from autoclip.util import write_json
+    args = fixture(tmp_path)
+    video, _, _, lines, seconds, cfg = args
+    outline = compile_outline(*args)
+    outline['chapters'][0]['beats'][1]['evidence_ids'] = [10]
+    write_json(tmp_path/'source.json', outline['source'])
+    write_json(tmp_path/'transcript.json', [s.model_dump() for s in lines])
+    write_json(tmp_path/'outline.json', outline)
+    monkeypatch.setattr(module, 'duration', lambda _: seconds)
+    cfg.min_seconds = 500  # An unwritten narration placeholder cannot establish duration.
+    before = {p: p.read_bytes() for p in tmp_path.iterdir()}
+    checked, _ = module.check_outline(video, tmp_path/'transcript.json', tmp_path/'outline.json', cfg)
+    assert checked == outline
+    assert before == {p: p.read_bytes() for p in tmp_path.iterdir()}

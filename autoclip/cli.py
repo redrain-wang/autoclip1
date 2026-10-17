@@ -199,6 +199,19 @@ def automatic_outline(source: Path, transcript: Path = typer.Option(...), output
         write_json(output/'planner-usage.json',llm.usage());llm.client.close()
 
 
+@app.command("check-outline")
+def outline_check(source: Path, outline: Path = typer.Option(...), transcript: Path = typer.Option(...),
+                  config: Path = Path("configs.long.toml")):
+    """只检查提纲来源、证据和镜头时间线；不调用模型、不改写文件。"""
+    from .outline import check_outline
+    try:
+        checked, _ = check_outline(source, transcript, outline, Settings.load(config))
+    except ValueError as ex:
+        console.print(f"提纲检查未通过：{ex}", markup=False)
+        raise typer.Exit(1)
+    console.print(f"提纲时间线通过，共{len(checked['chapters'])}章；内容事实和实配时长仍须核对。", markup=False)
+
+
 @app.command("write-outline")
 def outline_script(source: Annotated[Path, typer.Argument(help="带证据提纲的原片")],
                    outline: Path = typer.Option(...), transcript: Path = typer.Option(...),
