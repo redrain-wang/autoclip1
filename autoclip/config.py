@@ -14,7 +14,7 @@ class Settings(BaseModel):
     duration_profile: Literal["short", "long"] = "short"
     target_seconds: int = Field(default=100, ge=45, le=1200)
     min_seconds: float | None = Field(default=None, ge=30)
-    max_seconds: float | None = Field(default=None, le=1200)
+    max_seconds: float | None = Field(default=None, le=3600)
     opening: Literal["narration", "original", "original_teaser"] = "narration"
     original_ratio_target: float = Field(default=.4, ge=.2, le=.8)
     portrait: bool = True

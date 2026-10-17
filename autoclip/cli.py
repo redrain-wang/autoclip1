@@ -17,6 +17,107 @@ console = Console()
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm"}
 
 
+@app.command('voice-prepare')
+def voice_prepare(sources: list[Path], series: str = typer.Option(...),
+                  transcript: list[Path] = typer.Option(None, help='依次提供各集 transcript.json，可重复'),
+                  output: Path = Path('output/声音确认'), config: Path = Path('configs.production.toml'),
+                  model_path: Path | None = None, threshold: float = .5,
+                  skip_start: float = typer.Option(0., help='各集跳过片头秒数'),
+                  skip_end: float = typer.Option(0., help='各集跳过片尾秒数')):
+    """提取 CAM++ 候选声纹并跨集分组，供人工试听；不会自动认定角色。"""
+    from .voices import prepare
+    prepare(sources, transcript, output, series, Settings.load(config), model_path, threshold, skip_start, skip_end)
+
+
+@app.command('voice-review')
+def voice_review(output: Path = Path('output/声音确认'), port: int = 8766,
+                 open_browser: bool = True):
+    """打开本地声音确认台：试听、查看原片位置并保存角色名。"""
+    from .voice_review import serve
+    serve(output, port, open_browser)
+
+
+@app.command('voice-gap-prepare')
+def voice_gap_prepare(plan: Path = typer.Option(...), library: Path = typer.Option(...),
+                      output: Path = typer.Option(...), model_path: Path | None = None):
+    """按人物名单准备有原片时间及依据的补录候选，保留待人工确认状态。"""
+    from .voice_coverage import prepare_coverage
+    prepare_coverage(plan, library, output, model_path)
+
+
+@app.command('voice-scan-series')
+def voice_scan_series(source: Path, library: Path = typer.Option(...), output: Path = typer.Option(...),
+                      model_path: Path = typer.Option(...), vad_path: Path = typer.Option(...),
+                      threshold: float = .60, margin: float = .10):
+    """逐集扫描全片语音、提取声纹并比对；断点续跑，不依赖整季字幕。"""
+    from .voice_scan import scan_series
+    sources = sorted(p for p in source.iterdir() if p.suffix.lower() in VIDEO_EXTENSIONS)
+    scan_series(sources, library, output, model_path, vad_path, threshold, margin)
+
+
+@app.command('voice-import-discovery')
+def voice_import_discovery(scan: Path = typer.Option(...), output: Path = typer.Option(...), limit: int = 12):
+    """从已完成的全集扫描导入一小批优先试听样本，不赋予角色名。"""
+    from .voice_scan import import_discovery
+    result = import_discovery(scan, output, limit)
+    console.print(f"已准备 {len(result['discovery_groups'])} 组优先试听；角色由人确认。", markup=False)
+
+
+@app.command('voice-match')
+def voice_match(library: Path = typer.Option(...), candidates: Path = typer.Option(...),
+                output: Path = typer.Option(...), threshold: float = .65, margin: float = .10):
+    """用人工确认的声纹库比对新批次，输出候选归属，保留未知。"""
+    from .voices import match_batch
+    bank, batch = read_json(library), read_json(candidates)
+    if bank['series'] != batch['series'] or bank['model'] != batch['model']:
+        raise typer.BadParameter('剧名或声纹模型版本不匹配')
+    if not 0 < threshold < 1 or not 0 <= margin <= 2:
+        raise typer.BadParameter('匹配阈值或候选分差无效')
+    if output.resolve() in {library.resolve(), candidates.resolve()}:
+        raise typer.BadParameter('输出不能覆盖声纹库或候选批次')
+    for source in [s['source'] for s in batch['sources']] + [s['source'] for p in bank['characters'] for s in p['samples']]:
+        if source_identity(Path(source['path'])) != source:
+            raise typer.BadParameter('原片版本已改变，请重新核对')
+    write_json(output, match_batch(bank, batch, threshold, margin))
+    console.print(f'声纹比对结果：{output.resolve()}；人工确认与机器候选分别记录。', markup=False)
+
+
+@app.command('voice-merge')
+def voice_merge(libraries: list[Path], output: Path = typer.Option(...)):
+    """合并各集的人工参考，保留来源及版本，不改原始确认记录。"""
+    from .voices import merge_libraries
+    if output.resolve() in {p.resolve() for p in libraries}:
+        raise typer.BadParameter('合并结果不能覆盖输入声纹库')
+    banks = [read_json(p) for p in libraries]
+    for bank in banks:
+        for person in bank['characters']:
+            for sample in person['samples']:
+                if source_identity(Path(sample['source']['path'])) != sample['source']:
+                    raise typer.BadParameter('参考原片已改变，请重新核对')
+    merged = merge_libraries(banks)
+    write_json(output, merged)
+    console.print(f"已合并 {len(merged['characters'])} 位人物、" +
+                  f"{sum(len(p['samples']) for p in merged['characters'])} 段人工参考：{output.resolve()}", markup=False)
+
+
+@app.command('voice-evaluate')
+def voice_evaluate(library: Path = typer.Option(...), output: Path = typer.Option(...)):
+    """留出人工参考测试识别与拒认，比较严格/试验门槛，不修改标准库。"""
+    from .voices import evaluate_library
+    if library.resolve() == output.resolve():
+        raise typer.BadParameter('验证输出不能覆盖声纹库')
+    bank = read_json(library)
+    for person in bank['characters']:
+        for sample in person['samples']:
+            if source_identity(Path(sample['source']['path'])) != sample['source']:
+                raise typer.BadParameter('参考原片已改变，请重新核对')
+    report = evaluate_library(bank)
+    write_json(output, report)
+    for experiment in report['experiments']:
+        console.print(f"阈值 {experiment['threshold']}：" + str({k:v['counts'] for k,v in experiment['modes'].items()}), markup=False)
+    console.print('这是已确认参考上的开发诊断，不代表第三集准确率。', markup=False)
+
+
 @app.command('identify-scene')
 def identify_scene(source: Path, transcript: Path = typer.Option(...), start: float = typer.Option(...),
                    end: float = typer.Option(...), config: Path = Path('configs.production.toml'),

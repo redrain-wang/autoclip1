@@ -30,6 +30,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
     previous = load_continuity(video, cfg, root)
     lookup = {s.id: s for s in lines}
     chapters = outline['chapters']
+    story_first = outline.get('narrative_mode') == 'story_first'
     all_slots = [b for c in chapters for b in c['beats']]
     if len({b['id'] for b in all_slots}) != len(all_slots):
         raise ValueError('提纲镜头编号重复')
@@ -62,10 +63,18 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
         permitted = {b['id']: b for b in slots}
         selected = {i for b in slots for i in b['allowed_evidence_ids']}
         evidence = [s for s in lines if s.id in selected]
-        constraints = [{**b, 'min_chars':round(b['target_chars']*.45),'max_chars':round(b['target_chars']*1.4)} for b in slots]
+        constraints = [{**b, 'min_chars':5 if story_first else round(b['target_chars']*.45),
+                        'max_chars':round(b['target_chars']*1.4)} for b in slots]
+        narration_rules = (
+            "先让观众弄清谁在何处、发生了什么、前一场的结果为何引出这一场。"
+            "允许旁白只交代行动、时间地点或承接，不要求每段提出论点；关键转折才解释选择与代价。"
+            "不要靠一个共同主题硬连没有直接因果的支线，也不要用分析代替必要的剧情交代。"
+            "target_chars只是配音画面预算，短转场可以用很少的字说完，不为了字数或总时长扩写。\n"
+            if story_first else
+            "以连贯口语解释利益、选择、代价和因果，每个段落推进一个论点；原声已经展示事件，旁白不能只再说一遍。\n")
         prompt = (f"作品{cfg.series}，长解说主问题：{outline['hook']}，观点：{outline['angle']}。"
             f"全片章节顺序：{[c['title'] for c in chapters]}。本次只写第{number+1}章{chapter['title']}。"
-            "以连贯口语解释利益、选择、代价和因果，每个段落推进一个论点；原声已经展示事件，旁白不能只再说一遍。\n"
+            + narration_rules +
             "可以用贴切类比解释机制，但不是额外历史事实。角色指责自然交代来源，真实未知留白；不强制补另一种心理猜测。"
             "提纲instruction也是编辑角度，不能当作额外剧情证据。身份开发备注可辅助称谓，不能推导未给的内心。"
             "不用开场白、结尾求关注、某某告诉我们、听这句原声；相邻段不要重复同一个观点。"
@@ -93,7 +102,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
                     raise ValueError('写稿必须精确覆盖本章的口播编号')
                 for b in draft.items:
                     slot = permitted[b.id]
-                    if not round(slot['target_chars']*.45) <= len(b.text) <= round(slot['target_chars']*1.4):
+                    if not (5 if story_first else round(slot['target_chars']*.45)) <= len(b.text) <= round(slot['target_chars']*1.4):
                         raise ValueError(f'段{b.id}有{len(b.text)}字，不在要求范围内')
                     if not set(b.evidence_ids).issubset(slot['allowed_evidence_ids']):
                         raise ValueError(f'段{b.id}引用了未允许的证据')
@@ -110,7 +119,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
                         raise
                     for index, b in enumerate(draft.items):
                         slot = permitted[b.id]
-                        low, high = round(slot['target_chars']*.45), round(slot['target_chars']*1.4)
+                        low, high = 5 if story_first else round(slot['target_chars']*.45), round(slot['target_chars']*1.4)
                         if low <= len(b.text) <= high and set(b.evidence_ids).issubset(slot['allowed_evidence_ids']):
                             continue
                         local_feedback = ''
