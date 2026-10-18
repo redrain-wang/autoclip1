@@ -1,13 +1,14 @@
 # Generic unattended long-form pipeline; only voice enrollment is human-confirmed.
+# Shared formal delivery: 20-minute target, 18–22-minute measured acceptance.
 llm_base_url = "https://opencode.ai/zen/go/v1"
 llm_model = "deepseek-v4.1-flash"
 series = "自动识别"
 duration_profile = "long"
 narrative_mode = "story_first"
 style = "顺叙讲清事件起因、行动、结果与场景承接；只在必要处分析选择与代价"
-target_seconds = 1050
-min_seconds = 60
-max_seconds = 2700
+target_seconds = 1200
+min_seconds = 1080
+max_seconds = 1320
 opening = "original"
 voice = "zh-CN-YunjianNeural"
 edge_endpoint = "msedge"

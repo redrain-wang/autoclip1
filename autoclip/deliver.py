@@ -23,7 +23,8 @@ def export_finished(output: Path) -> Path:
         episode = result.parent.name.split("-", 1)[0]
         for number, clip in enumerate(read_json(result), 1):
             safe_title = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", clip["title"]).strip("_")[:45]
-            filename = f"{episode}-{number:02d}_{safe_title}.mp4"
+            prefix = '测试样片_' if clip.get('task_kind') == 'test_sample' else ''
+            filename = f"{prefix}{episode}-{number:02d}_{safe_title}.mp4"
             destination = target / filename
             source = Path(clip["video"])
             if not destination.exists() or not os.path.samefile(source, destination):
@@ -35,6 +36,8 @@ def export_finished(output: Path) -> Path:
                     shutil.copy2(source, temporary)
                 temporary.replace(destination)
             entry = {"episode": episode, "title": clip["title"], "duration": clip["duration"], "file": filename}
+            if clip.get('task_kind'):
+                entry.update(task_kind=clip['task_kind'],duration_policy=clip['duration_policy'])
             if clip.get("cover"):
                 cover_name = Path(filename).with_suffix(".jpg").name
                 cover_target = target / cover_name
@@ -44,6 +47,8 @@ def export_finished(output: Path) -> Path:
                 entry["cover"] = cover_name
             entries.append(entry)
             script.extend([f"## {episode}-{number:02d} {clip['title']}", "", f"时长：{clip['duration']:.1f} 秒。角度：{clip['angle']}", ""])
+            if clip.get('task_kind') == 'test_sample':
+                script.extend(['用途：开发测试样片，不是正式长片交付。',''])
             for beat in clip["timeline"]:
                 content = beat["text"] if beat["mode"] == "narration" else "【保留原声】"
                 script.extend([f"原片 {beat['start']:.2f}–{beat['end']:.2f} 秒：{content}", ""])

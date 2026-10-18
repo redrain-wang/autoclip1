@@ -45,7 +45,7 @@ def test_only_voice_enrollment_requests_human_action(tmp_path,monkeypatch):
     def prepare(sources,transcripts,root,*args):
         write_json(root/'manifest.json',{'ready':True})
     monkeypatch.setattr(module,'prepare_audio_candidates',prepare)
-    result=module.run_series(source,output)
+    result=module.run_series(source,output,test_sample=True)
     assert result['status']=='waiting_voice_confirmation'
     assert (output/'project.json').exists()
     assert not list(output.rglob('development-review.json'))
@@ -211,7 +211,108 @@ def test_failed_episode_does_not_block_next_and_failed_run_can_resume(tmp_path,m
     monkeypatch.setattr(module,'export_finished',lambda _:None)
     monkeypatch.setattr(module,'build_report',lambda _:None)
     for _ in range(2):
-        result=module.run_series(source,tmp_path/'project',series='test',library=library,voice_manifest=manifest)
+        result=module.run_series(source,tmp_path/'project',series='test',library=library,voice_manifest=manifest,test_sample=True)
         assert result['status']=='partial_failure'
         assert [r['status'] for r in result['episodes']]==['failed','completed']
     assert calls==['01.mp4','02.mp4','01.mp4','02.mp4']
+
+
+def test_every_production_episode_and_resume_use_same_duration_despite_legacy_config(tmp_path,monkeypatch):
+    source=tmp_path/'剧';source.mkdir()
+    videos=[source/'01.mp4',source/'02.mp4']
+    for video in videos:video.write_bytes(b'video')
+    library=tmp_path/'bank.json';manifest=tmp_path/'manifest.json'
+    write_json(library,{'series':'剧','model':{},'characters':[{'name':'甲','samples':[
+        {'status':'human_confirmed','source':source_identity(videos[0])}]}]})
+    write_json(manifest,{'model':{},'sources':[{'source':source_identity(v)} for v in videos]})
+    legacy=Settings(duration_profile='long',narrative_mode='story_first',target_seconds=300,min_seconds=60,
+                    max_seconds=2700,opening='original',conflict_brief=True)
+    monkeypatch.setattr(module.Settings,'load',lambda _:legacy.model_copy(deep=True))
+    monkeypatch.setattr(module,'duration',lambda _:2800.)
+    monkeypatch.setattr(module,'ingest_episode',lambda v,b,c:(b,[],2800.))
+    observed=[]
+    def episode(video,base,input_root,lines,seconds,cfg,bank,manifest,brand,index,test_sample):
+        observed.append((delivery_policy(cfg),cfg.continuity_history,cfg.conflict_brief,test_sample))
+        return {'source':str(video),'status':'completed','calls_this_run':0}
+    from autoclip.series import delivery_policy
+    monkeypatch.setattr(module,'run_episode',episode)
+    monkeypatch.setattr(module,'export_finished',lambda _:None)
+    monkeypatch.setattr(module,'build_report',lambda _:None)
+    output=tmp_path/'project'
+    for _ in range(2):
+        result=module.run_series(source,output,library=library,voice_manifest=manifest)
+        assert result['status']=='completed' and result['duration_policy']=={
+            'purpose':'production','target_seconds':1200,'min_seconds':1080,'max_seconds':1320}
+    assert len(observed)==4 and all(r==(result['duration_policy'],output/'episodes',True,False) for r in observed)
+    saved=read_json(output/'project.json')
+    assert saved['effective_settings']['target_seconds']==1200
+    assert saved['effective_settings']['clips']==1
+
+
+def test_short_production_source_fails_before_asr_voice_enrollment_or_model(tmp_path,monkeypatch):
+    video=tmp_path/'09.mp4';video.write_bytes(b'video')
+    monkeypatch.setattr(module,'duration',lambda _:210.)
+    monkeypatch.setattr(module,'ingest_episode',lambda *a:pytest.fail('短素材应在付费或准备声音之前拒绝'))
+    monkeypatch.setattr(module,'prepare_audio_candidates',lambda *a:pytest.fail('不能要求为不合格素材建档'))
+    result=module.run_series(video,tmp_path/'project')
+    assert result['status']=='partial_failure'
+    assert '210.00秒' in result['episodes'][0]['error'] and '1080秒' in result['episodes'][0]['error']
+    assert result['episodes'][0]['calls_this_run']==0
+    assert not list((tmp_path/'project').rglob('results.json'))
+    assert read_json(tmp_path/'project/production-metrics.json')['new_model_calls']==0
+    assert read_json(tmp_path/'project/project-report.json')['purpose']=='production'
+
+
+def test_legacy_short_completed_result_is_retired_when_formal_policy_changes(tmp_path,monkeypatch):
+    video=tmp_path/'09.mp4';video.write_bytes(b'video')
+    output=tmp_path/'project';old=output/'episodes/old'
+    write_json(output/'project.json',{'source':str(video),'series':'剧'})
+    write_json(old/'status.json',{'stage':'已完成'})
+    write_json(old/'results.json',[{'production_id':'old-short','duration':136.,'title':'旧短片','video':'old.mp4'}])
+    monkeypatch.setattr(module,'duration',lambda _:210.)
+    result=module.run_series(video,output)
+    assert result['status']=='partial_failure'
+    assert read_json(old/'status.json')['stage']=='制作规则已变更，等待自动复核'
+    assert read_json(output/'project-report.json')['deliverables']==[]
+
+
+@pytest.mark.parametrize('old_purpose,new_test',[('test_sample',False),('production',True)])
+def test_test_and_production_projects_cannot_silently_change_purpose(tmp_path,old_purpose,new_test):
+    video=tmp_path/'09.mp4';video.write_bytes(b'v')
+    output=tmp_path/'project'
+    write_json(output/'project.json',{'source':str(video),'purpose':old_purpose})
+    with pytest.raises(ValueError,match='不能混用'):
+        module.run_series(video,output,test_sample=new_test)
+    assert read_json(output/'project.json')['purpose']==old_purpose
+
+
+@pytest.mark.parametrize('actual,passed',[(136.,False),(1079.99,False),(1080.,True),(1200.,True),(1320.,True),(1320.01,False)])
+def test_final_duration_gate_probes_media_instead_of_trusting_cached_manifest(tmp_path,monkeypatch,actual,passed):
+    cfg=Settings(duration_profile='long',**module.PRODUCTION_DURATION)
+    monkeypatch.setattr(module,'duration',lambda _:actual)
+    finished={'video':str(tmp_path/'cached.mp4'),'duration':1200.}
+    if passed:
+        result=module.check_delivery(finished,cfg,tmp_path)
+        assert result['duration']==actual and result['task_kind']=='production'
+    else:
+        with pytest.raises(ValueError,match='本集未完成'):
+            module.check_delivery(finished,cfg,tmp_path)
+    assert read_json(tmp_path/'delivery-check.json')['passed']==passed
+
+
+def test_command_can_start_without_output_and_defaults_to_production(tmp_path,monkeypatch):
+    from typer.testing import CliRunner
+    from autoclip.cli import app
+    video=tmp_path/'09.mp4';video.write_bytes(b'v')
+    calls=[]
+    def run(*args):
+        calls.append(args)
+        return {'status':'completed'}
+    monkeypatch.setattr(module,'run_series',run)
+    result=CliRunner().invoke(app,['series',str(video)])
+    assert result.exit_code==0,result.output
+    assert calls[0][0]==video and calls[0][1] is None and calls[0][-1] is False
+    sample=CliRunner().invoke(app,['series',str(video),'--test-sample'])
+    assert sample.exit_code==0 and calls[-1][-1] is True
+    assert module.default_project_output(video)!=module.default_project_output(video,True)
+    assert module.default_project_output(video)==module.default_project_output(video)

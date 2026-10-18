@@ -238,3 +238,24 @@ def test_structure_repair_uses_configured_retry_limit(tmp_path,monkeypatch):
     assert len(prompts)==3
     assert '22.48秒' in prompts[1]
     assert result['chapters'][0]['beats'][0]['end']==120
+
+
+def test_production_story_budget_targets_twenty_minutes_instead_of_maximum():
+    from autoclip.planning import chapter_budgets
+    cfg=Settings(duration_profile='long',narrative_mode='story_first',target_seconds=1200,
+                 min_seconds=1080,max_seconds=1320,opening='original')
+    structure=Structure(title='本集剧情',angle='',hook='',opening_start=0,opening_end=20,opening_reason='',
+        chapters=[{'title':'起因','start':20,'end':1500,'purpose':''},
+                  {'title':'结果','start':1500,'end':2700,'purpose':''}])
+    assert sum(chapter_budgets(structure,cfg,enforce_duration=True))==pytest.approx(1180)
+    assert sum(chapter_budgets(structure,cfg))==pytest.approx(1300)  # historical natural-length path
+    short=structure.model_copy(deep=True);short.chapters=short.chapters[:1];short.chapters[0].end=200
+    with pytest.raises(ValueError,match='仅能提供约.*不足成片下限'):
+        validate_structure(short,0,2800,cfg,enforce_duration=True)
+
+
+def test_short_chapter_is_rejected_before_writing_narration(tmp_path):
+    from autoclip.planning import validate_chapter
+    _,structure,drafts,lines,_,cfg=fixture(tmp_path)
+    with pytest.raises(ValueError,match='不足预算下限90.0秒'):
+        validate_chapter(drafts[0],structure.chapters[0],structure,lines,0,100,cfg,minimum=90.)

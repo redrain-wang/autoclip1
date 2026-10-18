@@ -26,13 +26,18 @@ def series_report(output: Path = typer.Option(...), feedback: Path | None = None
 
 
 @app.command('series')
-def series_production(source: Path, output: Path = typer.Option(...), series: str | None = None,
+def series_production(source: Path, output: Path | None = typer.Option(None, help='默认按素材路径建立独立项目，重复同一命令自动续跑'), series: str | None = None,
                       config: Path | None = None, library: Path | None = None,
                       voice_manifest: Path | None = None, model_path: Path | None = None,
-                      voice_python: Path | None = None, limit: int | None = None, stage: str = 'all'):
-    """整剧自动长解说：仅声纹建档需人工，其余自动续跑、核对、修复和导出。"""
+                      voice_python: Path | None = None, limit: int | None = None, stage: str = 'all',
+                      test_sample: bool = typer.Option(False,'--test-sample',help='仅用于开发短素材验收，单独保存，不能充当正式长片')):
+    """一条命令制作单集或整剧并导出：正式长片统一目标20分钟、验收18–22分钟。"""
     from .series import run_series
-    result = run_series(source,output,series,config,library,voice_manifest,model_path,voice_python,limit,stage)
+    try:
+        result = run_series(source,output,series,config,library,voice_manifest,model_path,voice_python,limit,stage,test_sample)
+    except (ValueError, OSError) as exc:
+        console.print(str(exc),markup=False)
+        raise typer.Exit(1) from exc
     console.print(json.dumps(result,ensure_ascii=False,indent=2),markup=False)
     if result['status'] == 'partial_failure':
         raise typer.Exit(1)

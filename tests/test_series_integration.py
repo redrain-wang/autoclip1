@@ -60,13 +60,24 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
             raise AssertionError(system)
     monkeypatch.setattr(series,'LLM',Model)
     output=tmp_path/'project'
-    result=series.run_series(source,output,series='测试剧',library=library,voice_manifest=voice_manifest)
+    result=series.run_series(source,output,series='测试剧',library=library,voice_manifest=voice_manifest,test_sample=True)
     assert result['status']=='completed',result
     result_video=Path(result['episodes'][0]['video']);assert result_video.is_file()
     assert list((output/'episodes/成片').glob('*.mp4'))
     assert (output/'project-report.json').exists()
+    exported=read_json(output/'episodes/成片/清单.json')[0]
+    assert exported['task_kind']=='test_sample' and exported['file'].startswith('测试样片_')
+    assert '不是正式长片交付' in (output/'episodes/成片/最终解说稿.md').read_text()
+    assert read_json(Path(result['episodes'][0]['run'])/'delivery-check.json')['passed']
+    # A valid short export must still be rejected by the production gate even
+    # when its cached metadata falsely declares a 20-minute duration.
+    production=cfg.model_copy(update=series.PRODUCTION_DURATION)
+    with pytest.raises(ValueError,match='本集未完成'):
+        series.check_delivery({'video':str(result_video),'duration':1200.},production,tmp_path/'production-check')
+    rejected=read_json(tmp_path/'production-check/delivery-check.json')
+    assert not rejected['passed'] and rejected['actual_seconds']<60
     before=result_video.read_bytes();count=len(calls)
-    again=series.run_series(source,output)
+    again=series.run_series(source,output,test_sample=True)
     assert again['status']=='completed' and len(calls)==count
     assert result_video.read_bytes()==before
     assert not list(output.rglob('development-review.json'))
@@ -78,7 +89,7 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
     from autoclip.util import digest
     monkeypatch.setattr(automatic,'VERSION','review-next-test')
     monkeypatch.setattr(series,'REVIEW_VERSION','review-next-test')
-    updated=series.run_series(source,output)
+    updated=series.run_series(source,output,test_sample=True)
     assert updated['status']=='completed',updated
     run_root=Path(updated['episodes'][0]['run'])
     assert run_root==Path(result['episodes'][0]['run'])
@@ -88,7 +99,7 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
     assert approval['voice_digest']==digest(persisted)
     bank['revision']=2;bank['characters'][0]['name']='乙';write_json(library,bank)
     # Prepare-only still records the impact and retires old approvals from current display.
-    series.run_series(source,output,stage='prepare')
+    series.run_series(source,output,stage='prepare',test_sample=True)
     assert read_json(output/'reference-impact.json')['affected_episodes']==[str(video)]
     assert all(read_json(p)['stage']!='已完成' for p in (output/'episodes').glob('*/status.json'))
     assert result_video.read_bytes()==before

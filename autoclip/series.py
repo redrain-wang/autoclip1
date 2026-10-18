@@ -27,6 +27,34 @@ from .util import digest, duration, read_json, run, source_identity, write_json
 
 VERSION = 'series-1'
 EXTENSIONS = {'.mp4','.mkv','.mov','.avi','.m4v','.webm'}
+PRODUCTION_DURATION = {'target_seconds':1200, 'min_seconds':1080, 'max_seconds':1320}
+
+
+def default_project_output(source, test_sample=False):
+    source = Path(source).resolve()
+    name = re.sub(r'[^\w\u4e00-\u9fff.-]+','_',source.stem if source.is_file() else source.name)
+    kind = '测试样片' if test_sample else '整剧制作'
+    return Path(__file__).resolve().parents[1]/'output'/kind/(name+'-'+digest(str(source))[:8])
+
+
+def delivery_policy(cfg, test_sample=False):
+    return {'purpose':'test_sample' if test_sample else 'production',
+            'target_seconds':cfg.target_seconds,
+            'min_seconds':cfg.min_seconds or cfg.target_seconds*.6,
+            'max_seconds':cfg.max_seconds or cfg.target_seconds*1.8}
+
+
+def check_delivery(finished, cfg, root, test_sample=False):
+    """Probe even a cached deliverable before it becomes a completed result."""
+    policy = delivery_policy(cfg,test_sample)
+    actual = duration(Path(finished['video']))
+    passed = policy['min_seconds'] <= actual <= policy['max_seconds']
+    check = {**policy,'actual_seconds':actual,'passed':passed}
+    if not (root/'delivery-check.json').exists() or read_json(root/'delivery-check.json') != check:
+        write_json(root/'delivery-check.json',check)
+    if not passed:
+        raise ValueError(f"交付时长{actual:.2f}秒不满足{policy['min_seconds']:.0f}–{policy['max_seconds']:.0f}秒，本集未完成")
+    return {**finished,'duration':actual,'task_kind':policy['purpose'],'duration_policy':policy}
 
 
 def episode_sort_key(path):
@@ -197,9 +225,10 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm):
     raise ValueError('自动修复达到上限，本集未通过：'+json.dumps(issues,ensure_ascii=False)[:1800])
 
 
-def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, brand, index):
+def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, brand, index, test_sample=False):
     previous = load_continuity(video,cfg)
     inputs = {'v':VERSION,'source':source_identity(video),'lines':[s.model_dump() for s in lines],
+              'delivery_policy':delivery_policy(cfg,test_sample),
               'cfg':cfg.model_dump(mode='json'),'conflict_brief':cfg.conflict_brief,'bank':digest(bank),'manifest':digest(manifest),
               'prior':previous['signature'],'episode_number':cfg.episode_order.get(str(video)), 'brand':brand.model_dump(mode='json'),
               'brand_files':[source_identity(p) for p in [brand.watermark,*brand.watermarks,brand.font] if p and p.is_file()]}
@@ -226,7 +255,7 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
             'names':sorted({s['name'] for s in r['samples'] if s.get('name')})} for r in voices['lines']]},ensure_ascii=False)
         def outline_action():
             state('自动安排章节与镜头')
-            result = plan_outline(video,root,lines,seconds,cfg,llm,notes=notes)
+            result = plan_outline(video,root,lines,seconds,cfg,llm,notes=notes,enforce_duration=not test_sample)
             return result,[root/'outline.auto.json']
         outline = checkpoint(root,'outline',{'inputs':inputs,'planning_version':PLANNING_VERSION},outline_action)
         def writing_action():
@@ -260,6 +289,7 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
             finished['production_id'] = digest([inputs,approved['plan']])
             return finished,[Path(finished[k]) for k in ('video','cover','poster') if finished.get(k)]
         finished = checkpoint(root,'render',{'inputs':inputs,'approved':approved},render_action)
+        finished = check_delivery(finished,cfg,root,test_sample)
         if source_identity(video) != inputs['source']:
             raise ValueError('制作期间原片发生变化，不能交付此版本')
         write_json(base/'source.json',inputs['source'])
@@ -269,22 +299,23 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
         write_json(base/'results.json',[finished])
         write_json(base/'status.json',{'stage':'已完成','source':str(video),'run':str(root),'clips':1})
         return {'source':str(video),'status':'completed','run':str(root),'video':finished['video'],
+                'duration':finished['duration'],'task_kind':finished['task_kind'],
                 'repairs':len(list(root.glob('automatic-repair-*.json'))),'calls_this_run':llm.calls}
     finally:
         write_json(root/'usage.json',llm.usage())
         llm.client.close()
 
 
-def run_series(source, output, series=None, config=None, library=None, voice_manifest=None,
-               model_path=None, voice_python=None, limit=None, stage='all'):
-    output = Path(output).resolve()
+def run_series(source, output=None, series=None, config=None, library=None, voice_manifest=None,
+               model_path=None, voice_python=None, limit=None, stage='all', test_sample=False):
+    output = Path(output or default_project_output(source,test_sample)).resolve()
     output.mkdir(parents=True,exist_ok=True)
     with (output/'project.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        return _run_series(source,output,series,config,library,voice_manifest,model_path,voice_python,limit,stage)
+        return _run_series(source,output,series,config,library,voice_manifest,model_path,voice_python,limit,stage,test_sample)
 
 
-def _run_series(source,output,series,config,library,voice_manifest,model_path,voice_python,limit,stage):
+def _run_series(source,output,series,config,library,voice_manifest,model_path,voice_python,limit,stage,test_sample):
     if stage not in {'all','prepare'} or (limit is not None and limit<1):
         raise ValueError('stage应为all/prepare，limit须为正数')
     source = Path(source).resolve()
@@ -292,6 +323,9 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
     saved = read_json(saved_path) if saved_path.exists() else {}
     if saved and saved['source'] != str(source):
         raise ValueError('此项目绑定其他素材目录，请使用另一输出目录')
+    purpose = 'test_sample' if test_sample else 'production'
+    if saved.get('purpose') and saved['purpose'] != purpose:
+        raise ValueError('正式制作与测试样片不能混用同一项目目录；测试续跑须显式加--test-sample，正式制作请使用另一输出目录')
     config = Path(config or saved.get('config') or Path(__file__).resolve().parents[1]/'configs.series.toml').resolve()
     cfg = Settings.load(config)
     cfg.series = series or saved.get('series') or (source.stem if source.is_file() else source.name)
@@ -302,6 +336,10 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
     cfg.identity_gate = False
     if cfg.duration_profile != 'long' or not cfg.vision:
         raise ValueError('整剧自动入口需要long配置及画面审核')
+    if not test_sample:
+        # One production contract for every episode, including legacy config files.
+        cfg = cfg.model_copy(update=PRODUCTION_DURATION)
+    cfg.clips = 1
     library = Path(library or saved.get('library') or output/'voice-enrollment/registry.json').resolve()
     voice_manifest = Path(voice_manifest or saved['voice_manifest']).resolve() if voice_manifest or saved.get('voice_manifest') else None
     model_path = Path(model_path or saved['model_path']).resolve() if model_path or saved.get('model_path') else None
@@ -309,24 +347,58 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
     paths = discover(source,output)
     cfg.episode_order = {str(path):index+1 for index,path in enumerate(paths)}
     project = {'version':VERSION,'source':str(source),'series':cfg.series,'config':str(config),
+               'purpose':purpose,'duration_policy':delivery_policy(cfg,test_sample),
+               'effective_settings':cfg.model_dump(mode='json'),
                'library':str(library),'voice_manifest':str(voice_manifest) if voice_manifest else None,
                'model_path':str(model_path) if model_path else None,'voice_python':str(voice_python) if voice_python else None,
                'episodes':[str(p) for p in paths]}
+    if saved and saved.get('duration_policy') != project['duration_policy']:
+        for status in cfg.output.glob('*/status.json'):
+            row = read_json(status)
+            if row.get('stage') in {'已完成','部分完成'}:
+                write_json(status,{**row,'stage':'制作规则已变更，等待自动复核'})
     write_json(saved_path,project)
     write_json(output/'series-status.json',{'status':'running','stage':'initializing','episodes':[]})
+    # Reject short/invalid production inputs before transcription, voice scanning or model calls.
+    source_errors = {}
+    for video in paths[:limit] if limit else paths:
+        if not test_sample:
+            try:
+                seconds = duration(video)
+                if seconds < cfg.min_seconds:
+                    raise ValueError(f'正式制作需要完整单集素材且至少{cfg.min_seconds:.0f}秒；当前素材{seconds:.2f}秒，不能作为约20分钟长片交付。短素材验收须显式使用--test-sample')
+            except Exception as exc:
+                source_errors[video] = str(exc)[:2000]
+    selected = paths[:limit] if limit else paths
+    eligible = [p for p in selected if p not in source_errors]
+    if not eligible:
+        outcomes = []
+        for video,message in source_errors.items():
+            outcome = {'source':str(video),'status':'failed','error':message,'calls_this_run':0}
+            base = cfg.output/(video.stem+'-'+digest(source_identity(video)))
+            write_json(base/'status.json',{'stage':'素材预检失败',**outcome})
+            outcomes.append(outcome)
+        result = {'status':'partial_failure','purpose':purpose,'duration_policy':delivery_policy(cfg,test_sample),'episodes':outcomes}
+        write_json(output/'series-status.json',result)
+        write_json(output/'production-metrics.json',{'episodes':len(outcomes),'completed':0,'failed':len(outcomes),
+            'new_model_calls':0,'automatic_repairs':0,'human_steps':['voice_enrollment'],'human_revision_minutes':None})
+        from .feedback import summarize_project
+        summarize_project(output)
+        return result
     bank = read_json(library) if library.exists() else None
     if not bank or not bank.get('characters'):
         enrollment = output/'voice-enrollment'
         manifest_path = enrollment/'manifest.json'
         if not manifest_path.exists():
-            seed = paths[:2]
+            seed = eligible[:2]
             transcripts = []
             for video in seed:
                 base = cfg.output/(video.stem+'-'+digest(source_identity(video)))
                 input_root,_,_ = ingest_episode(video,base,cfg)
                 transcripts.append(input_root/'transcript.json')
             prepare_audio_candidates(seed,transcripts,enrollment,cfg,model_path,voice_python)
-        result = {'status':'waiting_voice_confirmation','review_root':str(enrollment),
+        result = {'status':'waiting_voice_confirmation','purpose':purpose,'duration_policy':delivery_policy(cfg,test_sample),
+                  'review_root':str(enrollment),
                   'instruction':'仅此步骤需要人工：voice-review --output '+str(enrollment)+'；确认后重跑同一series命令。'}
         write_json(output/'series-status.json',result)
         return result
@@ -351,7 +423,7 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
     brand_path = Path(__file__).resolve().parents[1]/'branding.toml'
     brand = BrandSettings.load(brand_path)
     outcomes = []
-    for index,video in enumerate(paths[:limit] if limit else paths):
+    for index,video in enumerate(selected):
         base = cfg.output/(video.stem+'-'+digest(source_identity(video)))
         write_json(output/'series-status.json',{'status':'running','current_episode':str(video),
                                               'stage':'preparing_episode','episodes':outcomes})
@@ -361,6 +433,8 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
                 write_json(marker.parent/'status.json',{'stage':'原片已变更，旧版本归档','source':str(video)})
         episode_started = time.time()
         try:
+            if video in source_errors:
+                raise ValueError(source_errors[video])
             if digest(read_json(library)) != digest(bank):
                 raise ValueError('声纹库在运行期间改变，重跑后按新版本继续')
             input_root,lines,seconds = ingest_episode(video,base,cfg)
@@ -372,7 +446,7 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
                         or not any(s['source']==source_identity(video) for s in current_manifest['sources'])):
                     voice_root = base/'voice-scan'/digest(['vad-production-1',source_identity(video),digest(bank),str(model_path)])
                     current_manifest = scan_production_audio(video,library,voice_root,model_path,voice_python)
-                outcome = run_episode(video,base,input_root,lines,seconds,cfg,bank,current_manifest,brand,index)
+                outcome = run_episode(video,base,input_root,lines,seconds,cfg,bank,current_manifest,brand,index,test_sample)
                 if digest(read_json(library)) != digest(bank):
                     raise ValueError('声纹库在审核期间改变，本集旧核定不交付；重跑后自动复核')
                 outcomes.append(outcome)
@@ -396,7 +470,8 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
         export_finished(cfg.output)
     build_report(cfg.output)
     result = {'status':'partial_failure' if any(o['status']=='failed' for o in outcomes) else ('prepared' if stage=='prepare' else 'completed'),
-              'episodes':outcomes,'gallery':str(cfg.output/'index.html')}
+              'purpose':purpose,'duration_policy':delivery_policy(cfg,test_sample),
+              'episodes':outcomes,'gallery':str(cfg.output/'index.html'),'exports':str(cfg.output/'成片')}
     write_json(output/'series-status.json',result)
     from .feedback import summarize_project
     summarize_project(output)

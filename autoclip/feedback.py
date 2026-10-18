@@ -43,6 +43,10 @@ def summarize_project(root, feedback=None):
         observations = read_json(root/'platform-feedback.json')
     result = {'episodes':episodes,'deliverables':[{k:c[k] for k in ('production_id','title','duration','video')} for c in clips.values()],
               'platform_observations':observations,'interpretation':'模型评分不等于观看效果；不同平台、时长与发布时间不直接混算。无数据不推断提升。'}
+    if (root/'project.json').exists():
+        project = read_json(root/'project.json')
+        if project.get('purpose'):
+            result.update(purpose=project['purpose'],duration_policy=project['duration_policy'])
     write_json(root/'project-report.json',result)
     template = root/'feedback-template.csv'
     with template.open('w',encoding='utf-8-sig',newline='') as stream:
