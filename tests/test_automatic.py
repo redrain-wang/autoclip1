@@ -218,6 +218,7 @@ def test_review_protocol_retry_keeps_script_and_supplies_previous_shown_context(
         sheet_roots.append(root)
         return frame
     monkeypatch.setattr(module,'contact_sheet',sheet)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',sheet)
     plan=sample_plan()
     plan.clips[0].beats[0].mode='original';plan.clips[0].beats[0].text=''
     plan.clips[0].beats[0].reason='内部猜测辛某起身，不属于观众听到的内容'
@@ -235,7 +236,7 @@ def test_review_protocol_retry_keeps_script_and_supplies_previous_shown_context(
                 'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
     report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(),Model())
     assert report['passed'] and len(prompts)==4
-    assert len(sheet_roots)==len(set(sheet_roots))==3
+    assert len(sheet_roots)==len(set(sheet_roots))==4
     assert all(len(group)<=3 for group in groups)
     assert [Path(p).name for p in report['batches']]==['batch-0.json','batch-3.json','batch-6.json']
     assert any('上次审核响应' in p for p in prompts[1:]) and plan.model_dump()==before
@@ -250,10 +251,11 @@ def test_automatic_approval_binds_exact_plan_voice_and_frames(tmp_path):
     video = tmp_path/'a.mp4';video.write_bytes(b'video')
     frame = tmp_path/'a.jpg';frame.write_bytes(b'frame')
     plan=sample_plan();lines=[];voices={'library_digest':'first'}
-    from autoclip.automatic import VERSION
+    from autoclip.automatic import VERSION,METADATA_CAPTION_POLICY
     report={'version':VERSION,'mode':'automatic_source_review','passed':True,'issues':[],'source':source_identity(video),
         'plan_digest':digest(plan.model_dump()),'transcript_digest':digest([]),'voice_digest':digest(voices),
-        'frames':[{'path':str(frame),'sha256':file_hash(frame)}]}
+        'metadata_caption_policy':METADATA_CAPTION_POLICY,
+        'frames':[{'path':str(frame),'sha256':file_hash(frame),'purpose':'metadata_captions'}]}
     assert_approval(report,video,plan,lines,voices)
     with pytest.raises(ValueError):assert_approval({**report,'version':'old-review'},video,plan,lines,voices)
     with pytest.raises(ValueError):assert_approval(report,video,plan,lines,{'library_digest':'new'},)
@@ -268,6 +270,7 @@ def test_originals_have_separate_review_scope_but_real_cut_failures_still_block(
     video=tmp_path/'source.mp4';video.write_bytes(b'source')
     frame=tmp_path/'frame.jpg';frame.write_bytes(b'frame')
     monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
     plan=sample_plan()
     for i in (0,2):plan.clips[0].beats[i].mode='original';plan.clips[0].beats[i].text=''
     before=plan.model_dump()
@@ -418,3 +421,51 @@ def test_local_writer_receives_actual_caption_evidence_not_only_reviewer_claim(t
     assert revised.clips[0].beats[0].text=='按原片可见文字作必要承接'
     assert revised.clips[0].beats[1:]==plan.clips[0].beats[1:]
     assert not (tmp_path/'plan-approved.json').exists()
+
+
+def test_metadata_crops_prioritize_plot_changing_words_from_asr():
+    from autoclip.automatic import metadata_caption_lines
+    lines=[Line(id=i,start=i,end=i+1,text='八爷继续说话') for i in range(20)]
+    lines.append(Line(id=638,start=30,end=34,text='八爷的乳名暗含着八爷的绝路'))
+    chosen=metadata_caption_lines([{'text':'乳名暗含绝路，从相面到下令拿人'}],lines)
+    assert 638 in [s.id for s in chosen] and len(chosen)<=6
+
+
+def test_metadata_gets_source_caption_images_before_any_asr_dispute(tmp_path,monkeypatch):
+    import json
+    import autoclip.automatic as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    main=tmp_path/'frame.jpg';main.write_bytes(b'full source picture')
+    captions=tmp_path/'captions.jpg';captions.write_bytes(b'actual source captions')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:main)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:captions)
+    plan=sample_plan();plan.clips[0].angle='乳名暗含绝路'
+    lines=[Line(id=i,start=i*10+.1,end=i*10+9,text='乳名暗含绝路' if i==0 else '当前对白') for i in range(4)]
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':[]}
+    class Model:
+        def json(self,system,prompt,images):
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+            if any(u['id']=='angle' for u in group):
+                assert images==[main,captions] and 'ASR只是识别稿' in prompt
+            return {'issues':[],'units':[{'id':u['id'],
+                'verdict':'contradicted' if u['id']=='angle' else 'supported',
+                'reason':'原片字幕为爵禄，不能写成绝路' if u['id']=='angle' else '依据相符',
+                'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
+                'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=0),Model())
+    assert not report['passed'] and any(i['id']=='angle' and '爵禄' in i['message'] for i in report['issues'])
+    assert report['metadata_caption_policy']==module.METADATA_CAPTION_POLICY
+    assert any(f.get('purpose')=='metadata_captions' and f['path']==str(captions) for f in report['frames'])
+
+
+@pytest.mark.parametrize('correction',[True,False])
+def test_required_source_correction_in_notes_blocks_supported_metadata(correction):
+    units=[{'id':'title','text':'当众拆字'},{'id':'angle','text':'乳名暗含绝路' if correction else '乳名暗含爵禄'}]
+    note=('原片字幕为“乳名暗含爵禄”，角度中“绝路”应据清晰字幕修正为“爵禄”。' if correction else
+          'ASR把爵禄写作绝路，当前角度已修正为爵禄，无需修改。')
+    raw={'passed':True,'issues':[],'notes':[{'id':'title','message':note}],
+        'units':[{'id':u['id'],'verdict':'supported','reason':'测试字幕与画面',
+            'evidence_ids':[0],'frame_ids':[0],'identity_basis':'no_identity_claim','subjects':[]} for u in units]}
+    issues=assess_batch(raw,units,[Line(id=0,start=0,end=4,text='乳名暗含绝路')],1,[])
+    if correction:assert len(issues)==1 and issues[0]['id']=='angle' and '爵禄' in issues[0]['message']
+    else:assert issues==[]

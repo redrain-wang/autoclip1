@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from .automatic import assert_approval, link_voice_evidence, validate_voice_library
-from .models import Plan
+from .models import Plan, validate_plan
 from .util import digest, read_json, source_identity, write_json
 
 
@@ -170,6 +170,42 @@ def pending_voice_followup(video, lines, voices, root, cfg, library):
             and task.get('settings_digest')==digest(cfg.model_dump(mode='json'))):
         return task
     return None
+
+
+def resume_reference_plan(video, lines, voices, story, cfg, root, seconds):
+    """Reuse text after a reference change, never its previous approval."""
+    candidates=[]
+    source=source_identity(video)
+    transcript_digest=digest([s.model_dump() for s in lines])
+    for previous in root.parent.iterdir():
+        if not all((previous/name).is_file() for name in
+                ('source.json','transcript.json','voice-evidence.json','plan-timed.json')):continue
+        try:
+            old_voices=read_json(previous/'voice-evidence.json')
+            if (read_json(previous/'source.json')!=source or old_voices.get('source')!=source
+                    or old_voices.get('transcript_digest')!=transcript_digest
+                    or digest(read_json(previous/'transcript.json'))!=transcript_digest
+                    or (previous!=root and old_voices.get('library_digest')==voices.get('library_digest'))
+                    or (previous==root and old_voices!=voices)
+                    or previous.name!=digest({'voices':old_voices,'cfg':cfg.model_dump(mode='json'),'story':story.model_dump()})):
+                continue
+            approved=previous!=root and (previous/'plan-approved.json').exists()
+            path=previous/('plan-approved.json' if approved else 'plan-timed.json')
+            plan=Plan.model_validate(read_json(path))
+            if len(plan.clips)!=1:continue
+            validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+            lookup={s.id:s for s in lines}
+            if any(lookup[i].start>=b.end for b in plan.clips[0].beats if b.mode=='narration' for i in b.evidence_ids):continue
+            if approved:
+                assert_approval(read_json(previous/'automatic-review.json'),video,plan,lines,old_voices)
+            if any(b.start<story.start or b.end>story.end for b in plan.clips[0].beats):continue
+            candidates.append((0 if previous==root else 1 if approved else 2,-path.stat().st_mtime_ns,path,plan))
+        except (ValueError,KeyError,OSError):continue
+    if not candidates:return None
+    _,_,path,plan=min(candidates,key=lambda row:row[:2])
+    write_json(root/'reference-resume.json',{'previous_plan':str(path.resolve()),'plan_digest':digest(plan.model_dump()),
+        'new_voice_digest':digest(voices),'status':'requires_full_measurement_and_review'})
+    return plan
 
 
 def episode_evidence(video, lines, library, root, cfg, manifest_path=None, model_path=None, voice_python=None):

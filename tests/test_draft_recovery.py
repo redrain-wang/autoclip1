@@ -9,6 +9,7 @@ from autoclip.director import compile_plan, create_plan
 from autoclip.draft import repair_draft
 from autoclip.models import Line, Plan, validate_plan
 from autoclip.repair import timing_report
+from autoclip.util import write_json
 from test_pipeline import fixture_plan
 
 
@@ -310,7 +311,8 @@ def test_partial_source_repair_is_remeasured_and_fully_reviewed_before_approval(
     assert report['passed'] and revised.clips[0].beats[0].text==seen[1]
 
 
-def test_broken_original_cut_can_replan_neighboring_bridge_without_approval(tmp_path):
+@pytest.mark.parametrize('repeated',[False,True])
+def test_broken_original_cut_can_replan_neighboring_bridge_without_approval(tmp_path,repeated):
     from autoclip.automatic import repair_plan
     from autoclip.models import Beat,Clip
     spans=[(i*10,(i+1)*10) for i in range(6)]
@@ -319,14 +321,20 @@ def test_broken_original_cut_can_replan_neighboring_bridge_without_approval(tmp_
         Beat(mode='narration' if i%2==0 else 'original',start=a,end=b,
              text='当前对白的必要解释与承接' if i%2==0 else '',evidence_ids=[i],reason='已有依据') for i,(a,b) in enumerate(spans)])
     plan=Plan(episode_summary='',genre='',style='',clips=[clip]);before=plan.model_dump()
+    prompts=[]
+    if repeated:
+        write_json(tmp_path/'issues-0.json',[{'id':'original-1','message':'应答被相邻旁白截断'}])
+        write_json(tmp_path/'plan-attempt-0.json',before)
     class Model:
         def json(self,system,prompt):
+            prompts.append(prompt)
             if '只替换replace_indices' in prompt:
                 return {'beats':[before['clips'][0]['beats'][0],dict(mode='original',start=10,end=30,
                     text='',evidence_ids=[1,2],reason='保留完整后续应答，不把命令留在旁白画面里')]}
             return {'changes':[{'id':'original-1','start':10,'end':20,'evidence_ids':[1],'reason':'已有依据'}]}
     revised=repair_plan(plan,[{'id':'original-1','message':'应答被相邻旁白截断'}],lines,{},tmp_path,
-                        Settings(target_seconds=45,repair_attempts=0),Model(),0,source_seconds=60)
+                        Settings(target_seconds=45,repair_attempts=0),Model(),1 if repeated else 0,source_seconds=60)
+    if repeated:assert all('只替换replace_indices' in prompt for prompt in prompts)
     assert revised!=plan and plan.model_dump()==before
     assert any(b.mode=='original' and b.start<=10 and b.end>=30 for b in revised.clips[0].beats)
     assert revised.clips[0].beats[-2].text==clip.beats[-2].text
@@ -350,3 +358,26 @@ def test_subtitle_zoom_uses_two_source_crops_not_expected_asr_text(tmp_path,monk
         assert picture.getpixel((10,60))[0]>200
     assert module.subtitle_evidence_sheet(tmp_path/'video.mp4',tmp_path,lines,'zoom')==target
     assert len(calls)==2
+
+
+def test_replacing_bridge_after_retained_opening_rejects_second_original_then_recovers(tmp_path):
+    from autoclip.models import Beat,Clip
+    spans=[(0,20),(20,26),(26,30),(30,40),(40,50)]
+    lines=[Line(id=i,start=a,end=b,text='已显示的完整对白') for i,(a,b) in enumerate(spans)]
+    beats=[Beat(mode='original' if i in {0,2,4} else 'narration',start=a,end=b,
+        text='' if i in {0,2,4} else '交代当前处境',evidence_ids=[i],reason='依据') for i,(a,b) in enumerate(spans)]
+    raw=Plan(episode_summary='',genre='',style='',clips=[Clip(title='完整故事',angle='',hook='',beats=beats)]).model_dump()
+    class Model:
+        calls=0
+        def json(self,system,prompt):
+            self.calls+=1
+            assert 'replacement_must_start_with' in prompt
+            replacement=copy.deepcopy(raw['clips'][0]['beats'][1:4])
+            if self.calls==1:replacement[0].update(mode='original',text='')
+            else:assert '窗口前已保留20.00秒原声开场' in prompt
+            return {'beats':replacement}
+    model=Model()
+    result=repair_draft(raw,{'issues':[{'code':'semantic_review','message':'clips[0].beats[2] 切点丢失完整应答'}]},
+        lines,(0,50),Settings(target_seconds=45,opening='original',repair_attempts=1),model,tmp_path,'opening-boundary',0)
+    assert model.calls==2 and result['clips'][0]['beats'][0]==raw['clips'][0]['beats'][0]
+    assert result['clips'][0]['beats'][1]['mode']=='narration'

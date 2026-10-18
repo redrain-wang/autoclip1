@@ -312,12 +312,18 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
             brief = None
             from .draft import resume_report
             repair=resume_report(storyroot,relevant,seconds,cfg,(story.start,story.end))
+            reference_plan=None
+            if voices is not None:
+                from .short_voices import resume_reference_plan
+                reference_plan=resume_reference_plan(video,lines,voices,story,cfg,storyroot,seconds)
+                if reference_plan is not None:
+                    console.print('沿用已保存的实配稿，重新测时及完整审核，不重新编写故事',markup=False)
             if repair:
                 console.print('复用结构较完整的失败草稿，修复未通过项；转写和整集分析使用缓存',markup=False)
             clip=None
             for attempt in range(cfg.repair_attempts+1):
                 try:
-                    if cfg.conflict_brief and brief is None:
+                    if cfg.conflict_brief and brief is None and reference_plan is None:
                         from .conflict import prepare_conflict_brief, brief_context
                         brief = prepare_conflict_brief(video,storyroot,lines,story.start,story.end,cfg,llm,story.angle)
                     local=cfg.model_copy(update={"clips":1,"style":cfg.style+f"。本次唯一选题：{story.title}。角度：{story.angle}。只能剪原片{story.start}–{story.end}秒内的故事。"})
@@ -332,7 +338,9 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                     if voices is not None:
                         story_maps.append({'voice_policy':voices['policy'],'voice_candidates':review_voice_rows([
                             row for row in voices['lines'] if row['start']<story.end and row['end']>story.start])})
-                    plan=create_plan(video,storyroot,relevant,seconds,story_maps,local,llm,[],repair=repair,bounds=(story.start,story.end),measured_review=voices is not None)
+                    plan=reference_plan if attempt==0 and reference_plan is not None else create_plan(
+                        video,storyroot,relevant,seconds,story_maps,local,llm,[],repair=repair,
+                        bounds=(story.start,story.end),measured_review=voices is not None)
                     clip=plan.clips[0]
                     check_footage(clip, story, existing+results)
                     write_json(storyroot/"plan.json",plan.model_dump())
@@ -359,7 +367,9 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                         return {'plan':measured.model_dump(),'report':report},[
                             storyroot/'plan-approved.json',storyroot/'automatic-review.json',
                             *[Path(f['path']) for f in report['frames']]]
+                    from .automatic import METADATA_CAPTION_POLICY
                     approval = checkpoint(storyroot,'voice-approval',{'draft':plan.model_dump(),'voices':voices,
+                        'metadata_caption_policy':METADATA_CAPTION_POLICY,
                         'cfg':local.model_dump(mode='json'),'story':story.model_dump()},approve)
                     plan = Plan.model_validate(approval['plan'])
                     assert_approval(approval['report'],video,plan,lines,voices)

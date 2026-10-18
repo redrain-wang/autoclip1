@@ -16,6 +16,7 @@ from .util import digest, read_json, source_identity, write_json
 from .voices import match_batch
 
 VERSION = 'automatic-review-9'
+METADATA_CAPTION_POLICY = 'metadata-captions-2'
 
 
 def validate_voice_library(library, series):
@@ -115,6 +116,35 @@ def caption_lines_for_issues(issues, lines, fallback_ids):
     return [lookup[i] for i in chosen]
 
 
+def metadata_caption_lines(units, lines):
+    """Pick literal source phrases from metadata, including plot-changing ASR words."""
+    def grams(text):
+        chunks=re.findall(r'[\u4e00-\u9fffA-Za-z0-9]+',text)
+        return {chunk[i:i+n] for chunk in chunks for n in range(2,6) for i in range(len(chunk)-n+1)}
+    terms=grams('，'.join(u['text'] for u in units))
+    rows=[(s,grams(s.text)&terms) for s in lines]
+    frequencies={term:sum(term in words for _,words in rows) for term in terms}
+    def score(row):
+        s,words=row
+        return sum(len(t)**2/max(1,frequencies[t]) for t in words)/max(1,len(s.text)**.5)
+    ranked=sorted(rows,key=lambda row:(-score(row),row[0].id))[:6]
+    return [s for s,_ in ranked]
+
+
+def required_note_repairs(notes, units):
+    """A required source correction cannot be hidden under a supported verdict."""
+    issues=[]
+    for note in notes:
+        message=note.message
+        if re.search(r'无需(?:再)?修|不(?:必|需|用)修|已(?:经)?修正|无需修改',message):continue
+        if not re.search(r'(?:应|必须|需要|须)[^。；]{0,50}(?:修正|改为|改成|更正|修改)',message):continue
+        quoted=re.findall(r'[“「"]([^”」"]{2,80})[”」"]',message)
+        affected=[u['id'] for u in units if any(word in u['text'] for word in quoted)]
+        if not affected:affected=[note.id]
+        issues.extend({'id':uid,'message':message} for uid in affected)
+    return issues
+
+
 def assess_batch(raw, units, lines, frame_count, voice_rows):
     parsed = ReviewBatch.model_validate(raw)
     expected = {u['id']:u for u in units}
@@ -127,6 +157,9 @@ def assess_batch(raw, units, lines, frame_count, voice_rows):
         if issue.id not in expected:
             raise ValueError('自动审核问题指向了本批次以外的单位')
         issues.append(issue.model_dump())
+    for issue in required_note_repairs(parsed.notes,units):
+        if issue['id'] not in expected:raise ValueError('审核备注要求修订本批次以外的单位')
+        issues.append(issue)
     for unit in parsed.units:
         if not set(unit.evidence_ids).issubset(lookup) or any(i<0 or i>=frame_count for i in unit.frame_ids):
             raise ValueError('自动审核引用了未提供的证据或画面')
@@ -246,6 +279,15 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
         feedback = ''
         review_images = [sheet]
         caption_sheet = None
+        metadata=any('start' not in u for u in group)
+        if metadata:
+            caption_lines=metadata_caption_lines(group,selected)
+            if not caption_lines:raise ValueError('标题、角度与钩子缺少可核对的原片字幕')
+            caption_sheet=subtitle_evidence_sheet(video,folder/f'batch-{offset}-metadata-captions',caption_lines,'metadata')
+            review_images.append(caption_sheet)
+            prompt+=('\n另附按标题、角度、钩子用词定位的原片字幕放大图。ASR只是识别稿，必须逐字对照实际可见字幕，'
+                '尤其核对人名、拆字、同音字和改变剧情含义的词。实际字幕与ASR冲突，以清晰可见原片为准；'
+                '不得照抄ASR把疑点认定为事实，看不清仍标unknown。frame_ids仍使用主图times索引。')
         for retry in range(cfg.repair_attempts+1):
             raw = llm.json('你是独立的影视内容与人物证据审核员，不读取人工答案。',prompt+feedback,review_images)
             try:
@@ -276,7 +318,11 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 if inconsistent and retry<cfg.repair_attempts:
                     raise ValueError('审核自身的身份依据与所引证据不一致：'+json.dumps(inconsistent,ensure_ascii=False)
                         +'。先重核说话人、听者、被提及者以及实际称呼和回应，不能仅凭反应画面断定发言人；'
-                        '不得靠改变identity_basis标签或脑补姓名放行。确实有疑点就标unknown/contradicted，并说明实际文案问题。')
+                        'voice_and_context要求subjects中每个人名都与本次声音候选一致，被点名者不是因此就有声音匹配。'
+                        '皇帝、老臣等称谓也不能由程序凭剧名自动等同于库内姓名。'
+                        '如果实际依据是明确点名、称呼、自称和紧接的回应或行动，应引用至少两条不同对白证据，'
+                        '用explicit_address_response逐一说明每个subjects如何被核实；不是只换标签，必须指出实际证据。'
+                        '没有这些依据就标unknown/contradicted，不能脑补姓名或用他人的声音放行。')
                 break
             except ValueError as exc:
                 write_json(folder/f'batch-{offset}-protocol-{retry}.json',{'raw':raw,'error':str(exc)})
@@ -285,7 +331,8 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 feedback = '\n上次审核响应未通过格式/引用检查：'+str(exc)[:1800]+'\n原响应：'+json.dumps(raw,ensure_ascii=False)+'\n请重审同一批units，未知仍须标unknown，不得为了修复格式把存疑内容放行。'
         record = {'units':group,'times':times,'raw':raw,'issues':issues}
         write_json(folder/f'batch-{offset}.json',record)
-        frames = [{'path':str(p.resolve()),'sha256':file_hash(p)} for p in review_images]
+        frames = [{'path':str(p.resolve()),'sha256':file_hash(p),
+            **({'purpose':'metadata_captions'} if metadata and p==caption_sheet else {})} for p in review_images]
         return issues,str((folder/f'batch-{offset}.json').resolve()),frames
     # Batches are independent; keep results in source order and share LLM's
     # locked request allowance. No partial batch constitutes an approval.
@@ -298,7 +345,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
         except BaseException:
             pool.shutdown(wait=True,cancel_futures=True)
             raise
-    report = {'mode':'automatic_source_review','version':VERSION,'source':source_identity(video),
+    report = {'mode':'automatic_source_review','version':VERSION,'metadata_caption_policy':METADATA_CAPTION_POLICY,'source':source_identity(video),
               'plan_digest':digest(plan.model_dump()),'transcript_digest':digest([s.model_dump() for s in lines]),
               'voice_digest':digest(voices),'passed':not all_issues,'issues':all_issues,'batches':batches,'frames':frames,
               'limitations':['机器审核可能误判；声纹候选不等于人工确定身份。']}
@@ -345,6 +392,37 @@ def restore_original_prefix(plan, uid, lines, cfg, source_seconds):
     return retain_short_source_audio(plan,f'beat-{index-1}',lines,cfg,source_seconds)
 
 
+def repeated_original_issue(plan, uid, root, attempt):
+    index=int(uid.split('-')[1])
+    current=plan.clips[0].beats[index]
+    for number in range(attempt):
+        issue_path,plan_path=root/f'issues-{number}.json',root/f'plan-attempt-{number}.json'
+        if not issue_path.exists() or not plan_path.exists():continue
+        if not any(i['id']==uid for i in read_json(issue_path)):continue
+        prior=Plan.model_validate(read_json(plan_path)).clips[0].beats
+        if index>=len(prior) or prior[index].mode!='original':continue
+        overlap=max(0,min(current.end,prior[index].end)-max(current.start,prior[index].start))
+        if overlap>=.8*max(current.end-current.start,prior[index].end-prior[index].start):return True
+    return False
+
+
+def replan_original_window(plan, uid, issues, lines, root, cfg, llm, attempt, retry, source_seconds):
+    from .draft import repair_draft
+    from .director import compile_plan
+    index=int(uid.split('-')[1])
+    bounds=(plan.clips[0].beats[0].start,plan.clips[0].beats[-1].end)
+    report={'clip':plan.clips[0].model_dump(),'issues':[{'code':'semantic_review',
+        'message':f'clips[0].beats[{index}] '+i['message']} for i in issues if i['id']==uid]}
+    raw=repair_draft(plan.model_dump(),report,lines,bounds,cfg,llm,
+        root/'automatic-repairs'/str(attempt)/uid,digest(report),retry)
+    candidate=compile_plan(raw,lines,bounds,fit_narration=False)
+    validate_plan(candidate,lines,source_seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+    lookup={s.id:s for s in lines}
+    if any(lookup[i].start>=b.end for b in candidate.clips[0].beats if b.mode=='narration' for i in b.evidence_ids):
+        raise ValueError('局部重编引用了尚未播放的未来对白')
+    return candidate
+
+
 def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_seconds=None):
     """Repair one failed unit at a time, keeping validated edits and shot IDs."""
     revised = plan.model_copy(deep=True)
@@ -358,6 +436,15 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
         if uid not in targets:
             raise ValueError('局部修订收到不存在的单位')
         target = targets[uid]
+        if (uid.startswith('original-') and cfg.duration_profile=='short' and source_seconds is not None
+                and repeated_original_issue(revised,uid,root,attempt)):
+            try:
+                candidate=replan_original_window(revised,uid,issues,lines,root,cfg,llm,attempt,0,source_seconds)
+                write_json(root/f'automatic-repair-{attempt}.json',{'changes':accepted,'structural_unit':uid,
+                    'plan':candidate.model_dump(),'status':'requires_full_measurement_and_review'})
+                return candidate
+            except ValueError as exc:
+                write_json(root/'automatic-repairs'/str(attempt)/uid/'window-error.json',{'error':str(exc)})
         max_characters = None
         measured = next((i.get('measurement') for i in issues if i['id']==uid and i.get('measurement')),None)
         if uid.startswith('beat-') and measured and measured.get('voice_seconds',0)>0:
@@ -468,20 +555,8 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                         # A cut may need room occupied by the next bridge. A
                         # one-shot patch cannot repair that; replan only its
                         # neighboring window and then remeasure/review all units.
-                        from .draft import repair_draft
-                        from .director import compile_plan
-                        index = int(uid.split('-')[1])
-                        bounds = (revised.clips[0].beats[0].start,revised.clips[0].beats[-1].end)
-                        report = {'clip':revised.clips[0].model_dump(),'issues':[{
-                            'code':'semantic_review','message':f'clips[0].beats[{index}] '+i['message']}
-                            for i in issues if i['id']==uid]}
                         try:
-                            raw_plan = repair_draft(revised.model_dump(),report,lines,bounds,cfg,llm,
-                                root/'automatic-repairs'/str(attempt)/uid,digest(report),retry)
-                            candidate = compile_plan(raw_plan,lines,bounds,fit_narration=False)
-                            validate_plan(candidate,lines,source_seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
-                            if any(lookup[i].start>=b.end for b in candidate.clips[0].beats if b.mode=='narration' for i in b.evidence_ids):
-                                raise ValueError('局部重编引用了尚未播放的未来对白')
+                            candidate = replan_original_window(revised,uid,issues,lines,root,cfg,llm,attempt,retry,source_seconds)
                             write_json(root/f'automatic-repair-{attempt}.json',{'changes':accepted,
                                 'structural_unit':uid,'plan':candidate.model_dump(),'status':'requires_full_measurement_and_review'})
                             return candidate
@@ -540,6 +615,8 @@ class FrozenAutomaticScript:
 
 def assert_approval(report, video, plan, lines, voices):
     if (report.get('version')!=VERSION or report.get('mode') != 'automatic_source_review' or report.get('passed') is not True or report.get('issues') != []
+            or report.get('metadata_caption_policy')!=METADATA_CAPTION_POLICY
+            or not any(f.get('purpose')=='metadata_captions' for f in report.get('frames',[]))
             or report.get('source') != source_identity(video) or report.get('plan_digest') != digest(plan.model_dump())
             or report.get('transcript_digest') != digest([s.model_dump() for s in lines])
             or report.get('voice_digest') != digest(voices) or not report.get('frames')):

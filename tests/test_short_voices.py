@@ -206,7 +206,7 @@ def test_short_voice_gate_real_export_cache_and_reference_change(tmp_path,monkey
     export_finished(cfg.output)
     assert len(list((cfg.output/'成片').glob('*.mp4')))==2
     bank['revision']=2;bank['characters'][0]['name']='乙';write_json(library,bank)
-    assert produce()['clips']==2 and len(reviews)>count and len(plans)==4
+    assert produce()['clips']==2 and len(reviews)>count and len(plans)==2
     assert all(Path(p).read_bytes()==content for p,content in before.items())
     assert (root/'voice-revalidation.json').exists()
     for clip in read_json(root/'results.json'):
@@ -347,3 +347,37 @@ def test_finished_followup_must_still_match_reviewed_source_and_batch(tmp_path,m
         write_json(folder/'manifest.json',manifest)
     with pytest.raises(ValueError):short_voices.apply_confirmed_followups(cfg.output,library,cfg.series)
     assert read_json(library)==bank
+
+
+@pytest.mark.parametrize('problem',[None,'current','source','transcript','configuration','story','future'])
+def test_reference_change_reuses_bound_draft_only_and_never_old_approval(tmp_path,monkeypatch,problem):
+    video,library,bank,cfg,root,lines,voices,folder,report,calls=followup_fixture(tmp_path,monkeypatch)
+    cfg=cfg.model_copy(update={'target_seconds':45,'min_seconds':1,'max_seconds':90,'opening':'narration'})
+    story=production.Story(title='测试故事',angle='对话',start=0,end=120,evidence_ids=[0,1],reason='完整对话')
+    old_voices={**voices,'library_digest':'old'}
+    voices={**voices,'library_digest':'new'}
+    previous=root/'runs'/digest({'voices':old_voices,'cfg':cfg.model_dump(mode='json'),'story':story.model_dump()})
+    current=root/'runs'/digest({'voices':voices,'cfg':cfg.model_dump(mode='json'),'story':story.model_dump()});current.mkdir(parents=True)
+    write_json(previous/'source.json',source_identity(video))
+    write_json(previous/'transcript.json',[s.model_dump() for s in lines])
+    write_json(previous/'voice-evidence.json',old_voices)
+    plan=read_json(folder/'plan-timed.json')
+    for beat in plan['clips'][0]['beats'][2:]:beat.update(mode='original',text='')
+    if problem=='current':
+        write_json(current/'plan-timed.json',plan)
+        write_json(current/'source.json',source_identity(video))
+        write_json(current/'transcript.json',[s.model_dump() for s in lines])
+        write_json(current/'voice-evidence.json',voices)
+    elif problem=='source':write_json(previous/'source.json',{'path':'other'})
+    elif problem=='transcript':write_json(previous/'transcript.json',[])
+    elif problem=='configuration':cfg=cfg.model_copy(update={'target_seconds':46})
+    elif problem=='story':story=story.model_copy(update={'title':'其他故事'})
+    elif problem=='future':plan['clips'][0]['beats'][0]['evidence_ids']=[0,3]
+    write_json(previous/'plan-timed.json',plan)
+    resumed=short_voices.resume_reference_plan(video,lines,voices,story,cfg,current,100)
+    if problem in {None,'current'}:
+        assert resumed.model_dump()==plan
+        assert read_json(current/'reference-resume.json')['status']=='requires_full_measurement_and_review'
+        if problem=='current':assert Path(read_json(current/'reference-resume.json')['previous_plan']).parent==current
+    else:assert resumed is None
+    assert not (current/'automatic-review.json').exists() and not (current/'plan-approved.json').exists()

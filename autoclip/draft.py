@@ -110,6 +110,10 @@ def repair_draft(raw, report, lines, bounds, cfg, llm, root, signature, attempt)
                'draft':{**{k:v for k,v in clips[0].items() if k!='beats'},'beats':beats[first:last+1]},
                'diagnostics':{'issues':report.get('issues',[])},
                'source_lines':[s.model_dump() for s in lines if s.start<window[1] and s.end>window[0]]}
+    follows_opening=(first>0 and cfg.opening=='original' and all(b['mode']=='original' for b in beats[:first]))
+    if follows_opening:
+        payload['retained_opening_seconds']=sum(b['end']-b['start'] for b in beats[:first])
+        payload['replacement_must_start_with']='narration'
     if structural:
         # A broken ordering is not a useful writing template. Supplying the
         # entire failed timeline encourages copying its reverse jump verbatim.
@@ -139,6 +143,7 @@ def repair_draft(raw, report, lines, bounds, cfg, llm, root, signature, attempt)
         '每项必须含mode/start/end/text/evidence_ids/reason；mode只能original或narration，original的text为空，narration必须填旁白。'
         'evidence_ids使用source_lines中真实字幕id整数，不能省略字段，其他约束见beat_schema。'
         '如果提供opening_options，第一段原声必须直接选择其中一项start/end/evidence_ids，随后留足画面写必要旁白，不能将字幕逐句拆成1秒原声来凑开场。'
+        '若replacement_must_start_with为narration，开场原声已由程序保留，替换窗口必须从旁白开始，不能再次安排原声延长或打断既有开场。'
         '可合并、拆分、删去重复的镜头；必须保留独立故事的前因后果。顺序与时间递增，禁止倒叙。'
         '镜头仅限source_window，原声切在完整字幕句边界。只有窗口从镜头0开始时才重做开场：原声10–22秒连续且随后接解说。'
         '不要预借未来对白：解说可解释已经展示的原声，或者当前画面有证据的动作。'
@@ -167,6 +172,8 @@ def repair_draft(raw, report, lines, bounds, cfg, llm, root, signature, attempt)
                     raise ValueError('每个镜头必须1–40秒；长原声须在完整字幕句边界拆分，不能返回整场对白')
             if len(beats)-(last-first+1)+len(proposal['beats'])>24:
                 raise ValueError('替换后短片超过24个镜头；合并次要片段，不能复制全稿')
+            if follows_opening and proposal['beats'][0]['mode']!='narration':
+                raise ValueError(f'窗口前已保留{payload["retained_opening_seconds"]:.2f}秒原声开场；替换窗口必须从旁白开始，不能再添加原声破坏开场')
             if first==0 and cfg.opening=='original':
                 opening_beats = proposal['beats']
                 if (len(opening_beats)<2 or opening_beats[0]['mode']!='original' or opening_beats[1]['mode']!='narration'
