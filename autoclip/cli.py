@@ -424,6 +424,9 @@ def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目
             config: Path = Path("configs.production.toml"),
             max_new: int = typer.Option(3,help="每集本轮最多推荐的新故事数，1–6；不是集数，也不保证出片数量"),
             stage: str = "all", output: Path | None = None,
+            series: str | None = None,
+            library: Path | None = typer.Option(None,help='本剧人工确认声纹库，长短片共用；项目会记住路径'),
+            voice_manifest: Path | None = None, model_path: Path | None = None, voice_python: Path | None = None,
             subtitle_layer: Path | None = typer.Option(None, help="单个素材使用的字幕纠错层；默认关闭"),
             retry_rejected_from: Path | None = typer.Option(None, help="原批次的单集目录；仅在新批次重试未通过选题")):
     """短片自动制作：单集可选多个完整故事，目录可批量处理，自动导出并保留旧成片。"""
@@ -440,6 +443,12 @@ def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目
     if cfg.duration_profile == "long":
         raise typer.BadParameter("长稿配置用于write-outline → measure-plan → render-sample；produce仍用于短片自动选题")
     cfg.output=(output or base/cfg.output).resolve()
+    saved_project = cfg.output/'short-project.json'
+    saved_series = read_json(saved_project).get('series') if saved_project.exists() else None
+    cfg.series = series or saved_series or cfg.series
+    cfg = cfg.model_copy(update={'identity_gate':False,'identity_registry':None,'narrative_mode':'story_first'})
+    if not cfg.vision:
+        raise typer.BadParameter('短片人物核对需要画面审核，不能关闭vision')
     history=base/"output"
     if cfg.output==history or cfg.output in history.parents:
         raise typer.BadParameter("新片必须使用独立目录，不能覆盖旧output目录")
@@ -462,7 +471,6 @@ def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目
     brand=BrandSettings.load(base/"branding.toml")
     if not all(shutil.which(x) for x in ("ffmpeg","ffprobe")):
         raise typer.BadParameter("请安装FFmpeg和ffprobe后重试")
-    cfg.api_key()
     if brand.enabled:
         from .branding import logo_bounds
         for logo in brand.watermarks or [brand.watermark]:
@@ -474,12 +482,23 @@ def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目
     if not paths:
         raise typer.BadParameter("素材目录没有视频")
     cfg.output.mkdir(parents=True,exist_ok=True)
+    from .short_voices import prepare_project, ensure_current_library
+    try:
+        voice_context = prepare_project(source,paths,cfg,library,voice_manifest,model_path,voice_python)
+    except (ValueError,OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if voice_context['status']=='waiting_voice_confirmation':
+        console.print(json.dumps(voice_context,ensure_ascii=False,indent=2),markup=False)
+        raise typer.Exit(2)
+    cfg.api_key()
     outcomes=[]
     for video in paths:
         console.rule(f"增量生产 {video.name}")
         try:
             outcomes.append(produce_episode(video,cfg,brand,history,max_new,stage,
-                                            subtitle_layer=subtitle_layer,retry_rejected_from=retry_rejected_from))
+                                            subtitle_layer=subtitle_layer,retry_rejected_from=retry_rejected_from,
+                                            library=voice_context['library'],voice_manifest=voice_context['voice_manifest'],
+                                            model_path=voice_context['model_path'],voice_python=voice_context['voice_python']))
         except Exception as ex:
             outcomes.append({"source":str(video),"status":"failed","error":str(ex)[:2000]})
             console.print(f"{video.name} 失败：{str(ex)[:1500]}",markup=False)
@@ -491,6 +510,15 @@ def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目
             if not latest.get("clips"):
                 for issue in latest.get("rejected",[]) + latest.get("failures",[]):
                     console.print(f"  {issue['title']}：{issue['error'].splitlines()[0][:240]}",markup=False)
+    try:
+        ensure_current_library(voice_context['library'],voice_context['bank'])
+    except (ValueError,OSError,RuntimeError) as exc:
+        for state in cfg.output.glob('*/status.json'):
+            row = read_json(state)
+            if row.get('stage') in {'已完成','部分完成'}:
+                write_json(state,{**row,'stage':'声纹参考已变更，等待自动复核'})
+        console.print(str(exc),markup=False)
+        raise typer.Exit(1) from exc
     if stage=="all" and any(row.get("clips",0)>0 or row.get("status")=="completed" for row in outcomes):
         export_finished(cfg.output)
     console.print(f"新片浏览页：{build_report(cfg.output)}")

@@ -8,13 +8,16 @@ from pathlib import Path
 from pydantic import BaseModel, Field, model_validator
 from .branding import BrandSettings, package_clip
 from .config import Settings
+from .automatic import FrozenAutomaticScript, assert_approval, audit_plan, review_voice_rows
+from .models import Plan
+from .short_voices import episode_evidence, ensure_current_library, retain_approved, spoken_plan_matches
 from .director import analyze, compact, create_plan
 from .ingest import save_transcript, transcribe
 from .llm import LLM
 from .pipeline import console
 from .render import render_clip
 from .report import build_report
-from .repair import RepairNeeded, enrich_constraints, prepare_voice, repair_context
+from .repair import RepairNeeded, enrich_constraints, repair_context
 from .research import background_context, prepare_research, research_context, seed_research
 from .util import digest, duration, read_json, source_identity, write_json
 
@@ -39,6 +42,10 @@ class Selection(BaseModel):
     stories: list[Story] = Field(max_length=6)
 
 
+class AutomaticReviewRejected(ValueError):
+    pass
+
+
 def content_rejection(error: Exception):
     """Only known editorial/timing gates are normal candidate rejections."""
     from .diagnostics import classify_error
@@ -48,7 +55,7 @@ def content_rejection(error: Exception):
            "duration_short","duration_long","duration_unresolved","duplicate_footage"}
     if isinstance(error, ValueError) and set(classify_error(str(error))) <= known:
         return True
-    return isinstance(error, RepairNeeded) or str(error).startswith(("剪辑计划未通过", "语义审片", "第1条视频三轮语义", "独立审核",
+    return isinstance(error, (RepairNeeded,AutomaticReviewRejected)) or str(error).startswith(("剪辑计划未通过", "语义审片", "第1条视频三轮语义", "独立审核",
         "配音时长调整后的文案事实审核失败", "配音与画面时长无法匹配", "成片时长", "镜头超出", "新片重复"))
 
 
@@ -113,9 +120,9 @@ def completed_stories(root: Path):
     for path in (root / "completed.json", root / "results.json"):
         if path.exists():
             candidates.extend(read_json(path))
-    for manifest in sorted((root / "stories").glob("*/published/*/manifest.json")):
+    for manifest in sorted((root / "stories").rglob("published/*/manifest.json")):
         clip = read_json(manifest)
-        story = stories.get(manifest.parents[2].name)
+        story = clip.get('story') or stories.get(manifest.parents[2].name)
         if story:
             clip["story"] = story
             candidates.append(clip)
@@ -201,9 +208,15 @@ reason解释新的看点、与旧片的区别以及为什么足以撑起长视�
 
 
 def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: Path, maximum=3, stage="all",
-                    subtitle_layer: Path | None = None, retry_rejected_from: Path | None = None):
+                    subtitle_layer: Path | None = None, retry_rejected_from: Path | None = None,
+                    library: Path | None = None, voice_manifest: Path | None = None,
+                    model_path: Path | None = None, voice_python: Path | None = None):
     if cfg.duration_profile == "long":
         raise ValueError("加长解说请使用write-outline → measure-plan → render-sample；常规自动选题尚未验证长稿")
+    if stage != 'scout' and (library is None or not cfg.vision):
+        raise ValueError('短片制作需要人工确认声纹库和画面审核；请使用--library指定本剧参考库')
+    if library is not None:
+        cfg = cfg.model_copy(update={'identity_gate':False,'identity_registry':None,'narrative_mode':'story_first'})
     identity=source_identity(video)
     root=cfg.output/(video.stem+"-"+digest(identity)[:8])
     if retry_rejected_from is not None:
@@ -240,6 +253,10 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
         # these effective lines, whose contents already form cache signatures.
         write_json(root/"transcript.effective.json", [s.model_dump() for s in lines])
         write_json(root/"transcript-input.json", evidence_input)
+        bank = voices = None
+        if library is not None:
+            status('扫描整集语音并关联当前声纹库')
+            bank,voices = episode_evidence(video,lines,library,root,cfg,voice_manifest,model_path,voice_python)
         llm=LLM(cfg,root)
         from .continuity import load_continuity, continuity_prompt
         previous = load_continuity(video, cfg, root)
@@ -263,6 +280,8 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
             status("新选题检查完成",candidates=len(selection.stories))
             return {"source":str(video),"candidates":len(selection.stories),"status":"scouted"}
         results,failures,rejected=completed_stories(root),[],[]
+        if voices is not None:
+            results = retain_approved(results,video,lines,voices,cfg,root)
         if stage=="all":
             write_json(root/"completed.json",results)
             write_json(root/"results.json",results)
@@ -275,6 +294,8 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                 continue
             console.print(f"[cyan]{video.stem} 新选题{index+1}：{story.title}[/cyan]",highlight=False)
             storyroot=root/"stories"/digest(story.model_dump())
+            if voices is not None:
+                storyroot = storyroot/'runs'/digest({'voices':voices,'cfg':cfg.model_dump(mode='json'),'story':story.model_dump()})
             storyroot.mkdir(parents=True,exist_ok=True)
             relevant=[s for s in lines if s.start>=story.start and s.end<=story.end]
             brief = None
@@ -294,23 +315,63 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                                            'continuity_signature': previous['signature']})
                     if dossier:
                         story_maps.append({"research_notes": research_context(dossier,story.start,story.end)})
+                    if voices is not None:
+                        story_maps.append({'voice_policy':voices['policy'],'voice_candidates':review_voice_rows([
+                            row for row in voices['lines'] if row['start']<story.end and row['end']>story.start])})
                     plan=create_plan(video,storyroot,relevant,seconds,story_maps,local,llm,[],repair=repair,bounds=(story.start,story.end))
                     clip=plan.clips[0]
                     check_footage(clip, story, existing+results)
                     write_json(storyroot/"plan.json",plan.model_dump())
-                    if stage=="plan":
+                    if stage=='plan':
+                        report = audit_plan(video,plan,lines,voices,storyroot,local,llm)
+                        if not report['passed']:
+                            raise RepairNeeded({'stage':'voice_source_review','clip':clip.model_dump(),
+                                'issues':[{'code':'semantic_review','message':json.dumps(report['issues'],ensure_ascii=False)}]})
+                        assert_approval(report,video,plan,lines,voices)
                         break
-                    clip=prepare_voice(clip,storyroot,local,llm,relevant,attempt,video=video)
+                    from .series import checkpoint, check_delivery, complete_long_plan
+                    write_json(storyroot/'source.json',identity)
+                    write_json(storyroot/'transcript.json',[s.model_dump() for s in lines])
+                    write_json(storyroot/'voice-evidence.json',voices)
+                    def approve():
+                        try:
+                            measured,report = complete_long_plan(video,plan,lines,voices,storyroot,local,llm,
+                                validate_clip=lambda c:check_footage(c,story,existing+results))
+                        except ValueError as exc:
+                            if str(exc).startswith('自动修复达到上限'):
+                                raise AutomaticReviewRejected(str(exc)) from exc
+                            raise
+                        return {'plan':measured.model_dump(),'report':report},[
+                            storyroot/'plan-approved.json',storyroot/'automatic-review.json',
+                            *[Path(f['path']) for f in report['frames']]]
+                    approval = checkpoint(storyroot,'voice-approval',{'draft':plan.model_dump(),'voices':voices,
+                        'cfg':local.model_dump(mode='json'),'story':story.model_dump()},approve)
+                    plan = Plan.model_validate(approval['plan'])
+                    assert_approval(approval['report'],video,plan,lines,voices)
+                    clip = plan.clips[0]
                     check_footage(clip, story, existing+results)
                     plan.clips[0]=clip
                     write_json(storyroot/"plan.json",plan.model_dump())
-                    clean=render_clip(video,storyroot,clip,index,local,llm,lines)
+                    ensure_current_library(library,bank)
+                    clean=render_clip(video,storyroot,clip,index,local,FrozenAutomaticScript(),lines)
+                    if not spoken_plan_matches(plan,clean['timeline']):
+                        raise ValueError('短片实际渲染内容与声纹核定稿不一致')
+                    clean['qa']['semantic_review'] = 'automatic_source_review_not_human'
+                    clean['automatic_review'] = str((storyroot/'automatic-review.json').resolve())
+                    write_json(Path(clean['video']).parent/'manifest.json',clean)
                     finished=package_clip(video,storyroot,clean,index,cfg.series,brand)
+                    finished=check_delivery(finished,local,storyroot)
                     holds=read_json(root/"quality-holds.json") if (root/"quality-holds.json").exists() else {}
                     if finished["video"] in holds:
                         raise RepairNeeded({"stage":"quality_hold","clip":clip.model_dump(),"issues":[{
                             "code":"semantic_review","message":holds[finished["video"]]["reason"]}]})
                     finished["story"]=story.model_dump()
+                    finished['voice_review'] = {'plan':str((storyroot/'plan-approved.json').resolve()),
+                        'approval':str((storyroot/'automatic-review.json').resolve()),
+                        'settings_digest':digest(cfg.model_dump(mode='json')),'media':source_identity(Path(finished['video']))}
+                    ensure_current_library(library,bank)
+                    assert_approval(approval['report'],video,plan,lines,voices)
+                    write_json(Path(finished['video']).parent/'manifest.json',finished)
                     results.append(finished)
                     write_json(root/"completed.json",results)
                     write_json(root/"results.json",results)
@@ -322,7 +383,7 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                     repair=enrich_constraints(repair_context(ex,clip,local),relevant,(story.start,story.end),local)
                     repair["repair_round"]=attempt+1
                     write_json(storyroot/f"attempt-{attempt}.json",{"error":str(ex)[:2500],"repair":repair,"attempt":attempt+1})
-                    if not editorial or attempt==cfg.repair_attempts:
+                    if not editorial or attempt==cfg.repair_attempts or isinstance(ex,AutomaticReviewRejected):
                         destination=rejected if editorial else failures
                         destination.append({"title":story.title,"error":str(ex)[:2000],"issues":repair["issues"],"attempts":attempt+1})
                         console.print(f"[yellow]此选题未通过，继续其他选题：{story.title}[/yellow]")

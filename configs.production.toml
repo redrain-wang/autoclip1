@@ -22,6 +22,7 @@ tts = "edge"
 edge_endpoint = "msedge"
 voice = "zh-CN-YunyangNeural"
 research_before_produce = true
+# Legacy batch compatibility; produce overrides these with its mandatory --library gate.
 identity_gate = true
 identity_registry = "output/人物锚点/registry.json"
 tts_rate = "+8%"

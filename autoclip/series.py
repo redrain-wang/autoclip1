@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from .automatic import (VERSION as REVIEW_VERSION, FrozenAutomaticScript, assert_approval, audit_plan,
-                        link_voice_evidence, repair_plan)
+                        link_voice_evidence, repair_plan, validate_voice_library)
 from .branding import BrandSettings, package_clip
 from .config import Settings
 from .continuity import load_continuity
@@ -173,8 +173,8 @@ def ingest_episode(video, base, cfg):
     return folder, [Line.model_validate(x) for x in read_json(Path(result['transcript']))],result['seconds']
 
 
-def complete_long_plan(video, plan, lines, voices, root, cfg, llm):
-    """Measure, review and repair without requesting a human approval artifact."""
+def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip=None):
+    """Shared long/short measurement and source review; no human approval artifact."""
     issues = []
     repairs = {'timing':0, 'content':0}
     # TTS alignment must not consume the later factual repair allowance.
@@ -184,10 +184,22 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm):
         write_json(root/'plan.json',plan.model_dump())
         timing = measure_sample_plan(video,root/'plan.json',root/'transcript.json',cfg,root)
         plan = Plan.model_validate(read_json(root/'plan-timed.json'))
+        if validate_clip:
+            validate_clip(plan.clips[0])
         if timing['issues']:
             from .recut import cut_candidates
             candidates = cut_candidates(plan.clips[0],timing,lines,cfg,allow_original=False)
-            chosen = next((c for c in candidates if not c['timing']['issues']),None)
+            chosen = None
+            for candidate in candidates:
+                if candidate['timing']['issues']:
+                    continue
+                if validate_clip:
+                    try:
+                        validate_clip(type(plan.clips[0]).model_validate(candidate['clip']))
+                    except ValueError:
+                        continue
+                chosen = candidate
+                break
             if chosen is not None:
                 before = plan.clips[0].model_copy(deep=True)
                 plan.clips[0] = type(before).model_validate(chosen['clip'])
@@ -198,6 +210,8 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm):
                 write_json(root/'plan.json',plan.model_dump())
                 timing = measure_sample_plan(video,root/'plan.json',root/'transcript.json',cfg,root)
                 plan = Plan.model_validate(read_json(root/'plan-timed.json'))
+                if validate_clip:
+                    validate_clip(plan.clips[0])
         if timing['issues']:
             category = 'timing'
             issues = []
@@ -222,6 +236,8 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm):
         write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':category})
         plan = repair_plan(plan,issues,lines,voices,root,cfg,llm,attempt,source_seconds=duration(video))
         validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+        if validate_clip:
+            validate_clip(plan.clips[0])
     raise ValueError('自动修复达到上限，本集未通过：'+json.dumps(issues,ensure_ascii=False)[:1800])
 
 
@@ -405,13 +421,8 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
                   'instruction':'仅此步骤需要人工：voice-review --output '+str(enrollment)+'；确认后重跑同一series命令。'}
         write_json(output/'series-status.json',result)
         return result
-    if bank['series'] != cfg.series:
-        raise ValueError('人工声纹库剧名与项目不一致')
-    # Validate all references even for a prepare-only invocation.
-    for person in bank['characters']:
-        for sample in person['samples']:
-            if sample.get('status') != 'human_confirmed' or source_identity(Path(sample['source']['path'])) != sample['source']:
-                raise ValueError('人工声纹参考无效或已改变')
+    # The same reference validation is used by short-video production.
+    validate_voice_library(bank,cfg.series)
     old_digest = saved.get('library_digest')
     project['library_digest'] = digest(bank)
     if old_digest and old_digest != project['library_digest']:

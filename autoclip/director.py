@@ -319,6 +319,7 @@ evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间�
         check(plan)
     # Review one story at a time. Mixing two storylines and a whole-episode summary
     # in one review encourages false attribution and demands to cover every subplot.
+    voice_context = [m for m in maps if isinstance(m,dict) and m.get('voice_candidates')]
     for i in range(len(plan.clips)):
         previous_issues = []
         for attempt in range(3):
@@ -338,6 +339,7 @@ evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间�
                 + WRITING_RULES + f"Clip格式：{json.dumps(Clip.model_json_schema(),ensure_ascii=False)}"
                 f"\n上一轮问题（若有必须落实修复）：{json.dumps(previous_issues,ensure_ascii=False)}"
                 f"\n待审视频：{clip.model_dump_json()}\n对应原片字幕：{compact(relevant)}" + background_context(cfg.series)
+                + '\n当前人工声纹库比对候选（不是身份定论，需结合画面与问答）：'+json.dumps(voice_context,ensure_ascii=False)
                 + "\n逐项区分行为主语、听话人和被提及者；身份不明的关键归属必须列为实质问题，不因剧名或背景资料而默认正确。", sheets)
             write_json(root / f"review-{signature}-clip{i+1}-{attempt}.json", review)
             if review.get("passed") is True and review.get("issues") == []:

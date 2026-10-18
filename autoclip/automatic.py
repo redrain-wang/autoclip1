@@ -16,18 +16,26 @@ from .voices import match_batch
 VERSION = 'automatic-review-9'
 
 
+def validate_voice_library(library, series):
+    if not library.get('characters'):
+        raise ValueError('缺少人工确认声纹库，不能进行人物核对后交付')
+    if library.get('series') != series:
+        raise ValueError('人工声纹库剧名与项目不一致')
+    for person in library['characters']:
+        if not person.get('samples'):
+            raise ValueError('人工声纹参考没有确认样本')
+        for sample in person['samples']:
+            if sample.get('status') != 'human_confirmed' or source_identity(Path(sample['source']['path'])) != sample['source']:
+                raise ValueError('人工声纹参考无效或原片已改变')
+
+
 def link_voice_evidence(video, lines, library, manifest):
     """Rematch against the current human library; never trust old suggested names."""
     source = source_identity(video)
     source_ids = {s['id'] for s in manifest['sources'] if s['source'] == source}
     if not source_ids:
         raise ValueError('声纹候选没有绑定当前原片版本')
-    for person in library['characters']:
-        for sample in person['samples']:
-            if sample.get('status') != 'human_confirmed':
-                raise ValueError('参考库只能包含人工确认声纹')
-            if source_identity(Path(sample['source']['path'])) != sample['source']:
-                raise ValueError('声纹参考原片已改变')
+    validate_voice_library(library,manifest['series'])
     selected = {**manifest, 'samples':[s for s in manifest['samples'] if s['source_id'] in source_ids]}
     matched = match_batch(library, selected)
     rows = []
