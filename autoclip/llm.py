@@ -54,6 +54,10 @@ class LLM:
                 body = response.json()
                 choice = body["choices"][0]
                 if choice.get("finish_reason") == "length":
+                    # Repeating the same output cap cannot recover a response
+                    # whose reasoning consumed it. Keep the retry/call budget,
+                    # but allow one bounded increase; never cache partial JSON.
+                    payload["max_tokens"] = min(payload["max_tokens"] * 2, 28000)
                     raise RuntimeError("模型输出被截断，缩小任务或提高输出限制")
                 raw = choice["message"]["content"].strip()
                 if raw.startswith("```"):

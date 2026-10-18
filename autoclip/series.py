@@ -6,18 +6,19 @@ import sys
 import time
 from pathlib import Path
 
-from .automatic import (FrozenAutomaticScript, assert_approval, audit_plan,
+from .automatic import (VERSION as REVIEW_VERSION, FrozenAutomaticScript, assert_approval, audit_plan,
                         link_voice_evidence, repair_plan)
 from .branding import BrandSettings, package_clip
 from .config import Settings
 from .continuity import load_continuity
 from .deliver import export_finished
 from .director import analyze
+from .editorial import VERSION as ORAL_VERSION
 from .ingest import save_transcript, transcribe
 from .llm import LLM
 from .models import Line, Plan, validate_plan
 from .outline import compose_outline
-from .planning import plan_outline
+from .planning import VERSION as PLANNING_VERSION, plan_outline
 from .render import render_clip
 from .report import build_report
 from .research import prepare_research
@@ -105,6 +106,27 @@ def prepare_audio_candidates(sources, transcripts, root, cfg, model_path=None, p
     return read_json(root/'manifest.json')
 
 
+def scan_production_audio(video, library, root, model_path=None, python=None):
+    """Scan all speech for production; enrollment previews are intentionally sparse."""
+    manifest_path = root/'manifest.json'
+    if manifest_path.exists():
+        cached = read_json(manifest_path)
+        if not cached.get('summary',{}).get('failed'):
+            return cached
+    python = python or (Path(__file__).resolve().parents[1]/'.venv-voices/bin/python')
+    if not Path(python).is_file():
+        python = Path(sys.executable)
+    args = [python,'-m','autoclip','voice-scan-series',video,'--library',library,
+            '--output',root,'--threshold','0.65','--margin','0.10']
+    if model_path:
+        args += ['--model-path',model_path]
+    run(args,timeout=43200)
+    manifest = read_json(manifest_path)
+    if manifest.get('summary',{}).get('failed'):
+        raise ValueError('本集全片声纹扫描失败，不能用部分扫描结果继续制作')
+    return manifest
+
+
 def ingest_episode(video, base, cfg):
     source = source_identity(video)
     sidecar = video.with_suffix('.srt')
@@ -126,12 +148,30 @@ def ingest_episode(video, base, cfg):
 def complete_long_plan(video, plan, lines, voices, root, cfg, llm):
     """Measure, review and repair without requesting a human approval artifact."""
     issues = []
-    for attempt in range(cfg.repair_attempts+1):
+    repairs = {'timing':0, 'content':0}
+    # TTS alignment must not consume the later factual repair allowance.
+    # Each category remains bounded, including regressions after a content edit.
+    for attempt in range(2*cfg.repair_attempts+2):
         write_json(root/f'plan-attempt-{attempt}.json',plan.model_dump())
         write_json(root/'plan.json',plan.model_dump())
         timing = measure_sample_plan(video,root/'plan.json',root/'transcript.json',cfg,root)
         plan = Plan.model_validate(read_json(root/'plan-timed.json'))
         if timing['issues']:
+            from .recut import cut_candidates
+            candidates = cut_candidates(plan.clips[0],timing,lines,cfg,allow_original=False)
+            chosen = next((c for c in candidates if not c['timing']['issues']),None)
+            if chosen is not None:
+                before = plan.clips[0].model_copy(deep=True)
+                plan.clips[0] = type(before).model_validate(chosen['clip'])
+                if any(a.text!=b.text or a.evidence_ids!=b.evidence_ids or
+                       (a.mode=='original' and a!=b) for a,b in zip(before.beats,plan.clips[0].beats,strict=True)):
+                    raise ValueError('空隙补画面不能改变文字、原声或引用')
+                write_json(root/f'automatic-timing-{attempt}.json',chosen)
+                write_json(root/'plan.json',plan.model_dump())
+                timing = measure_sample_plan(video,root/'plan.json',root/'transcript.json',cfg,root)
+                plan = Plan.model_validate(read_json(root/'plan-timed.json'))
+        if timing['issues']:
+            category = 'timing'
             issues = []
             for item in timing['issues']:
                 targets = [item['beat']] if 'beat' in item else [i for i,b in enumerate(plan.clips[0].beats) if b.mode=='narration']
@@ -139,15 +179,20 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm):
                     row = timing['beats'][index]
                     issues.append({'id':f'beat-{index}', 'message':item['message'], 'measurement':row})
         else:
+            category = 'content'
             report = audit_plan(video,plan,lines,voices,root,cfg,llm)
             issues = report['issues']
             if report['passed']:
+                write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':None})
                 write_json(root/'plan-approved.json',plan.model_dump())
                 return plan, report
         write_json(root/f'issues-{attempt}.json',issues)
-        if attempt == cfg.repair_attempts:
+        write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':category})
+        if repairs[category] >= cfg.repair_attempts:
             break
-        plan = repair_plan(plan,issues,lines,voices,root,cfg,llm,attempt)
+        repairs[category] += 1
+        write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':category})
+        plan = repair_plan(plan,issues,lines,voices,root,cfg,llm,attempt,source_seconds=duration(video))
         validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
     raise ValueError('自动修复达到上限，本集未通过：'+json.dumps(issues,ensure_ascii=False)[:1800])
 
@@ -183,7 +228,7 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
             state('自动安排章节与镜头')
             result = plan_outline(video,root,lines,seconds,cfg,llm,notes=notes)
             return result,[root/'outline.auto.json']
-        outline = checkpoint(root,'outline',inputs,outline_action)
+        outline = checkpoint(root,'outline',{'inputs':inputs,'planning_version':PLANNING_VERSION},outline_action)
         def writing_action():
             state('写稿与口播精修')
             plan = compose_outline(video,root/'transcript.json',root/'outline.auto.json',root,cfg,llm)
@@ -193,12 +238,12 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
             result,_ = writing_action()
             write_json(root/'initial-plan.json',result)
             return result,[root/'initial-plan.json']
-        draft = checkpoint(root,'draft',{'inputs':inputs,'outline':outline},saved_draft)
+        draft = checkpoint(root,'draft',{'inputs':inputs,'outline':outline,'oral_version':ORAL_VERSION},saved_draft)
         def approve_action():
             state('自动测时、内容核对与局部修复')
             plan,report = complete_long_plan(video,Plan.model_validate(draft),lines,voices,root,cfg,llm)
             return {'plan':plan.model_dump(),'report':report},[root/'plan-approved.json',root/'automatic-review.json',*[Path(f['path']) for f in report['frames']]]
-        approved = checkpoint(root,'approval',{'inputs':inputs,'draft':draft,'voices':voices},approve_action)
+        approved = checkpoint(root,'approval',{'inputs':inputs,'draft':draft,'voices':voices,'review_version':REVIEW_VERSION},approve_action)
         plan = Plan.model_validate(approved['plan'])
         assert_approval(approved['report'],video,plan,lines,voices)
         def render_action():
@@ -325,11 +370,8 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
                 current_manifest = candidates
                 if (current_manifest is None or current_manifest.get('model') != bank.get('model')
                         or not any(s['source']==source_identity(video) for s in current_manifest['sources'])):
-                    voice_root = base/'voice-candidates'/digest([source_identity(video),[s.model_dump() for s in lines],str(model_path),bank['model']])
-                    if (voice_root/'manifest.json').exists():
-                        current_manifest = read_json(voice_root/'manifest.json')
-                    else:
-                        current_manifest = prepare_audio_candidates([video],[input_root/'transcript.json'],voice_root,cfg,model_path,voice_python)
+                    voice_root = base/'voice-scan'/digest(['vad-production-1',source_identity(video),digest(bank),str(model_path)])
+                    current_manifest = scan_production_audio(video,library,voice_root,model_path,voice_python)
                 outcome = run_episode(video,base,input_root,lines,seconds,cfg,bank,current_manifest,brand,index)
                 if digest(read_json(library)) != digest(bank):
                     raise ValueError('声纹库在审核期间改变，本集旧核定不交付；重跑后自动复核')

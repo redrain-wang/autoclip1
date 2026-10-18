@@ -67,8 +67,10 @@ def test_malformed_automatic_review_never_passes(bad):
 def test_semantic_or_identity_uncertainty_blocks_approval(bad):
     raw,units,lines,count,voices = review_fixture()
     if bad=='unknown':raw['units'][0]['verdict']='unknown'
-    if bad=='contradiction':raw['issues']=['说法有误']
-    if bad=='future':units[0]['end']=4
+    if bad=='contradiction':raw['issues']=[{'id':'beat-1','message':'说法有误'}]
+    if bad=='future':
+        units[0]['end']=4
+        raw['units'][0]['verdict']='unknown'
     if bad in {'voice_conflict','no_voice'}:
         raw['units'][0]['identity_basis']='voice_and_context'
         if bad=='voice_conflict':voices=[{'line_id':1,'status':'conflict'}]
@@ -77,6 +79,34 @@ def test_semantic_or_identity_uncertainty_blocks_approval(bad):
 
 def test_valid_review_is_accepted():
     assert assess_batch(*review_fixture()) == []
+
+
+def test_supported_verdict_with_future_citation_requires_recheck_instead_of_script_rewrite():
+    args=review_fixture();args[1][0]['end']=4
+    with pytest.raises(ValueError,match='声称有据但引用未来对白'):
+        assess_batch(*args)
+
+
+def test_review_issues_only_affect_the_named_unit():
+    raw,units,lines,count,voices=review_fixture()
+    units.append({'id':'beat-2','text':'另一段合理口播','end':10})
+    raw['units'].append({**raw['units'][0],'id':'beat-2'})
+    raw['passed']=False
+    raw['issues']=[{'id':'beat-1','message':'只修这一段的主语'}]
+    assert assess_batch(raw,units,lines,count,voices)==raw['issues']
+    raw['issues'][0]['id']='title'
+    with pytest.raises(ValueError,match='本批次以外'):assess_batch(raw,units,lines,count,voices)
+
+
+def test_contradictory_response_without_specific_issue_is_not_a_content_verdict():
+    args=review_fixture();args[0]['passed']=False
+    with pytest.raises(ValueError,match='未指出'):assess_batch(*args)
+
+
+def test_named_subject_cannot_claim_there_is_no_identity_assertion():
+    args=review_fixture();unit=args[0]['units'][0]
+    unit['identity_basis']='no_identity_claim';unit['subjects']=['甲']
+    assert assess_batch(*args)
 
 
 def sample_plan():
@@ -96,15 +126,119 @@ def test_repair_only_touches_failed_units(tmp_path):
     with pytest.raises(ValueError):repair_plan(plan,[{'id':'beat-1','message':'纠错'}],[],{},tmp_path,Settings(),Invalid(),0)
 
 
+def test_invalid_empty_repair_is_retried_transactionally(tmp_path):
+    plan=sample_plan();before=plan.model_dump();prompts=[]
+    class Model:
+        def json(self,system,prompt):
+            prompts.append(prompt)
+            return {'changes':[{'id':'beat-1','text':'' if len(prompts)==1 else '这个人说明了办理事情的理由'}]}
+    revised=repair_plan(plan,[{'id':'beat-1','message':'主语应准确'}],[],{},tmp_path,Settings(),Model(),0)
+    assert len(prompts)==2 and 'narration text required' in prompts[1]
+    assert plan.model_dump()==before and revised.clips[0].beats[1].text
+    for i in (0,2,3):assert revised.clips[0].beats[i]==plan.clips[0].beats[i]
+
+
+def test_single_unit_repairs_preserve_successful_edits_and_exclude_future_evidence(tmp_path):
+    import json
+    plan=sample_plan();before=plan.model_dump();targets=[];prompts=[]
+    lines=[Line(id=i,start=i*10+.5,end=(i+1)*10-.5,text='当前对白') for i in range(4)]
+    class Model:
+        def json(self,system,prompt):
+            target=json.JSONDecoder().raw_decode(prompt.split('\ntarget=',1)[1])[0]
+            targets.append(target['id']);prompts.append(prompt)
+            if target['id']=='beat-1':return {'changes':[{'id':'beat-1','text':'先交代这次事情的缘由'}]}
+            return {'changes':[{'id':'beat-2','text':'再交代对方随后作出的回应',
+                                'evidence_ids':[3] if len(targets)==2 else [2]}]}
+    final=repair_plan(plan,[{'id':'beat-1','message':'明确起因'},{'id':'beat-2','message':'说明回应'}],
+                      lines,{},tmp_path,Settings(),Model(),0)
+    assert targets==['beat-1','beat-2','beat-2']
+    assert '先交代这次事情的缘由' in prompts[-1] and '未允许证据' in prompts[-1]
+    assert final.clips[0].beats[2].evidence_ids==[2] and plan.model_dump()==before
+    assert final.clips[0].beats[0]==plan.clips[0].beats[0]
+    assert final.clips[0].beats[3]==plan.clips[0].beats[3]
+
+
+@pytest.mark.parametrize('cited',[None,[{'id':1}]])
+def test_malformed_repair_evidence_has_bounded_retries(tmp_path,cited):
+    calls=[]
+    class Model:
+        def json(self,*args):
+            calls.append(args);return {'changes':[{'id':'beat-1','text':'说明原因','evidence_ids':cited}]}
+    with pytest.raises(ValueError,match='整数编号列表'):
+        repair_plan(sample_plan(),[{'id':'beat-1','message':'修订'}],[],{},tmp_path,
+                    Settings(repair_attempts=1),Model(),0)
+    assert len(calls)==2
+
+
+def test_original_note_can_change_without_rewriting_original_audio(tmp_path):
+    plan=sample_plan();plan.clips[0].beats[0].mode='original';plan.clips[0].beats[0].text=''
+    class Model:
+        def json(self,*args):return {'changes':[{'id':'original-0','reason':'保留完整问答，不附加人物判断'}]}
+    revised=repair_plan(plan,[{'id':'original-0','message':'内部说明不准确'}],[],{},tmp_path,Settings(),Model(),0)
+    before=plan.clips[0].beats[0].model_dump();after=revised.clips[0].beats[0].model_dump()
+    before.pop('reason');after.pop('reason')
+    assert before==after
+
+
+@pytest.mark.parametrize('problem',['overlap','future','cut'])
+def test_repaired_timeline_is_validated_before_accepting_patch(tmp_path,problem):
+    plan=sample_plan();plan.clips[0].beats[0].mode='original';plan.clips[0].beats[0].text=''
+    lines=[Line(id=i,start=i*10+.5,end=(i+1)*10-.5,text='当前对白') for i in range(4)]
+    cfg=Settings(opening='original',target_seconds=100,min_seconds=30,max_seconds=180,repair_attempts=0)
+    row={'id':'beat-1','text':'说明事情发生的原因'}
+    if problem=='overlap':row['start']=0
+    elif problem=='future':row['evidence_ids']=[1,3]
+    else:
+        lines[0].end=11
+        row={'id':'original-0','end':10}
+    class Model:
+        def json(self,*args):return {'changes':[row]}
+    with pytest.raises(ValueError):
+        repair_plan(plan,[{'id':row['id'],'message':'修复'}],lines,{},tmp_path,cfg,Model(),0,source_seconds=40)
+
+
+def test_review_protocol_retry_keeps_script_and_supplies_previous_shown_context(tmp_path,monkeypatch):
+    import json
+    import autoclip.automatic as module
+    from autoclip.util import write_json
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'frame')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    plan=sample_plan()
+    plan.clips[0].beats[0].mode='original';plan.clips[0].beats[0].text=''
+    plan.clips[0].beats[0].reason='内部猜测辛某起身，不属于观众听到的内容'
+    before=plan.model_dump()
+    lines=[Line(id=i,start=i*10+.5,end=(i+1)*10-.5,text='当前对白') for i in range(4)]
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':[]}
+    groups=[];prompts=[]
+    class Model:
+        def json(self,system,prompt,images):
+            prompts.append(prompt)
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0];groups.append(group)
+            if len(prompts)==1:return {'passed':False,'issues':[],'units':[]}
+            return {'passed':True,'issues':[],'units':[{'id':u['id'],'verdict':'supported',
+                'reason':'给定字幕与画面相符','evidence_ids':[0],'frame_ids':[0],
+                'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(),Model())
+    assert report['passed'] and len(prompts)==3
+    assert '上次审核响应' in prompts[1] and plan.model_dump()==before
+    assert all('内部猜测辛某' not in prompt for prompt in prompts)
+    last=next(u for group in groups for u in group if u['id']=='beat-3')
+    assert last['shown_evidence']==[0,1,2]
+    assert list(tmp_path.glob('automatic-review/*/batch-0-protocol-0.json'))
+
+
 def test_automatic_approval_binds_exact_plan_voice_and_frames(tmp_path):
     from autoclip.identity import file_hash
     video = tmp_path/'a.mp4';video.write_bytes(b'video')
     frame = tmp_path/'a.jpg';frame.write_bytes(b'frame')
     plan=sample_plan();lines=[];voices={'library_digest':'first'}
-    report={'mode':'automatic_source_review','passed':True,'issues':[],'source':source_identity(video),
+    from autoclip.automatic import VERSION
+    report={'version':VERSION,'mode':'automatic_source_review','passed':True,'issues':[],'source':source_identity(video),
         'plan_digest':digest(plan.model_dump()),'transcript_digest':digest([]),'voice_digest':digest(voices),
         'frames':[{'path':str(frame),'sha256':file_hash(frame)}]}
     assert_approval(report,video,plan,lines,voices)
+    with pytest.raises(ValueError):assert_approval({**report,'version':'old-review'},video,plan,lines,voices)
     with pytest.raises(ValueError):assert_approval(report,video,plan,lines,{'library_digest':'new'},)
     frame.write_bytes(b'edited')
     with pytest.raises(ValueError):assert_approval(report,video,plan,lines,voices)

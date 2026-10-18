@@ -70,3 +70,31 @@ def test_go_cache_records_endpoint_without_credentials(tmp_path, monkeypatch):
         assert 'go-test-key' not in cache.read_text()
         assert m.usage()['endpoint'] == go().llm_base_url
     finally: m.client.close()
+
+
+@pytest.mark.parametrize('always_truncated', [False, True])
+def test_truncated_response_uses_bounded_larger_budget_without_caching_partial_json(tmp_path, monkeypatch, always_truncated):
+    monkeypatch.setenv('OPENCODE_API_KEY', 'go-test-key')
+    monkeypatch.setattr('autoclip.llm.time.sleep', lambda *a: None)
+    budgets = []
+    client = httpx.Client
+    def respond(request):
+        budgets.append(json.loads(request.content)['max_tokens'])
+        truncated = always_truncated or len(budgets) == 1
+        return httpx.Response(200, json={'choices': [{'finish_reason': 'length' if truncated else 'stop',
+            'message': {'content': '{"partial":true}' if truncated else '{"ok":true}'}}]})
+    monkeypatch.setattr('autoclip.llm.httpx.Client', lambda **kwargs: client(transport=httpx.MockTransport(respond), **kwargs))
+    m = LLM(go(), tmp_path)
+    try:
+        if always_truncated:
+            with pytest.raises(RuntimeError, match='截断'):
+                m.json('system', 'prompt')
+            assert budgets == [14000, 28000, 28000]
+            assert not list(tmp_path.rglob('*.json'))
+        else:
+            assert m.json('system', 'prompt') == {'ok': True}
+            assert m.json('system', 'prompt') == {'ok': True}
+            assert budgets == [14000, 28000]
+            assert len(list(tmp_path.rglob('*.json'))) == 1
+        assert m.calls == len(budgets)
+    finally: m.client.close()

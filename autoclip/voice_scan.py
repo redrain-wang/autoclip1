@@ -66,7 +66,7 @@ def cluster_unknown(samples, seed=17):
     return sorted(rows, key=lambda g: -g['priority'])
 
 
-def scan_series(sources, library_path, root, model_path, vad_path, threshold=.60, margin=.10):
+def scan_series(sources, library_path, root, model_path=None, vad_path=None, threshold=.60, margin=.10):
     import numpy as np
     from funasr import AutoModel
     import fcntl
@@ -98,6 +98,9 @@ def _scan(sources, library_path, root, model_path, vad_path, threshold, margin, 
     encoder, model = load_encoder(model_path)
     if model != library['model']:
         raise ValueError('扫描与人工参考的声纹模型不一致')
+    if vad_path is None:
+        from modelscope import snapshot_download
+        vad_path = snapshot_download('iic/speech_fsmn_vad_zh-cn-16k-common-pytorch')
     vad_path = Path(vad_path).resolve()
     vad_signature = digest([(n, (vad_path/n).read_bytes().hex()) for n in ('config.yaml', 'model.pt')])
     vad = AutoModel(model=str(vad_path), device='cpu', disable_update=True, disable_log=True, disable_pbar=True)

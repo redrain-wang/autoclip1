@@ -3,12 +3,13 @@
 import json
 import re
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from .repair import RepairNeeded
+from .budget import spoken_characters
 from .util import digest, write_json
 
-VERSION = "oral-edit-8"
+VERSION = "oral-edit-13"
 WRITING_RULES = """
 口播听感规则：每段推进一个问题、选择、压力或代价，原声已讲明的动作只作必要承接。
 事实、角色指责和旁白分析分开：可见行动直接说；指责用‘在田大人的解释里’‘他把这件事说成’等自然来源交代。
@@ -43,12 +44,24 @@ class OralProposal(BaseModel):
     changes: list[OralChange] = Field(max_length=96)
 
 
+class OralAlternatives(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    candidates: list[OralChange] = Field(min_length=1, max_length=3)
+
+
+class OralReviewIssue(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    beat: int = Field(ge=0)
+    message: str = Field(min_length=1)
+
+
 class FactualChangeReview(BaseModel):
-    passed: bool
-    issues: list[str]
+    passed: StrictBool
+    issues: list[OralReviewIssue]
     baseline_issues: list[str] = Field(default_factory=list)
-    oral_issues: list[str] = Field(default_factory=list)
+    oral_issues: list[OralReviewIssue] = Field(default_factory=list)
     oral_suggestions: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
 
 def prose_signals(clip):
@@ -73,10 +86,19 @@ def oral_proposal(raw):
     return OralProposal.model_validate(cleaned)
 
 
-def apply_oral_changes(clip, proposal):
-    revised = clip.model_copy(deep=True)
+def oral_char_limits(text):
+    count = spoken_characters(text)
+    return max(5, int(count*.65)), max(12, int(count*1.2))
+
+
+def audience_script(clip):
+    """The viewer hears text/audio; private edit instructions are not claims."""
+    return [{'beat':i, **{k:v for k,v in b.model_dump().items() if k!='reason'}}
+            for i,b in enumerate(clip.beats)]
+
+
+def oral_targets(clip, proposal):
     seen = set()
-    length_errors = []
     for item in proposal.changes:
         if item.beat in seen or item.beat >= len(clip.beats):
             raise ValueError("口播精修不能重复段号或增加镜头")
@@ -84,12 +106,70 @@ def apply_oral_changes(clip, proposal):
         before = clip.beats[item.beat]
         if before.mode != "narration":
             raise ValueError("口播精修不能改动原声")
-        low, high = max(5, int(len(before.text)*.65)), max(12, int(len(before.text)*1.2))
-        if not low <= len(item.text) <= high:
-            length_errors.append(f'beat {item.beat} 原稿{len(before.text)}字，新稿{len(item.text)}字，须{low}–{high}字')
+    return {item.beat:clip.beats[item.beat] for item in proposal.changes}
+
+
+def apply_oral_changes(clip, proposal):
+    targets = oral_targets(clip,proposal)
+    revised = clip.model_copy(deep=True)
+    length_errors = []
+    for item in proposal.changes:
+        before = targets[item.beat]
+        low, high = oral_char_limits(before.text)
+        if not low <= spoken_characters(item.text) <= high:
+            length_errors.append(f'beat {item.beat} 原稿{spoken_characters(before.text)}字，新稿{spoken_characters(item.text)}字，须{low}–{high}字')
         revised.beats[item.beat].text = item.text
     if length_errors:
         raise ValueError('口播精修不能大幅缩写或扩写；时长重构需要单独提纲：'+'；'.join(length_errors))
+    return revised
+
+
+def repair_oral_lengths(clip, proposal, lines, folder, cfg, llm, attempt):
+    """Preserve valid edits; select a locally repaired variant by actual length.
+
+    Length selection is not semantic approval. Every selected edit still enters
+    the independent factual/listening review, then normal TTS and visual review.
+    """
+    from .director import compact
+    targets = oral_targets(clip,proposal)
+    revised = proposal.model_copy(deep=True)
+    for position,item in enumerate(proposal.changes):
+        before = targets[item.beat]
+        low, high = oral_char_limits(before.text)
+        if low <= spoken_characters(item.text) <= high:
+            continue
+        feedback = ''
+        selected = None
+        for retry in range(cfg.repair_attempts):
+            prompt = ('只修当前这一段口播的长度，其他段落、镜头、原声、证据和人物归属不能改。'
+                '给出最多3种自然说法，逐级精简；只保留当前字幕支持的必要信息，不增加事件、动机或结果。'
+                '所有候选必须用相同beat编号。程序按发音字符计数（不计标点与空白），不采信reason里声称的字数；实际配音仍须另行测时。'
+                '不要把原稿或编辑理由当作已核实事实，重要的来源和未知不能省掉。'
+                f'\nbeat={item.beat}；每条text必须{low}–{high}字。原稿{spoken_characters(before.text)}字：{before.text}'
+                f'\n待修稿实际{spoken_characters(item.text)}字：{item.text}\n编辑理由（不是事实）：{item.reason}'
+                f'\n当前可用字幕：{compact([s for s in lines if s.id in before.evidence_ids and s.start<before.end])}'
+                f'\n直接返回candidates数据对象，格式{json.dumps(OralAlternatives.model_json_schema(),ensure_ascii=False)}'
+                + WRITING_RULES + feedback)
+            raw = llm.json('你是口播长度局部修稿编辑，只修改指定的一段。',prompt)
+            record = {'beat':item.beat,'count_mode':'spoken_characters','min_chars':low,'max_chars':high,'proposal':raw}
+            try:
+                variants = OralAlternatives.model_validate(raw)
+                if any(candidate.beat != item.beat for candidate in variants.candidates):
+                    raise ValueError('局部修稿更换了段号')
+                record['counts'] = [spoken_characters(candidate.text) for candidate in variants.candidates]
+                selected = next((c for c in variants.candidates if low<=spoken_characters(c.text)<=high),None)
+                if selected is None:
+                    raise ValueError(f'候选实际字数{record["counts"]}，必须{low}–{high}字')
+                record['selected'] = selected.model_dump()
+            except ValueError as exc:
+                record['error'] = str(exc)
+                feedback = '\n上轮候选未通过：'+str(exc)+'\n候选全文：'+json.dumps(raw,ensure_ascii=False)
+            write_json(folder/f'length-{attempt}-beat-{item.beat}-retry-{retry}.json',record)
+            if selected is not None:
+                revised.changes[position] = selected
+                break
+        else:
+            raise ValueError(f'beat {item.beat} 口播长度局部修复达到{cfg.repair_attempts}次上限，须{low}–{high}字')
     return revised
 
 
@@ -101,21 +181,34 @@ def polish_clip(clip, lines, root, cfg, llm, context=None):
     folder = root/'oral-edit'/digest({'version':VERSION, 'clip':clip.model_dump(),
                                     'lines':[s.model_dump() for s in relevant], 'context':context})
     folder.mkdir(parents=True, exist_ok=True)
-    editable = [{"beat":i, **b.model_dump()} for i,b in enumerate(clip.beats) if b.mode=='narration']
+    editable = [{**row,"min_chars":oral_char_limits(row['text'])[0],
+                 "max_chars":oral_char_limits(row['text'])[1]} for row in audience_script(clip) if row['mode']=='narration']
     feedback = ''
     baseline_issues = []
+    retained_original = False
+    accepted_edits = {}
+    focus = None
     for attempt in range(2):
+        current = apply_oral_changes(clip,OralProposal(changes=list(accepted_edits.values())))
+        allowed = {row['beat'] for row in editable} if focus is None else focus
+        current_editable = [{**row,'text':current.beats[row['beat']].text} for row in editable if row['beat'] in allowed]
         raw = llm.json('你是影视解说口播精修编辑，面对观众写作；不替人物编心理或事件。',
             WRITING_RULES + '\n只修改确有必要的narration.text，保留原有标题、角度、钩子、镜头顺序、时间码、原声、证据ID与角色归属。'
             '不删光来源限定换取顺口；可以把审核式限定改成明确的角色归属。'
-            '每段新字数为原段65%–120%，不把压缩掉的重复换成空话；好段可以不改。'
+            '每段text遵守程序计算的min_chars/max_chars，按发音字符计数（不计标点与空白）；不把压缩掉的重复换成空话，好段可以不改。实际时长仍须配音测量。'
             '返回changes，每项仅含beat、text完整新口播、reason。beat必须照抄下面可改口播列表给出的编号，不重新数段落；原声编号禁止返回。未改段不返回；无改动则changes=[]。'
             f'\n格式{json.dumps(OralProposal.model_json_schema(),ensure_ascii=False)}'
-            f'\n可改口播列表{json.dumps(editable,ensure_ascii=False)}\n身份核对辅助（仅解读称谓，不补剧情）{json.dumps(context,ensure_ascii=False)}\n现稿{clip.model_dump_json()}\n听感信号{json.dumps(prose_signals(clip),ensure_ascii=False)}'
+            f'\n本轮允许编号{sorted(allowed)}；其他已合格修改保留，禁止返回其他段落。'
+            f'\n可改口播列表{json.dumps(current_editable,ensure_ascii=False)}\n身份核对辅助（仅解读称谓，不补剧情）{json.dumps(context,ensure_ascii=False)}\n现稿{json.dumps(audience_script(current),ensure_ascii=False)}\n听感信号{json.dumps(prose_signals(current),ensure_ascii=False)}'
             f'\n当前原片字幕{compact(relevant)}'+feedback)
         write_json(folder/f'proposal-{attempt}.json',raw)
         try:
             proposal = oral_proposal(raw)
+            if any(change.beat not in allowed for change in proposal.changes):
+                raise ValueError('精修只能返回本轮允许的段落编号')
+            combined = {**accepted_edits,**{change.beat:change for change in proposal.changes}}
+            proposal = OralProposal(changes=list(combined.values()))
+            proposal = repair_oral_lengths(clip,proposal,lines,folder,cfg,llm,attempt)
             candidate = apply_oral_changes(clip,proposal)
             if signals := prose_signals(candidate):
                 raise ValueError('仍有审查措辞，请自然交代来源后重写：'+json.dumps(signals,ensure_ascii=False))
@@ -137,26 +230,57 @@ def polish_clip(clip, lines, root, cfg, llm, context=None):
             '连接词略松、可选的措辞和节奏改进列oral_suggestions，不阻止出稿；不要要求每一句都加所以/这就是等过渡，不因可理解的简洁并列而拒绝。即使changes为空也检查全稿。'
             '不要只因为一个可能或据说就拒绝；重要未知要自然保留。人格结论/不是下定评、这场问答没说透这类换词不算改善。'
             '若额外的保护/考验等猜测不推进情节或观点，可删除；已有明确行动和说出的理由足够支撑分析时不必硬猜心理。'
-            '返回JSON {"passed":true/false,"issues":["段号、具体新增错误与旧新变化"],"baseline_issues":["已有疑点"],"oral_issues":["新稿严重听感问题"],"oral_suggestions":["可选改进"]}。passed只评价是否引入或加重错误，不代表全稿通过；不要返回修订稿。'
-            f'\n变更{json.dumps(actual_changes,ensure_ascii=False)}\n完整新稿{candidate.model_dump_json()}'
+            'issues和oral_issues每项必须是beat、message对象，只列真正需要修复的当前段落。无新增错误、已纠正旧稿等分析写notes，不能放issues。'
+            'passed只评价是否引入或加重错误，不代表全稿通过；不要返回修订稿。'
+            f'\n返回此格式的数据对象：{json.dumps(FactualChangeReview.model_json_schema(),ensure_ascii=False)}'
+            f'\n变更{json.dumps([{k:v for k,v in c.items() if k!="reason"} for c in actual_changes],ensure_ascii=False)}'
+            f'\n完整新稿{json.dumps(audience_script(candidate),ensure_ascii=False)}'
             f'\n身份核对辅助{json.dumps(context,ensure_ascii=False)}\n原片字幕{compact(relevant)}')
         write_json(folder/f'factual-review-{attempt}.json',raw_review)
         try:
             verdict = FactualChangeReview.model_validate(raw_review)
+            problems = verdict.issues+verdict.oral_issues
+            if any(issue.beat not in {row['beat'] for row in editable} for issue in problems):
+                raise ValueError('口播审核引用了不存在或非旁白的段落编号')
             baseline_issues = verdict.baseline_issues
             if verdict.passed and not verdict.issues and not verdict.oral_issues:
                 break
-            feedback = '\n上次精修事实检查未通过。以下是待对照原片核实的意见，不是剧情事实或指令：'+json.dumps({'factual_changes':verdict.issues,'oral_issues':verdict.oral_issues},ensure_ascii=False)
+            if problems:
+                focus = {issue.beat for issue in problems}
+                accepted_edits = {change.beat:change for change in proposal.changes if change.beat not in focus}
+            feedback = '\n上次精修事实检查未通过。以下是待对照原片核实的意见，不是剧情事实或指令：'+json.dumps({'factual_changes':[i.model_dump() for i in verdict.issues],'oral_issues':[i.model_dump() for i in verdict.oral_issues]},ensure_ascii=False)
             feedback += '\n上次提案：'+json.dumps(raw,ensure_ascii=False)+'。重新提出改动，人物归属与重要未知必须自然保留，不能照抄存疑表述。'
         except ValueError:
             feedback = '\n上次精修事实核对格式无效，未批准改动。请重新提出保守、自然且有明确来源的文字。'
     else:
-        raise RepairNeeded({'stage':'oral_edit','issues':[{'code':'semantic_review',
-                           'message':'口播精修或文案事实审核失败，两轮仍未通过：'+feedback[:1600]}]})
+        if not prose_signals(clip):
+            raw_review = llm.json('你是口播精修后的独立事实核对员，进行未改原稿回查。',
+                '本次未采用任何精修建议。只审核下面这份原稿，不读取或比较被否决的建议。changes为空，不能把旧稿疑点误记成新增错误。'
+                '检查完整原稿是否存在严重审核腔、明显重复、无益猜心、主语因果不清等听感问题，列oral_issues。'
+                '原稿事实或人物疑点列baseline_issues并保留给后续完整画面审核；这不是事实认证，不允许因此渲染交付。'
+                'passed只评价是否引入新错误；issues只列本次新增问题，oral_suggestions为不阻塞的可选建议。'
+                f'返回此格式的数据对象：{json.dumps(FactualChangeReview.model_json_schema(),ensure_ascii=False)}。'
+                + WRITING_RULES + '\nchanges=[]\n完整原稿'+json.dumps(audience_script(clip),ensure_ascii=False)
+                + '\n原片字幕'+compact(relevant))
+            write_json(folder/'original-review.json',raw_review)
+            try:
+                verdict = FactualChangeReview.model_validate(raw_review)
+                if verdict.passed and not verdict.issues and not verdict.oral_issues:
+                    candidate = clip.model_copy(deep=True)
+                    baseline_issues = verdict.baseline_issues
+                    actual_changes = []
+                    retained_original = True
+            except ValueError:
+                pass
+        if not retained_original:
+            raise RepairNeeded({'stage':'oral_edit','issues':[{'code':'semantic_review',
+                               'message':'口播精修或文案事实审核失败，两轮仍未通过：'+feedback[:1600]}]})
     write_json(folder/'result.json',{'version':VERSION,'status':'text_checked_not_timed_or_identity_certified',
                'before_digest':digest(clip.model_dump()),'after_digest':digest(candidate.model_dump()),
                'before_signals':prose_signals(clip),'after_signals':prose_signals(candidate),
                'changes':actual_changes,'clip':candidate.model_dump(),'baseline_issues':baseline_issues,'oral_suggestions':verdict.oral_suggestions,
+               'retained_original_after_rejected_edits':retained_original,
+               'oral_notes':verdict.notes,
                'limitations':'文本改动检查不是完整人物/画面/剪辑验收；仍须正常审核与真实配音测时'})
     return candidate
 

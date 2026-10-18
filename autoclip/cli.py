@@ -70,11 +70,11 @@ def voice_gap_prepare(plan: Path = typer.Option(...), library: Path = typer.Opti
 
 @app.command('voice-scan-series')
 def voice_scan_series(source: Path, library: Path = typer.Option(...), output: Path = typer.Option(...),
-                      model_path: Path = typer.Option(...), vad_path: Path = typer.Option(...),
+                      model_path: Path | None = None, vad_path: Path | None = None,
                       threshold: float = .60, margin: float = .10):
     """逐集扫描全片语音、提取声纹并比对；断点续跑，不依赖整季字幕。"""
     from .voice_scan import scan_series
-    sources = sorted(p for p in source.iterdir() if p.suffix.lower() in VIDEO_EXTENSIONS)
+    sources = [source] if source.is_file() else sorted(p for p in source.iterdir() if p.suffix.lower() in VIDEO_EXTENSIONS)
     scan_series(sources, library, output, model_path, vad_path, threshold, margin)
 
 

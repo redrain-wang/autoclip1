@@ -11,7 +11,7 @@ from .director import compact
 from .models import Beat, Clip, Plan, validate_plan
 from .util import digest, read_json, source_identity, write_json
 
-VERSION = 'planning-4'
+VERSION = 'planning-5'
 
 
 class Chapter(BaseModel):
@@ -42,6 +42,26 @@ class Slot(BaseModel):
 
 class Slots(BaseModel):
     beats: list[Slot] = Field(min_length=1)
+
+
+def merge_continuous_originals(raw, lines):
+    """Keep nearby original utterances as one continuous source interval.
+
+    This preserves the real audio between the requested cuts, including any
+    intervening dialogue. Invalid requested citations remain subject to checks.
+    """
+    merged = []
+    for slot in Slots.model_validate(raw).beats:
+        if (merged and slot.mode==merged[-1].mode=='original'
+                and 0<=slot.start-merged[-1].end<=1.5 and slot.end-merged[-1].start<=40):
+            previous = merged[-1]
+            previous.end = slot.end
+            previous.instruction += '；'+slot.instruction
+            previous.evidence_ids = sorted(set(previous.evidence_ids+slot.evidence_ids+
+                [s.id for s in lines if s.start<previous.end and s.end>previous.start]))
+        else:
+            merged.append(slot.model_copy(deep=True))
+    return {'beats':[slot.model_dump() for slot in merged]}
 
 
 def validate_structure(structure, start, end, cfg, lines=None):
@@ -183,6 +203,8 @@ def plan_outline(video, root, lines, seconds, cfg, llm, start=0, end=None, notes
             draft = llm.json('你是影视剪辑师，按当前原片证据安排镜头。', prompt+feedback)
             write_json(folder/f'chapter-{index}-attempt-{attempt}.json', draft)
             try:
+                draft = merge_continuous_originals(draft,lines)
+                write_json(folder/f'chapter-{index}-normalized-{attempt}.json',draft)
                 validate_chapter(draft, chapter, structure, lines, index, budget, cfg)
                 return draft
             except ValueError as ex:

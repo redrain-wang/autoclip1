@@ -8,6 +8,7 @@ from autoclip.editorial import OralProposal, apply_oral_changes, polish_clip, pr
 from autoclip.models import Clip, Beat, Line
 from autoclip.repair import RepairNeeded
 from autoclip.util import read_json
+from autoclip.budget import spoken_characters
 
 
 def fixture_clip():
@@ -43,8 +44,87 @@ def test_oral_length_feedback_identifies_all_failed_beats_and_limits():
         apply_oral_changes(clip,OralProposal.model_validate(raw))
     message=str(caught.value)
     for i in (1,3):
-        assert f'beat {i} 原稿{len(clip.beats[i].text)}字，新稿100字，须' in message
+        assert f'beat {i} 原稿{spoken_characters(clip.beats[i].text)}字，新稿100字，须' in message
     assert clip.model_dump()==before
+
+
+def test_punctuation_does_not_consume_spoken_character_budget():
+    clip=fixture_clip();clip.beats[1].text='有人提问对方回应事情继续'
+    text='有人提问，对方回应；事情继续。'
+    raw={'changes':[{'beat':1,'text':text,'reason':'只加正常停顿'}]}
+    assert len(text)>int(len(clip.beats[1].text)*1.2)
+    revised=apply_oral_changes(clip,OralProposal.model_validate(raw))
+    assert revised.beats[1].text==text
+
+
+def short_oral_fixture():
+    clip=fixture_clip()
+    clip.beats[1].text='有人提出问题，对方随后回应。'
+    long='这段口播明显超出原定画面，需要仅修复这一处而保留其他段落。'
+    return clip, {'changes':[{'beat':1,'text':long,'reason':'修顺口播'},
+                            {'beat':3,'text':clip.beats[3].text,'reason':'原稿可保留'}]}
+
+
+def test_length_repair_selects_actual_fit_preserves_valid_edits_and_sources(tmp_path):
+    from autoclip.editorial import repair_oral_lengths
+    clip,raw=short_oral_fixture();before=clip.model_dump()
+    proposal=OralProposal.model_validate(raw)
+    class Model:
+        def json(self,*args):
+            return {'candidates':[raw['changes'][0],{'beat':1,'text':'有人提问，对方回应。','reason':'精简过渡'}]}
+    fixed=repair_oral_lengths(clip,proposal,[],tmp_path,Settings(),Model(),0)
+    assert fixed.changes[0].text=='有人提问，对方回应。'
+    assert fixed.changes[1]==proposal.changes[1]
+    assert proposal.model_dump()==raw and clip.model_dump()==before
+    record=read_json(next(tmp_path.glob('length-*.json')))
+    assert record['counts'][0]>record['max_chars']
+    assert record['selected']['text']==fixed.changes[0].text
+    assert apply_oral_changes(clip,fixed).beats[1].evidence_ids==clip.beats[1].evidence_ids
+
+
+def test_length_repair_exhaustion_changes_feedback_without_truncating_text(tmp_path):
+    from autoclip.editorial import repair_oral_lengths
+    clip,raw=short_oral_fixture();prompts=[]
+    class Model:
+        def json(self,system,prompt):
+            prompts.append(prompt);return {'candidates':[raw['changes'][0]]}
+    with pytest.raises(ValueError,match='达到2次上限'):
+        repair_oral_lengths(clip,OralProposal.model_validate(raw),[],tmp_path,
+                            Settings(repair_attempts=2),Model(),0)
+    assert len(prompts)==2 and prompts[0]!=prompts[1]
+    assert '候选实际字数' in prompts[1]
+    assert all('selected' not in read_json(p) for p in tmp_path.glob('length-*.json'))
+
+
+@pytest.mark.parametrize('case',['original','duplicate','new_shot'])
+def test_invalid_targets_cannot_request_local_length_repairs(tmp_path,case):
+    from autoclip.editorial import repair_oral_lengths
+    clip,raw=short_oral_fixture()
+    if case=='original':raw['changes'][0]['beat']=0
+    if case=='duplicate':raw['changes'].append(raw['changes'][0])
+    if case=='new_shot':raw['changes'][0]['beat']=99
+    class Model:
+        def json(self,*args):pytest.fail('无效目标不能请求修稿')
+    with pytest.raises(ValueError):
+        repair_oral_lengths(clip,OralProposal.model_validate(raw),[],tmp_path,Settings(),Model(),0)
+
+
+def test_length_repaired_text_still_requires_independent_factual_approval(tmp_path):
+    clip,raw=short_oral_fixture();events=[]
+    class Model:
+        def json(self,system,prompt):
+            if '口播长度局部' in system:
+                events.append('length')
+                return {'candidates':[{'beat':1,'text':'有人提问，对方回应。','reason':'精简过渡'}]}
+            if '独立事实核对员' in system:
+                events.append('facts')
+                assert ('有人提出问题，对方随后回应。' if '未采用任何精修建议' in prompt else '有人提问，对方回应。') in prompt
+                return {'passed':False,'issues':[{'beat':1,'message':'声称对方已回应，原片仍在提问'}]}
+            events.append('proposal');return {'changes':[raw['changes'][0]]}
+    with pytest.raises(RepairNeeded,match='事实审核失败'):
+        polish_clip(clip,[],tmp_path,Settings(),Model())
+    assert events==['proposal','length','facts']*2+['facts']
+    assert not list(tmp_path.rglob('result.json'))
 
 
 @pytest.mark.parametrize('case',['original','duplicate','new_shot','new_field'])
@@ -63,7 +143,7 @@ def test_factual_check_can_reject_smoother_but_unfaithful_text(tmp_path):
     class Model:
         def json(self,system,prompt):
             calls.append(system)
-            return proposal() if len(calls)%2==1 else {'passed':False,'issues':['口播把借款动机写成已证实']}
+            return proposal() if len(calls)%2==1 else {'passed':False,'issues':[{'beat':1,'message':'口播把借款动机写成已证实'}]}
     with pytest.raises(RepairNeeded,match='事实审核失败'):
         polish_clip(clip,[Line(id=1,start=18,end=20,text='依我看来')],tmp_path,Settings(),Model())
     assert len(calls)==4 and prose_signals(clip)
@@ -77,6 +157,7 @@ def test_repeated_clinical_proposal_stops_after_two_attempts(tmp_path):
     with pytest.raises(RepairNeeded,match='精修或文案事实审核失败'):
         polish_clip(fixture_clip(),[],tmp_path,Settings(),Model())
     assert len(calls)==2 and not list(tmp_path.rglob('result.json'))
+    assert not list(tmp_path.rglob('original-review.json'))
 
 
 def test_success_keeps_attribution_and_unknowns_instead_of_stripping_hedges(tmp_path):
@@ -92,6 +173,23 @@ def test_success_keeps_attribution_and_unknowns_instead_of_stripping_hedges(tmp_
     record=read_json(next(tmp_path.rglob('result.json')))
     assert record['before_signals'] and not record['after_signals']
     assert record['status']=='text_checked_not_timed_or_identity_certified'
+
+
+def test_oral_review_does_not_audit_private_edit_instructions_as_spoken_claims(tmp_path):
+    clip=fixture_clip();clip.beats[1].reason='内部尚未核实的因果备注'
+    events=[]
+    class Model:
+        def json(self,system,prompt):
+            assert '内部尚未核实的因果备注' not in prompt
+            events.append(system)
+            if '独立事实核对员' in system:
+                assert '候选改写的内部理由' not in prompt
+                return {'passed':True,'issues':[]}
+            raw=proposal();raw['changes'][0]['reason']='候选改写的内部理由'
+            return raw
+    result=polish_clip(clip,[],tmp_path,Settings(),Model())
+    assert len(events)==2 and result.beats[1].reason==clip.beats[1].reason
+    assert read_json(next(tmp_path.rglob('result.json')))['changes'][0]['reason']=='候选改写的内部理由'
 
 
 def test_production_editor_is_enabled_but_rendering_frozen_script_is_not_rewritten(tmp_path):
@@ -225,7 +323,7 @@ def test_factually_unchanged_near_synonym_of_audit_language_cannot_pass(tmp_path
         def json(self,*args):
             calls.append(args)
             return proposal() if len(calls)%2==1 else {'passed':True,'issues':[],
-                'oral_issues':['改写只是把审稿用词换成近义词，仍不适合口播']}
+                'oral_issues':[{'beat':1,'message':'改写只是把审稿用词换成近义词，仍不适合口播'}]}
     with pytest.raises(RepairNeeded,match='两轮仍未通过'):
         polish_clip(fixture_clip(),[],tmp_path,Settings(),Model())
     assert len(calls)==4 and not list(tmp_path.rglob('result.json'))
@@ -238,10 +336,63 @@ def test_no_change_proposal_still_requires_whole_script_listening_review(tmp_pat
         def json(self,*args):
             calls.append(args)
             return {'changes':[]} if len(calls)%2==1 else {'passed':True,'issues':[],
-                'oral_issues':['beat 3未改段仍重复免责声明']}
+                'oral_issues':[{'beat':3,'message':'未改段仍重复免责声明'}]}
     with pytest.raises(RepairNeeded,match='两轮仍未通过'):
         polish_clip(clip,[],tmp_path,Settings(),Model())
-    assert len(calls)==4 and not list(tmp_path.rglob('result.json'))
+    assert len(calls)==5 and not list(tmp_path.rglob('result.json'))
+
+
+def test_rejected_edits_can_keep_independently_reviewed_original_without_fact_certification(tmp_path):
+    clip=fixture_clip();clip.beats[1].text=proposal()['changes'][0]['text'];before=clip.model_dump()
+    class Model:
+        def json(self,system,prompt):
+            if '未采用任何精修建议' in prompt:
+                return {'passed':True,'issues':[],'baseline_issues':['人物归属仍需完整画面审核']}
+            if '独立事实核对员' in system:
+                return {'passed':False,'issues':[{'beat':1,'message':'改稿新增了无据的动作'}]}
+            raw=proposal();raw['changes'][0]['text']=raw['changes'][0]['text'].replace('借一两','借一两银子')
+            return raw
+    final=polish_clip(clip,[],tmp_path,Settings(),Model())
+    assert final.model_dump()==before
+    record=read_json(next(tmp_path.rglob('result.json')))
+    assert record['retained_original_after_rejected_edits'] and record['changes']==[]
+    assert record['baseline_issues']==['人物归属仍需完整画面审核']
+    assert record['status']=='text_checked_not_timed_or_identity_certified'
+
+
+@pytest.mark.parametrize('verdict',[{'passed':True,'issues':[{'beat':1,'message':'仍有新增错误'}]},
+    {'passed':True,'issues':[],'oral_issues':[{'beat':3,'message':'原稿听感严重绕句'}]},
+    {'passed':False,'issues':[]}, {'passed':'true','issues':[]}, {}])
+def test_original_retention_requires_unambiguous_independent_review(tmp_path,verdict):
+    clip=fixture_clip();clip.beats[1].text=proposal()['changes'][0]['text']
+    class Model:
+        def json(self,system,prompt):
+            if '未采用任何精修建议' in prompt:return verdict
+            if '独立事实核对员' in system:return {'passed':False,'issues':[{'beat':1,'message':'拒绝改稿'}]}
+            return proposal()
+    with pytest.raises(RepairNeeded):polish_clip(clip,[],tmp_path,Settings(),Model())
+    assert not list(tmp_path.rglob('result.json'))
+
+
+def test_fact_repair_focus_keeps_other_approved_edits(tmp_path):
+    clip=fixture_clip();clip.beats[1].text=proposal()['changes'][0]['text']
+    third='田大人收下银子，让陈大人先回去读书，现场问话就此结束。'
+    proposals=[];reviews=[]
+    class Model:
+        def json(self,system,prompt):
+            if '独立事实核对员' in system:
+                reviews.append(prompt)
+                return {'passed':False,'issues':[{'beat':1,'message':'这一段新增了无据的解释'}]} if len(reviews)==1 else {'passed':True,'issues':[]}
+            proposals.append(prompt)
+            first=proposal()['changes'][0]
+            if len(proposals)==1:
+                return {'changes':[first,{'beat':3,'text':third,'reason':'自然交代结果'}]}
+            assert '本轮允许编号[1]' in prompt
+            return {'changes':[first]}
+    final=polish_clip(clip,[],tmp_path,Settings(),Model())
+    assert len(proposals)==len(reviews)==2
+    assert final.beats[3].text==third and final.beats[0]==clip.beats[0]
+    assert third in reviews[-1]
 
 
 def test_only_empty_metadata_placeholder_is_tolerated_source_fields_stay_forbidden():

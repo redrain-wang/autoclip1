@@ -12,6 +12,20 @@ def test_speech_windows_preserve_offsets_and_do_not_extend_short_replies():
     assert speech_windows([[0,5000]],0,4.6) == [(0.,3.),(3.,4.6)]
 
 
+def test_scan_cli_accepts_one_episode_and_resolves_default_models(tmp_path,monkeypatch):
+    from typer.testing import CliRunner
+    from autoclip.cli import app
+    import autoclip.voice_scan as module
+    video=tmp_path/'01.mp4';video.write_bytes(b'video')
+    library=tmp_path/'library.json';library.write_text('{}')
+    calls=[]
+    monkeypatch.setattr(module,'scan_series',lambda *args:calls.append(args))
+    result=CliRunner().invoke(app,['voice-scan-series',str(video),'--library',str(library),
+                                   '--output',str(tmp_path/'scan')])
+    assert result.exit_code==0,result.output
+    assert calls[0][0]==[video] and calls[0][3:5]==(None,None)
+
+
 def test_discovery_excludes_known_opening_short_and_distorted_segments():
     pytest.importorskip('sklearn')
     base={'status':'unknown','duration':3.,'opening_or_credits':False,'rms':.05,'clipped_fraction':0.,

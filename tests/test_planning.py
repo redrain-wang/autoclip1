@@ -44,6 +44,29 @@ def test_structure_cannot_overlap_chapters_or_leave_source(tmp_path):
     with pytest.raises(ValueError,match='章节'):validate_structure(structure,0,140,args[-1])
 
 
+def test_short_original_utterances_merge_without_losing_intervening_dialogue():
+    import copy
+    from autoclip.planning import merge_continuous_originals
+    raw={'beats':[{'mode':'original','start':10,'end':10.86,'instruction':'问话','evidence_ids':[1]},
+                  {'mode':'original','start':12,'end':13.74,'instruction':'回答','evidence_ids':[2]}]}
+    before=copy.deepcopy(raw)
+    lines=[Line(id=1,start=10,end=10.86,text='问'),Line(id=3,start=11,end=11.5,text='中间真实对白'),
+           Line(id=2,start=12,end=13.74,text='答')]
+    merged=merge_continuous_originals(raw,lines)['beats']
+    assert len(merged)==1 and merged[0]['start']==10 and merged[0]['end']==13.74
+    assert set(merged[0]['evidence_ids'])=={1,2,3} and raw==before
+    raw['beats'][1]['evidence_ids'].append(999)
+    assert 999 in merge_continuous_originals(raw,lines)['beats'][0]['evidence_ids']
+
+
+@pytest.mark.parametrize('second_start,second_end',[(12,15),(10,45)])
+def test_original_merge_does_not_span_large_gaps_or_exceed_shot_limit(second_start,second_end):
+    from autoclip.planning import merge_continuous_originals
+    raw={'beats':[{'mode':'original','start':0,'end':10,'instruction':'原声','evidence_ids':[1]},
+                  {'mode':'original','start':second_start,'end':second_end,'instruction':'原声','evidence_ids':[2]}]}
+    assert len(merge_continuous_originals(raw,[])['beats'])==2
+
+
 def test_reports_all_slot_errors_for_one_bounded_repair(tmp_path):
     args=fixture(tmp_path)
     args[2][0]['beats'][0]['end']=45
