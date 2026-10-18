@@ -421,11 +421,12 @@ def research(source: Annotated[Path, typer.Argument(help="先整理剧情资料�
 
 @app.command()
 def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目录；省略则读取本地.env")] = None,
-            config: Path = Path("configs.production.toml"), max_new: int = 3,
+            config: Path = Path("configs.production.toml"),
+            max_new: int = typer.Option(3,help="每集本轮最多推荐的新故事数，1–6；不是集数，也不保证出片数量"),
             stage: str = "all", output: Path | None = None,
             subtitle_layer: Path | None = typer.Option(None, help="单个素材使用的字幕纠错层；默认关闭"),
             retry_rejected_from: Path | None = typer.Option(None, help="原批次的单集目录；仅在新批次重试未通过选题")):
-    """独立生成更长的新片，自动选题、审查、配音、包装和导出，保留旧成片。"""
+    """短片自动制作：单集可选多个完整故事，目录可批量处理，自动导出并保留旧成片。"""
     import os
     from dotenv import load_dotenv
     from .branding import BrandSettings, font_path
