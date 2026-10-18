@@ -214,9 +214,9 @@ def create_plan(video: Path, root: Path, lines: list[Line], seconds: float, maps
         for clip in plan.clips:
             enforce_identity(video, root, clip, cfg, llm, lines)
         return plan
-    system = """你是专业中文影视短视频编导。任务是写有观点、好听、剧情连贯的解说并给出可执行时间线。
+    system = """你是专业中文影视短视频编导。任务是先讲清剧情，再作必要分析，写出好听、连贯的解说并给出可执行时间线。
 只根据给出的原片字幕和画面事实，不许凭作品记忆造剧情。将解释写成对行为的分析，不把猜测动机当成明示事实。
-不照搬原对白；不要‘这部剧告诉我们’式空话。开头用具体冲突抓人，按任务选择原声或口播；中段保留关键原声；结尾兑现观点。
+不照搬原对白；不要‘这部剧告诉我们’式空话。开头交代具体处境，按任务选择原声或口播；中段保留关键原声和必要承接；结尾讲清已发生的结果。
 严禁添加无依据台词、未来剧情、人名、金额、官职或因果。用简体中文。人物名确实不确定时用身份指代。
 低置信度ASR不是可靠证据；分段分析也可能误判人物，要用完整字幕上下文交叉核实。没有必要不要写具体年份或精确金额。
 类型适配：权谋讲利益与困境，家庭讲处境与共情，喜剧讲铺垫与反差，悬疑讲信息差但不乱剧透。
@@ -233,16 +233,16 @@ def create_plan(video: Path, root: Path, lines: list[Line], seconds: float, maps
         if cfg.opening == "original" else "首段narration直接抛出具体矛盾并交代必要人物和处境。")
     prompt = f"""为《{cfg.series}》本集制作 {quantity} 条不同选题的短视频，每条约 {cfg.target_seconds} 秒。
 风格要求：{cfg.style}。原片总长：{seconds:.2f} 秒。
-成片实际时长要求：{cfg.min_seconds or cfg.target_seconds*.6:.0f}–{cfg.max_seconds or cfg.target_seconds*1.8:.0f}秒；用更多完整情节和观点支撑时长，不靠重复或空话。
+成片实际时长要求：{cfg.min_seconds or cfg.target_seconds*.6:.0f}–{cfg.max_seconds or cfg.target_seconds*1.8:.0f}秒；选择足够的完整情节与必要承接，不靠重复、空话或强加观点凑时长。
 必须按此 JSON schema 输出：{schema}
 每个 beat 是一个原片连续区间，时间用原片绝对秒数。必须递增且不重叠，避免频繁跨场景跳跃。
 每条用{beat_count}个beat；narration时填解说text，original时text必须为空。
 每条至少有两处、合计{original_seconds}秒 original 保留完整关键对白，剪在句子边界，不要一个字只剩半句。
 原声目标约占{cfg.original_ratio_target:.0%}，这是创作参考而非硬配额。达到实际时长下限且已讲完独立故事就可以结束，不要为追目标时长扩空话。优先增加必要对白与反应，不把关键原声改成旁白复述。
 解说 text 以每秒4–4.5个汉字写，单段25–75个字，给它留足6–22秒原片画面；不要连续长时间口播。
-{opening_instruction}最后一段解释片中已经发生的结果，不许卖下一集关子。结尾总结必须预留10–18秒真实画面；不要把长总结塞在最后1–3秒，可以提前结束故事，原声与解说均须留足时间。
-evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间相交。reason说明该画面如何支撑解说观点。
-原声应使观众听清完整的关键句；原声前的解说引导观众注意，原声后点破含义，不要重复复述。
+{opening_instruction}最后讲清片中已经发生的结果，不许卖下一集关子。结尾旁白须有与真实配音匹配的画面，不把长总结塞在最后1–3秒；完整对白足以交代结果时可以直接收束，不强加总结。
+evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间相交。reason说明该画面如何支撑当前剧情或必要分析。
+原声应使观众听清完整的关键句；前后解说只作必要承接，关键转折才解释含义，不重复复述，不要求每段都有观点。
 不同成片不要重复剧情超过40%。避开片头、片尾、ASR疑似幻觉和低信息过场。空镜不能假定说话人。
 可参考前集摘要保持人物关系一致，但不得把前集事实混作本集证据：{json.dumps(previous,ensure_ascii=False)}
 本集分段分析：{json.dumps(maps,ensure_ascii=False)}

@@ -12,7 +12,7 @@ class Settings(BaseModel):
     style: str = "auto"
     clips: int = Field(default=2, ge=0, le=10)
     duration_profile: Literal["short", "long"] = "short"
-    narrative_mode: Literal["analysis", "story_first"] = "analysis"
+    narrative_mode: Literal["analysis", "story_first"] = "story_first"
     target_seconds: int = Field(default=100, ge=45, le=1200)
     min_seconds: float | None = Field(default=None, ge=30)
     max_seconds: float | None = Field(default=None, le=3600)

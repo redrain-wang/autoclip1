@@ -11,7 +11,7 @@ from .director import compact
 from .models import Beat, Clip, Plan, validate_plan
 from .util import digest, read_json, source_identity, write_json
 
-VERSION = 'planning-6'
+VERSION = 'planning-7'
 
 
 class Chapter(BaseModel):
@@ -160,8 +160,10 @@ def plan_outline(video, root, lines, seconds, cfg, llm, start=0, end=None, notes
             'supplied_structure':supplied,
             'brief':brief_context(brief),'prior':previous['signature'],'notes':notes,'cfg':cfg.model_dump(mode='json')}
     folder=root/'automatic-outlines'/digest(inputs);folder.mkdir(parents=True,exist_ok=True)
-    prompt=(f'为《{cfg.series}》制作约{cfg.target_seconds}秒的一条长解说提纲；先定章节，不写口播。'
-            '找一个总问题，把相关冲突连成因果链；无关支线和片头片尾歌曲不选。章节按原片顺序、范围不重叠。' +
+    prompt=(f'为《{cfg.series}》制作约{cfg.target_seconds}秒的一条长解说提纲；先定章节，不写口播。' +
+            ('剧情优先：围绕本集主要事件，先找全起因、行动、结果与必要场景承接，不为统一观点硬连无关支线。' if cfg.narrative_mode == 'story_first' else
+             '找一个总问题，把相关冲突连成因果链；无关支线不选。') +
+            '片头片尾歌曲不选，章节按原片顺序、范围不重叠。' +
             ('开场从正文之前选10–22秒完整原声，按事件发生顺序推进，不前置后文；章节起点在开场结束之后。' if cfg.opening == 'original' else
              '开场从最值得直接观看的对白选18–22秒连续高光，可前置；正文避开该区间。') +
             '开场后用必要旁白衔接正文。先完整走完本集，不因找到早段候选就停止。' +

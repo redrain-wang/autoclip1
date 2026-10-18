@@ -13,7 +13,7 @@ from .models import Plan, Beat, validate_plan, evidence_matches
 from .util import digest, read_json, source_identity, write_json
 from .voices import match_batch
 
-VERSION = 'automatic-review-8'
+VERSION = 'automatic-review-9'
 
 
 def link_voice_evidence(video, lines, library, manifest):
@@ -189,7 +189,9 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                   '原声本身没有新增身份主张时identity_basis=no_identity_claim、subjects=[]。'
                   'ASR可能有同音或繁简错字，应区别转写疑点与实质事实错误；他/她同音，不能据ASR字形断言原声所指性别错误。'
                   '旁白和标题中的人物归属仍必须有依据；用清楚的关系或行动描述人物可以，不能用含糊泛称掩盖错误行为归属。'
-                  'title/angle/hook根据全片选用证据核查。保留必要剧情与自然转场，不要求每段都有观点。'
+                  'title/angle/hook根据全片选用证据核查。剧情优先是长期规则：先讲清人物、处境、事件起因、行动、结果与场景承接，必要时才分析。'
+                  '对照viewer_timeline检查是否遗漏理解当前情节所必需的信息、因果或转场，是否以观点替代必要剧情；实际缺失绑定受影响单位列issues。'
+                  '简短承接或纯粹交代行动是合法口播，不因某段没有观点要求扩写。不能为了时长重复或删掉关键承接。'
                   '只审核本批units；不要求其他批次的标题或镜头出现在这里。每个问题都写具体id，不把单段问题复制给所有单位。'
                   '时间区间包含start、不包含end；end恰好等于下一条字幕start并未剪入该字幕，不得据此误判截断或预支。'
                   '图片编号按times顺序从0开始。证据必须来自给定字幕；每个单位至少引用一条字幕及一幅画面。'

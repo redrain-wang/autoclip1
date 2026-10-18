@@ -339,6 +339,8 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
     if not test_sample:
         # One production contract for every episode, including legacy config files.
         cfg = cfg.model_copy(update=PRODUCTION_DURATION)
+    # Story continuity is a project rule, independent of length or test purpose.
+    cfg.narrative_mode = 'story_first'
     cfg.clips = 1
     library = Path(library or saved.get('library') or output/'voice-enrollment/registry.json').resolve()
     voice_manifest = Path(voice_manifest or saved['voice_manifest']).resolve() if voice_manifest or saved.get('voice_manifest') else None
@@ -347,12 +349,13 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
     paths = discover(source,output)
     cfg.episode_order = {str(path):index+1 for index,path in enumerate(paths)}
     project = {'version':VERSION,'source':str(source),'series':cfg.series,'config':str(config),
-               'purpose':purpose,'duration_policy':delivery_policy(cfg,test_sample),
+               'purpose':purpose,'duration_policy':delivery_policy(cfg,test_sample),'editorial_policy':'story_first',
                'effective_settings':cfg.model_dump(mode='json'),
                'library':str(library),'voice_manifest':str(voice_manifest) if voice_manifest else None,
                'model_path':str(model_path) if model_path else None,'voice_python':str(voice_python) if voice_python else None,
                'episodes':[str(p) for p in paths]}
-    if saved and saved.get('duration_policy') != project['duration_policy']:
+    if saved and (saved.get('duration_policy') != project['duration_policy']
+                  or saved.get('editorial_policy') != project['editorial_policy']):
         for status in cfg.output.glob('*/status.json'):
             row = read_json(status)
             if row.get('stage') in {'已完成','部分完成'}:

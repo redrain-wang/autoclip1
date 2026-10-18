@@ -225,14 +225,14 @@ def test_every_production_episode_and_resume_use_same_duration_despite_legacy_co
     write_json(library,{'series':'剧','model':{},'characters':[{'name':'甲','samples':[
         {'status':'human_confirmed','source':source_identity(videos[0])}]}]})
     write_json(manifest,{'model':{},'sources':[{'source':source_identity(v)} for v in videos]})
-    legacy=Settings(duration_profile='long',narrative_mode='story_first',target_seconds=300,min_seconds=60,
+    legacy=Settings(duration_profile='long',narrative_mode='analysis',target_seconds=300,min_seconds=60,
                     max_seconds=2700,opening='original',conflict_brief=True)
     monkeypatch.setattr(module.Settings,'load',lambda _:legacy.model_copy(deep=True))
     monkeypatch.setattr(module,'duration',lambda _:2800.)
     monkeypatch.setattr(module,'ingest_episode',lambda v,b,c:(b,[],2800.))
     observed=[]
     def episode(video,base,input_root,lines,seconds,cfg,bank,manifest,brand,index,test_sample):
-        observed.append((delivery_policy(cfg),cfg.continuity_history,cfg.conflict_brief,test_sample))
+        observed.append((delivery_policy(cfg),cfg.continuity_history,cfg.conflict_brief,test_sample,cfg.narrative_mode))
         return {'source':str(video),'status':'completed','calls_this_run':0}
     from autoclip.series import delivery_policy
     monkeypatch.setattr(module,'run_episode',episode)
@@ -243,10 +243,11 @@ def test_every_production_episode_and_resume_use_same_duration_despite_legacy_co
         result=module.run_series(source,output,library=library,voice_manifest=manifest)
         assert result['status']=='completed' and result['duration_policy']=={
             'purpose':'production','target_seconds':1200,'min_seconds':1080,'max_seconds':1320}
-    assert len(observed)==4 and all(r==(result['duration_policy'],output/'episodes',True,False) for r in observed)
+    assert len(observed)==4 and all(r==(result['duration_policy'],output/'episodes',True,False,'story_first') for r in observed)
     saved=read_json(output/'project.json')
     assert saved['effective_settings']['target_seconds']==1200
     assert saved['effective_settings']['clips']==1
+    assert saved['effective_settings']['narrative_mode']==saved['editorial_policy']=='story_first'
 
 
 def test_short_production_source_fails_before_asr_voice_enrollment_or_model(tmp_path,monkeypatch):

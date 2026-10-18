@@ -54,7 +54,8 @@ def test_more_shots_do_not_relax_real_measured_duration_or_chronology():
         validate_plan(plan,lines,1200,1,1050,900,1200,'original')
 
 
-def test_story_first_outline_keeps_a_short_scene_bridge_without_padding(tmp_path, monkeypatch):
+@pytest.mark.parametrize('outline_mode',[None,'analysis','story_first'])
+def test_story_first_outline_keeps_a_short_scene_bridge_without_padding(tmp_path, monkeypatch,outline_mode):
     import autoclip.outline as module
     video = tmp_path/'09.mp4'
     video.write_bytes(b'fixture')
@@ -69,7 +70,9 @@ def test_story_first_outline_keeps_a_short_scene_bridge_without_padding(tmp_path
              for i, (mode, a, b) in enumerate([('original', 0, 21), ('narration', 21, 30),
                                                ('original', 30, 45), ('narration', 45, 55)])]
     outline = dict(source=marker, title='接着讲故事', angle='顺叙', hook='事情怎样发生',
-                   narrative_mode='story_first', chapters=[dict(title='事情经过', beats=slots)])
+                   chapters=[dict(title='事情经过', beats=slots)])
+    if outline_mode is not None:
+        outline['narrative_mode']=outline_mode
     path = tmp_path/'outline.json'
     write_json(path, outline)
     monkeypatch.setattr(module, 'duration', lambda *args: 60)

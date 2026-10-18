@@ -64,7 +64,8 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
     outline, lines = check_outline(video, transcript, outline_path, cfg)
     previous = load_continuity(video, cfg, root)
     chapters = outline['chapters']
-    story_first = outline.get('narrative_mode') == 'story_first'
+    # Legacy outline metadata cannot turn off the current story-first rule.
+    story_first = cfg.narrative_mode == 'story_first' or outline.get('narrative_mode') == 'story_first'
     all_slots = [b for c in chapters for b in c['beats']]
     brief = None
     if cfg.conflict_brief:
