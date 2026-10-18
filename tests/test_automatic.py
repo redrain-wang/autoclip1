@@ -203,7 +203,11 @@ def test_review_protocol_retry_keeps_script_and_supplies_previous_shown_context(
     from autoclip.util import write_json
     video=tmp_path/'source.mp4';video.write_bytes(b'source')
     frame=tmp_path/'frame.jpg';frame.write_bytes(b'frame')
-    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    sheet_roots=[]
+    def sheet(video,root,*args):
+        sheet_roots.append(root)
+        return frame
+    monkeypatch.setattr(module,'contact_sheet',sheet)
     plan=sample_plan()
     plan.clips[0].beats[0].mode='original';plan.clips[0].beats[0].text=''
     plan.clips[0].beats[0].reason='内部猜测辛某起身，不属于观众听到的内容'
@@ -220,8 +224,11 @@ def test_review_protocol_retry_keeps_script_and_supplies_previous_shown_context(
                 'reason':'给定字幕与画面相符','evidence_ids':[0],'frame_ids':[0],
                 'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
     report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(),Model())
-    assert report['passed'] and len(prompts)==3
-    assert '上次审核响应' in prompts[1] and plan.model_dump()==before
+    assert report['passed'] and len(prompts)==4
+    assert len(sheet_roots)==len(set(sheet_roots))==3
+    assert all(len(group)<=3 for group in groups)
+    assert [Path(p).name for p in report['batches']]==['batch-0.json','batch-3.json','batch-6.json']
+    assert any('上次审核响应' in p for p in prompts[1:]) and plan.model_dump()==before
     assert all('内部猜测辛某' not in prompt for prompt in prompts)
     last=next(u for group in groups for u in group if u['id']=='beat-3')
     assert last['shown_evidence']==[0,1,2]

@@ -1,5 +1,6 @@
 """Source-bound automated review and local repair, separate from human approval."""
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
@@ -11,7 +12,7 @@ from .models import Plan, Beat, validate_plan, evidence_matches
 from .util import digest, read_json, source_identity, write_json
 from .voices import match_batch
 
-VERSION = 'automatic-review-4'
+VERSION = 'automatic-review-5'
 
 
 def link_voice_evidence(video, lines, library, manifest):
@@ -126,18 +127,23 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
     key = digest({'v':VERSION,'plan':plan.model_dump(),'voices':voices,'model':cfg.llm_model,'endpoint':cfg.llm_base_url})
     folder = root/'automatic-review'/key
     all_issues, batches, frames = [], [], []
-    for offset in range(0,len(units),6):
-        group = units[offset:offset+6]
+    def review_group(offset):
+        group = units[offset:offset+3]
         ids = {i for u in group for i in u.get('evidence_ids',[]) + u.get('shown_evidence',[])}
         # Metadata is checked against the actual selected footage, not an invented summary.
         if any('start' not in u for u in group):
             ids.update(i for b in clip.beats for i in b.evidence_ids)
         selected = [s for s in lines if s.id in ids or any('start' in u and u['start']-8<=s.start<u['end']+8 for u in group)]
         intervals = [(u['start'],u['end']) for u in group if 'start' in u]
-        if not intervals:
-            intervals = [(b.start,b.end) for b in clip.beats[:6]]
-        times = sorted({round(t,3) for a,b in intervals for t in (a+.1,(a+b)/2,b-.1)})
-        sheet = contact_sheet(video,folder,times,f'batch-{offset}')
+        if intervals:
+            times = sorted({round(t,3) for a,b in intervals for t in (a+.1,(a+b)/2,b-.1)})
+        else:
+            # Metadata spans the selected story. Keep the sheet bounded while
+            # sampling its beginning, middle and end rather than only the intro.
+            count = min(8,len(clip.beats))
+            selected_beats = [clip.beats[round(i*(len(clip.beats)-1)/max(1,count-1))] for i in range(count)]
+            times = sorted({round((b.start+b.end)/2,3) for b in selected_beats})
+        sheet = contact_sheet(video,folder/f'batch-{offset}-images',times,f'batch-{offset}')
         evidence = [r for r in voices['lines'] if r['line_id'] in {s.id for s in selected}]
         prompt = ('逐项核对文本事实、人物行为归属、画面相关性、连续原声切点、场景承接和重复解释。'
                   '不能因同一模型写稿就默认正确。声纹是候选；画面人物可能是听者。'
@@ -171,9 +177,18 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 feedback = '\n上次审核响应未通过格式/引用检查：'+str(exc)[:1800]+'\n原响应：'+json.dumps(raw,ensure_ascii=False)+'\n请重审同一批units，未知仍须标unknown，不得为了修复格式把存疑内容放行。'
         record = {'units':group,'times':times,'raw':raw,'issues':issues}
         write_json(folder/f'batch-{offset}.json',record)
-        batches.append(str((folder/f'batch-{offset}.json').resolve()))
-        frames.append({'path':str(sheet.resolve()),'sha256':file_hash(sheet)})
-        all_issues.extend(issues)
+        return issues,str((folder/f'batch-{offset}.json').resolve()),{'path':str(sheet.resolve()),'sha256':file_hash(sheet)}
+    # Batches are independent; keep results in source order and share LLM's
+    # locked request allowance. No partial batch constitutes an approval.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        try:
+            for issues,batch,frame in pool.map(review_group,range(0,len(units),3)):
+                all_issues.extend(issues)
+                batches.append(batch)
+                frames.append(frame)
+        except BaseException:
+            pool.shutdown(wait=True,cancel_futures=True)
+            raise
     report = {'mode':'automatic_source_review','version':VERSION,'source':source_identity(video),
               'plan_digest':digest(plan.model_dump()),'transcript_digest':digest([s.model_dump() for s in lines]),
               'voice_digest':digest(voices),'passed':not all_issues,'issues':all_issues,'batches':batches,'frames':frames,

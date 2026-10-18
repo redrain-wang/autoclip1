@@ -210,7 +210,7 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
         if not (root/name).exists():
             write_json(root/name,value)
     voices = link_voice_evidence(video,lines,bank,manifest)
-    if not (root/'voice-evidence.json').exists():
+    if not (root/'voice-evidence.json').exists() or read_json(root/'voice-evidence.json') != voices:
         write_json(root/'voice-evidence.json',voices)
     llm = LLM(cfg,root)
     def state(stage):

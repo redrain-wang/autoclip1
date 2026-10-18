@@ -72,6 +72,20 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
     assert not list(output.rglob('development-review.json'))
     approval=read_json(Path(result['episodes'][0]['run'])/'automatic-review.json')
     assert approval['mode']=='automatic_source_review' and approval['passed']
+    # A review algorithm update must refresh the persisted evidence as well as
+    # the approval, even when source, library and run directory do not change.
+    from autoclip import automatic
+    from autoclip.util import digest
+    monkeypatch.setattr(automatic,'VERSION','review-next-test')
+    monkeypatch.setattr(series,'REVIEW_VERSION','review-next-test')
+    updated=series.run_series(source,output)
+    assert updated['status']=='completed',updated
+    run_root=Path(updated['episodes'][0]['run'])
+    assert run_root==Path(result['episodes'][0]['run'])
+    persisted=read_json(run_root/'voice-evidence.json')
+    approval=read_json(run_root/'automatic-review.json')
+    assert persisted['version']==approval['version']=='review-next-test'
+    assert approval['voice_digest']==digest(persisted)
     bank['revision']=2;bank['characters'][0]['name']='乙';write_json(library,bank)
     # Prepare-only still records the impact and retires old approvals from current display.
     series.run_series(source,output,stage='prepare')
