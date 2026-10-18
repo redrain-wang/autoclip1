@@ -29,7 +29,7 @@ def test_conflict_brief_is_a_source_bound_editorial_suggestion_without_forced_tw
     assert '不要求每种都有' in calls[0]
     # Re-check cached suggestions as well: distant quotations cannot become
     # one continuous opening simply by using their outer timestamps.
-    cache=next((tmp_path/'conflict-briefs').glob('*.raw.json'))
+    cache=next(p for p in (tmp_path/'conflict-briefs').glob('*.raw.json') if '.attempt-' not in p.name)
     raw=read_json(cache);raw['opening_evidence_ids']=[1,999]
     from autoclip.util import write_json
     write_json(cache,raw)
@@ -58,3 +58,32 @@ def test_production_and_long_configs_enable_briefs_without_changing_old_render_f
     for name in ('configs.production.toml','configs.long.toml','configs.long-yunjian.toml'):
         cfg=Settings.load(base/name)
         assert cfg.conflict_brief and 'conflict_brief' not in cfg.model_dump()
+
+
+def test_malformed_steps_receive_bounded_structural_repair_and_cache(tmp_path):
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    lines=[Line(id=1,start=1,end=3,text='先问一个问题')]
+    prompts=[]
+    class Model:
+        def json(self,system,prompt):
+            prompts.append(prompt)
+            return {'question':'为何提问','why_it_matters':'事情起因','ending':'等待回答',
+                    'steps':[{': ':'字段错误'}] if len(prompts)==1 else [
+                        {'role':'起因','description':'有人提问','evidence_ids':[1],'commentary_job':'交代问题'}]}
+    first=prepare_conflict_brief(video,tmp_path,lines,0,5,Settings(),Model())
+    assert len(prompts)==2 and 'steps每项须包含' in prompts[1]
+    assert first['steps'][0]['evidence_ids']==[1]
+    assert prepare_conflict_brief(video,tmp_path,lines,0,5,Settings(),Model())==first
+    assert len(prompts)==2
+
+
+def test_malformed_brief_stops_at_configured_repair_limit(tmp_path):
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    calls=[]
+    class Model:
+        def json(self,*args):calls.append(args);return {'steps':[]}
+    with pytest.raises(ValueError):
+        prepare_conflict_brief(video,tmp_path,[Line(id=1,start=1,end=3,text='对白')],0,5,
+                               Settings(repair_attempts=1),Model())
+    assert len(calls)==2
+    assert not (tmp_path/'conflict-brief.json').exists()

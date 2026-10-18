@@ -76,6 +76,7 @@ def oral_proposal(raw):
 def apply_oral_changes(clip, proposal):
     revised = clip.model_copy(deep=True)
     seen = set()
+    length_errors = []
     for item in proposal.changes:
         if item.beat in seen or item.beat >= len(clip.beats):
             raise ValueError("口播精修不能重复段号或增加镜头")
@@ -83,9 +84,12 @@ def apply_oral_changes(clip, proposal):
         before = clip.beats[item.beat]
         if before.mode != "narration":
             raise ValueError("口播精修不能改动原声")
-        if not max(5, int(len(before.text)*.65)) <= len(item.text) <= max(12, int(len(before.text)*1.2)):
-            raise ValueError("口播精修不能大幅缩写或扩写；时长重构需要单独提纲")
+        low, high = max(5, int(len(before.text)*.65)), max(12, int(len(before.text)*1.2))
+        if not low <= len(item.text) <= high:
+            length_errors.append(f'beat {item.beat} 原稿{len(before.text)}字，新稿{len(item.text)}字，须{low}–{high}字')
         revised.beats[item.beat].text = item.text
+    if length_errors:
+        raise ValueError('口播精修不能大幅缩写或扩写；时长重构需要单独提纲：'+'；'.join(length_errors))
     return revised
 
 

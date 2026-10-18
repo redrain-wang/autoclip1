@@ -166,6 +166,10 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
                             if low <= len(b.text) <= high and set(b.evidence_ids).issubset(slot['allowed_evidence_ids']):
                                 draft.items[index] = b
                                 break
+                            local_feedback = ('\n上轮局部修稿仍未通过：'+b.model_dump_json()
+                                +f'\n实际字数{len(b.text)}，必须{low}–{high}字；未允许证据'
+                                +str(sorted(set(b.evidence_ids)-set(slot['allowed_evidence_ids'])))
+                                +'。只依据允许字幕重新写这一个口播，不得仅换证据编号保留不受支持的主张。')
                         else: raise ValueError(f'段{b.id}局部修订后仍未通过：字数{len(b.text)}，范围{low}–{high}；未允许ID{sorted(set(b.evidence_ids)-set(slot["allowed_evidence_ids"]))}')
                     write_json(path,draft.model_dump())
                     return draft

@@ -38,10 +38,7 @@ def prepare_conflict_brief(video, root, lines, start, end, cfg, llm, question=''
               'lines':[s.model_dump() for s in selected],'question':question,'notes':notes,
               'model':cfg.llm_model,'endpoint':cfg.llm_base_url}
     path = root/'conflict-briefs'/f'{digest(inputs)}.json'
-    if path.exists():
-        raw = read_json(path.with_suffix('.raw.json'))
-    else:
-        raw = llm.json('你是影视解说选题编辑。先依据本集原片把一个完整冲突说清楚，不编造剧情。',
+    prompt = (
             f'《{cfg.series}》当前选段{start}–{end}秒，编辑主问题参考：{question}。'
             '整理一份简短的写稿提纲，不是口播全文：核心问题是什么，观众为什么在意；'
             '有哪些有因果关联的起因、阻力、选择、转折或结果；结尾已经走到哪里。'
@@ -57,8 +54,24 @@ def prepare_conflict_brief(video, root, lines, start, end, cfg, llm, question=''
             '提纲是选题建议，仍需现有内容核对。证据只能用当前字幕ID，不借其他集或未来剧情。'
             f'\n当前原片核对备注（只辅助明确的称谓归属，不扩展成新情节）：{notes}'
             f'\n格式{json.dumps(ConflictBrief.model_json_schema(),ensure_ascii=False)}\n本段字幕{compact(selected)}')
-        write_json(path.with_suffix('.raw.json'),raw)
-    data = ConflictBrief.model_validate(raw)
+    feedback = ''
+    for attempt in range(cfg.repair_attempts+1):
+        if attempt == 0 and path.exists():
+            raw = read_json(path.with_suffix('.raw.json'))
+        else:
+            raw = llm.json('你是影视解说选题编辑。先依据本集原片把一个完整冲突说清楚，不编造剧情。',prompt+feedback)
+        write_json(path.parent/f'{path.stem}.attempt-{attempt}.raw.json',raw)
+        try:
+            data = ConflictBrief.model_validate(raw)
+            write_json(path.with_suffix('.raw.json'),raw)
+            break
+        except ValueError as exc:
+            write_json(path.parent/f'{path.stem}.attempt-{attempt}.error.json',{'error':str(exc)})
+            if attempt == cfg.repair_attempts:
+                raise
+            feedback = ('\n上次提纲结构校验失败：'+str(exc)[:3000]
+                +'\n上次完整输出：'+json.dumps(raw,ensure_ascii=False)
+                +'\n重新返回完整数据对象，steps每项须包含role、description、evidence_ids、commentary_job；不要返回JSON schema。')
     warnings, steps = [], []
     for step in data.steps:
         if any(i not in lookup for i in step.evidence_ids):

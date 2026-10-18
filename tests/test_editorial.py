@@ -36,6 +36,17 @@ def test_oral_edit_preserves_originals_citations_timing_and_does_not_mutate_inpu
     assert after.title==clip.title and after.hook==clip.hook and after.angle==clip.angle
 
 
+def test_oral_length_feedback_identifies_all_failed_beats_and_limits():
+    clip=fixture_clip();before=clip.model_dump()
+    raw={'changes':[{'beat':i,'text':'字'*100,'reason':'测试超长修订'} for i in (1,3)]}
+    with pytest.raises(ValueError) as caught:
+        apply_oral_changes(clip,OralProposal.model_validate(raw))
+    message=str(caught.value)
+    for i in (1,3):
+        assert f'beat {i} 原稿{len(clip.beats[i].text)}字，新稿100字，须' in message
+    assert clip.model_dump()==before
+
+
 @pytest.mark.parametrize('case',['original','duplicate','new_shot','new_field'])
 def test_oral_edit_cannot_change_source_or_invent_editable_structure(case):
     raw=proposal()
@@ -178,6 +189,34 @@ def test_existing_doubts_are_retained_for_full_review_not_marked_resolved(tmp_pa
     result=read_json(next(tmp_path.rglob('result.json')))
     assert result['baseline_issues']==['旧稿借款用途仍需完整内容核对']
     assert result['status']=='text_checked_not_timed_or_identity_certified'
+
+
+def test_outline_local_repair_updates_feedback_after_bad_evidence(tmp_path,monkeypatch):
+    import autoclip.outline as outline
+    import autoclip.continuity as continuity
+    monkeypatch.setattr(continuity,'load_continuity',lambda *a:{'signature':'prior','episodes':[]})
+    slots=[{'id':i,'mode':'narration' if i in (1,2) else 'original','start':i*12,'end':(i+1)*12,
+            'instruction':'依据当前字幕交代事情','evidence_ids':[i],'allowed_evidence_ids':[i],
+            'target_chars':45} for i in range(4)]
+    lines=[Line(id=i,start=i*12+1,end=i*12+10,text='当前剧情依据') for i in range(4)]
+    data={'title':'事情经过','angle':'问答','hook':'事情怎样展开','narrative_mode':'story_first',
+          'chapters':[{'title':'事情经过','beats':slots}]}
+    monkeypatch.setattr(outline,'check_outline',lambda *a:(data,lines))
+    monkeypatch.setattr(outline,'duration',lambda _:48)
+    text='有人提出了问题，对方作了回应。'
+    local_prompts=[]
+    class Model:
+        def json(self,system,prompt):
+            if '局部修稿编辑' in system:
+                local_prompts.append(prompt)
+                return {'id':1,'text':text,'evidence_ids':[999] if len(local_prompts)==1 else [1]}
+            return {'items':[{'id':i,'text':text,'evidence_ids':[999] if i==1 else [i]} for i in (1,2)]}
+    cfg=Settings(target_seconds=100,min_seconds=30,max_seconds=180,opening='original')
+    result=outline.compose_outline(tmp_path/'video.mp4',tmp_path/'transcript.json',tmp_path/'outline.json',
+                                   tmp_path/'run',cfg,Model())
+    assert len(local_prompts)==2 and local_prompts[0]!=local_prompts[1]
+    assert '未允许证据[999]' in local_prompts[1]
+    assert result.clips[0].beats[1].evidence_ids==[1]
 
 
 def test_factually_unchanged_near_synonym_of_audit_language_cannot_pass(tmp_path):

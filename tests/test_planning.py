@@ -146,6 +146,18 @@ def test_chapter_budget_and_bad_evidence_repaired_before_whole_compilation(tmp_p
         validate_chapter(drafts[0],structure.chapters[0],structure,lines,0,100,cfg)
 
 
+def test_chapter_repair_reports_numeric_limits_and_zero_length_shot(tmp_path):
+    from autoclip.planning import validate_chapter
+    _,structure,drafts,lines,_,cfg=fixture(tmp_path)
+    drafts[0]['beats'][-1].update(mode='narration',start=80,end=80,target_chars=30)
+    with pytest.raises(ValueError) as caught:
+        validate_chapter(drafts[0],structure.chapters[0],structure,lines,0,100,cfg)
+    message=str(caught.value)
+    assert '范围80.0–80.0' in message
+    assert '零秒旁白' in message
+    assert '字数预算30需适配画面0.00秒' in message
+
+
 def test_only_failed_chapter_is_retried(tmp_path,monkeypatch):
     import autoclip.planning as module
     args=fixture(tmp_path)
@@ -170,3 +182,36 @@ def test_only_failed_chapter_is_retried(tmp_path,monkeypatch):
     result=module.plan_outline(video,tmp_path/'run',lines,seconds,cfg,Model())
     assert counts=={1:2,2:1}
     assert result['chapters'][1]['beats'][0]['start']==40
+
+
+@pytest.mark.parametrize('opening,minimum', [('original',10),('original_teaser',18)])
+def test_opening_error_reports_actual_duration_and_configured_range(tmp_path,opening,minimum):
+    _,structure,_,_,_,cfg=fixture(tmp_path)
+    cfg.opening=opening
+    structure.opening_end=122.48
+    with pytest.raises(ValueError) as caught:
+        validate_structure(structure,0,140,cfg)
+    assert '22.48秒' in str(caught.value)
+    assert f'{minimum}–22秒' in str(caught.value)
+
+
+def test_structure_repair_uses_configured_retry_limit(tmp_path,monkeypatch):
+    import autoclip.planning as module
+    video,structure,drafts,lines,seconds,cfg=fixture(tmp_path)
+    monkeypatch.setattr(module,'load_continuity',lambda *a:{'signature':'prior'})
+    monkeypatch.setattr(module,'continuity_prompt',lambda *a:'')
+    monkeypatch.setattr(module,'prepare_conflict_brief',lambda *a,**k:{})
+    monkeypatch.setattr(module,'brief_context',lambda _: {})
+    prompts=[]
+    class Model:
+        def json(self,system,prompt):
+            if '先定章节' in prompt:
+                prompts.append(prompt)
+                raw=structure.model_dump()
+                if len(prompts)<3: raw['opening_end']=122.48
+                return raw
+            return drafts[0]
+    result=module.plan_outline(video,tmp_path/'run',lines,seconds,cfg,Model())
+    assert len(prompts)==3
+    assert '22.48秒' in prompts[1]
+    assert result['chapters'][0]['beats'][0]['end']==120
