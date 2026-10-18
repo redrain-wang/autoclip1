@@ -171,8 +171,7 @@ def fit_narration(beat, root, cfg, llm, lines):
 
 def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, llm: LLM, lines: list[Line]):
     from .identity import enforce_identity
-    if cfg.oral_edit and not getattr(llm,"frozen_script",False):
-        require_oral_style(clip)
+    require_oral_style(clip)
     enforce_identity(video, root, clip, cfg, llm, lines)
     from .media_cache import cached_shot, shot_inputs
     source = source_identity(video)

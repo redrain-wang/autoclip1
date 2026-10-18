@@ -9,7 +9,8 @@ from .repair import RepairNeeded
 from .budget import spoken_characters
 from .util import digest, write_json
 
-VERSION = "oral-edit-14"
+VERSION = "oral-edit-15"
+AUDIENCE_STYLE_POLICY = 'audience-narration-3'
 WRITING_RULES = """
 剧情优先是所有新稿始终遵循的规则，优先于风格参考中的观点或分析要求。
 先讲清谁在何处、事件起因、行动、结果以及场景之间的承接，再在必要转折解释选择、压力或代价。
@@ -22,6 +23,10 @@ WRITING_RULES = """
 指责交代来源后直接讲机制，不再接‘不是认罪、能确认的只是……’等多次保留意见。
 确实影响结论的未知事实必须保留，如资金去向未明、尚未到账；不能把‘据说’删成事实，把角色指责删成旁白定论。
 ‘客观定论、控诉方的推论、证据只到……、单凭这场问答不能断定’等审查措辞留在审核记录，不进入解说正文。
+字幕、转写、声纹及审核记录只是内部依据，不是解说的叙述主体。正文禁止‘字幕里说’‘字幕显示’‘根据字幕’‘镜头里有人’‘画面中可以看到’等制作核对话术。
+面向观众直接讲人物处境、对白含义及行动承接；人物身份不明时用有来源的关系或行动描述，不用制作过程或含混的有人代替剧情。
+用第三人称自然讲述，不把角色自称侄儿、朕或称呼您、你的裸台词直接当作旁白；确有必要引用时，先交代是谁在说什么。允许准确概括和同义转述，不要求逐字复读字幕。
+不照读转写错字或不成句的残片。官名、人名及关键用词须对照原片核实，不确定的内容不扩写成事实。
 开头交代当前证据支持的具体处境，章节按事件发展衔接，结尾讲清已发生的结果；有必要时才解释人物选择与代价，不预支未来情节。
 少用‘等于、换句话说、所以’重复解释同一观点，不堆金句，也不为了时长反复说‘规矩还是规矩’。
 区分下令、承诺、执行与完成：调任命令已下不写成人已离京，答应还款不写成钱已入库。
@@ -33,6 +38,20 @@ WRITING_RULES = """
 # These signals flag prose for rewriting. They are never automatically removed.
 _CLINICAL = re.compile(r"客观定论|人格结论|控诉方的推论|证据只到|证据局限|不能顺势坐实|"
                        r"单凭[^。！？]{0,35}(?:不能|无法)断定|需进一步核实")
+_PRODUCTION_LANGUAGE = re.compile(
+    r'字幕(?:里|中|上|所|显示|写|说|提|表明|证明|明确)|(?:根据|依据|从)(?:这段|本段|上述|这些)?字幕|'
+    r'(?:镜头|画面)(?:里|中)(?:有人|有个|一个|能|可|我们|显示|出现|看到|看见|只)|'
+    r'ASR|转写稿|转写结果|声纹候选|声纹库|证据ID|字幕ID|evidence_ids|frame_ids|审核记录',re.IGNORECASE)
+
+
+def unframed_role_speech(text):
+    plain=re.sub(r'“[^”]*”|「[^」]*」|『[^』]*』|"[^\"]*"','',text)
+    marks=[]
+    for match in re.finditer(r'朕|儿臣|奴才|本王|本官|您|(?:^|[，,。！？；：])\s*(?:侄儿|[你我](?!们))',plain):
+        prefix=re.split(r'[。！？；]',plain[:match.start()])[-1]
+        if re.search(r'说|问|答|喊|解释|表示|反驳|称|请求|恳求|写道',prefix):continue
+        marks.append('角色口吻未交代引述：'+match.group().strip('，,。！？；： '))
+    return marks
 
 
 class OralChange(BaseModel):
@@ -71,7 +90,7 @@ def prose_signals(clip):
     rows = []
     for i, beat in enumerate(clip.beats):
         if beat.mode == "narration":
-            marks = _CLINICAL.findall(beat.text)
+            marks = _CLINICAL.findall(beat.text)+_PRODUCTION_LANGUAGE.findall(beat.text)+unframed_role_speech(beat.text)
             if marks:
                 rows.append({"beat": i, "phrases": marks})
     return rows
@@ -291,4 +310,4 @@ def polish_clip(clip, lines, root, cfg, llm, context=None):
 def require_oral_style(clip):
     if signals := prose_signals(clip):
         raise RepairNeeded({'stage':'oral_style','issues':[{'code':'semantic_review',
-                           'message':'口播仍有审查措辞，需要自然交代来源后精修：'+json.dumps(signals,ensure_ascii=False)}]})
+                           'message':'口播仍有制作或审查措辞，须面向观众讲剧情：'+json.dumps(signals,ensure_ascii=False)}]})

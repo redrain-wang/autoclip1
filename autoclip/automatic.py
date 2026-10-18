@@ -8,7 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from .identity import units_for_clip, file_hash
-from .editorial import audience_script
+from .editorial import audience_script, prose_signals, require_oral_style, WRITING_RULES
 from .ingest import contact_sheet, subtitle_evidence_sheet
 from .models import Plan, Beat, validate_plan, evidence_matches
 from .repair import RepairNeeded
@@ -94,6 +94,34 @@ class OriginalReviewBatch(UnitReviews):
     units: list[OriginalDecision]
 
 
+class CaptionReading(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    line_id: int
+    text: str
+
+
+class CaptionReadings(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    readings: list[CaptionReading] = Field(min_length=1,max_length=6)
+
+
+def read_caption_observations(llm, sheet, line_ids):
+    """Read only source pixels, without exposing ASR or the candidate narration."""
+    raw=llm.json('你是原片字幕辨读员，只读图，不审稿、不识别人物、不补对白。',
+        '按图上caption line标签，逐条抄录原片实际可见的字幕。标签ID和时间不是原片字幕。'
+        '每条有两张原片图，若字幕不同，按先后用 / 分隔；无字或看不清返回空字符串。'
+        '不凭剧情记忆、发音或常识补字。仅返回JSON readings数组，每项只有line_id和text，'
+        '必须恰好覆盖这些line_id：'+json.dumps(line_ids),[sheet])
+    parsed=CaptionReadings.model_validate(raw)
+    if len(parsed.readings)!=len(line_ids) or {r.line_id for r in parsed.readings}!=set(line_ids):
+        raise ValueError('原片字幕辨读未精确覆盖给定位置')
+    return parsed.model_dump()['readings']
+
+
+def review_transcript_rows(lines):
+    return [{'id':s.id,'start':s.start,'end':s.end,'asr_text':s.text,'confidence':s.confidence} for s in lines]
+
+
 def review_voice_rows(rows):
     """Keep actual accepted names and uncertainty; ranks below the gate aren't identities."""
     return [{**{k:v for k,v in row.items() if k!='samples'},
@@ -136,12 +164,23 @@ def required_note_repairs(notes, units):
     issues=[]
     for note in notes:
         message=note.message
-        if re.search(r'无需(?:再)?修|不(?:必|需|用)修|已(?:经)?修正|无需修改',message):continue
-        if not re.search(r'(?:应|必须|需要|须)[^。；]{0,50}(?:修正|改为|改成|更正|修改)',message):continue
-        quoted=re.findall(r'[“「"]([^”」"]{2,80})[”」"]',message)
-        affected=[u['id'] for u in units if any(word in u['text'] for word in quoted)]
-        if not affected:affected=[note.id]
-        issues.extend({'id':uid,'message':message} for uid in affected)
+        affected=set()
+        # Scope instructions to their clause: an ASR observation followed by
+        # "the narration is correct; do not change it" is not a script repair.
+        for clause in re.split(r'[，,。；;\n]',message):
+            if (re.search(r'ASR|转写',clause,re.IGNORECASE)
+                    and not re.search(r'旁白|口播|正文|稿件|标题|角度|钩子',clause)):
+                continue
+            directives=re.sub(r'(?:无[需须]|不(?:必|需(?:要)?|用|应|须))[^，,。；;]{0,30}?'
+                r'(?:修正|改为|改成|更正|修改|修订)|已(?:经)?(?:修正|更正|修改)','',clause)
+            instruction=re.search(r'(?:应|必须|需要|须)[^，,。；;]{0,50}(?:修正|改为|改成|更正|修改)',directives)
+            if not instruction:continue
+            quoted=re.findall(r'[“「"]([^”」"]{2,80})[”」"]',directives[:instruction.start()])
+            targets=[u['id'] for u in units if any(word in u['text'] for word in quoted)]
+            affected.update(targets or [note.id])
+        issues.extend({'id':u['id'],'message':message} for u in units if u['id'] in affected)
+        if affected-set(u['id'] for u in units):
+            issues.extend({'id':uid,'message':message} for uid in sorted(affected-set(u['id'] for u in units)))
     return issues
 
 
@@ -208,7 +247,9 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 or (cfg.opening=='original_teaser' and index==1 and eid in clip.beats[0].evidence_ids))
     key = digest({'v':VERSION,'plan':plan.model_dump(),'voices':voices,'model':cfg.llm_model,'endpoint':cfg.llm_base_url})
     folder = root/'automatic-review'/key
-    all_issues, batches, frames = [], [], []
+    all_issues=[{'id':f'beat-{row["beat"]}','message':'旁白混入制作或审查话术，必须面向观众直接讲剧情，不能照读核对记录：'
+        +json.dumps(row['phrases'],ensure_ascii=False)} for row in prose_signals(clip)]
+    batches, frames = [], []
     groups = []
     offset = 0
     for subset in ([u for u in units if u.get('mode')!='original'],[u for u in units if u.get('mode')=='original']):
@@ -236,6 +277,13 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
         sheet = contact_sheet(video,folder/f'batch-{offset}-images',times,f'batch-{offset}')
         evidence = review_voice_rows([r for r in voices['lines'] if r['line_id'] in {s.id for s in selected}]) if not original else []
         prompt = ('逐项核对文本事实、人物行为归属、画面相关性、连续原声切点、场景承接和重复解释。'
+                  '旁白必须面向观众讲剧情，不能出现字幕里说、根据字幕、镜头里有人等制作核对话术；'
+                  '不能只因与转写字面一致就放行，不成句的残片或明显同音错词须按原片核实并指出问题。'
+                  '字幕字段中的asr_text只是机器转写，不是原片实际字幕，可能有错字和错断句。'
+                  '旁白与原片图一致、仅与asr_text不同，不是旁白错误；转写疑点只能写notes，不能要求修改正确旁白来迎合错误转写。'
+                  '这是剧情解说，不是逐字复读校对；允许同义概括、略去语气词和压缩正常停顿，不因没有逐字照读就判错。'
+                  '旁白须自然地用第三人称讲述，不能把角色自称侄儿、朕或称呼您的裸台词直接当成解说。必要引用先交代发言者，不能让配音者冒充剧中人。'
+                  '有清楚自称、称呼和连续问答时，可用这位晚辈、来求差事的人等有来源的角色关系叙述，不要求每个行为者先识别到姓名。'
                   '不能因同一模型写稿就默认正确。声纹是候选；画面人物可能是听者。'
                   '声纹有冲突时只能以明确叫名与连续问答核实，否则unknown；不能凭剧名记忆认人。'
                   '身份依据分为无身份主张、声纹加语境、明确称呼回应、依据不足。泛称仍可能有身份主张。'
@@ -259,7 +307,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                   '回顾上一镜头已经发生的事情不要求该事情在当前画面再发生一次；须有此前证据并自然承接，不能把回顾误判成预支未来。'
                   f'\n格式{json.dumps(UnitReviews.model_json_schema(),ensure_ascii=False)}'
                   f'\nunits={json.dumps(group,ensure_ascii=False)}\ntimes={times}'
-                  f'\n字幕={json.dumps([s.model_dump() for s in selected],ensure_ascii=False)}'
+                  f'\n字幕={json.dumps(review_transcript_rows(selected),ensure_ascii=False)}'
                   f'\n声音候选={json.dumps(evidence,ensure_ascii=False)}'
                   f'\nviewer_timeline={json.dumps(audience_script(clip),ensure_ascii=False)}')
         if original:
@@ -274,11 +322,12 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 '不要返回passed总开关；程序按每个单位的verdict及issues汇总。未知或实际错误仍须逐项拒绝。'
                 f'\n格式{json.dumps(OriginalReviewBatch.model_json_schema(),ensure_ascii=False)}'
                 f'\nunits={json.dumps(group,ensure_ascii=False)}\ntimes={times}'
-                f'\n字幕={json.dumps([s.model_dump() for s in selected],ensure_ascii=False)}'
+                f'\n字幕={json.dumps(review_transcript_rows(selected),ensure_ascii=False)}'
                 f'\nviewer_timeline={json.dumps(audience_script(clip),ensure_ascii=False)}')
         feedback = ''
         review_images = [sheet]
         caption_sheet = None
+        caption_observations=None
         metadata=any('start' not in u for u in group)
         if metadata:
             caption_lines=metadata_caption_lines(group,selected)
@@ -288,6 +337,17 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
             prompt+=('\n另附按标题、角度、钩子用词定位的原片字幕放大图。ASR只是识别稿，必须逐字对照实际可见字幕，'
                 '尤其核对人名、拆字、同音字和改变剧情含义的词。实际字幕与ASR冲突，以清晰可见原片为准；'
                 '不得照抄ASR把疑点认定为事实，看不清仍标unknown。frame_ids仍使用主图times索引。')
+        elif not original:
+            caption_lines=[]
+            for unit in group:
+                cited=[s for s in selected if s.id in unit.get('evidence_ids',[])]
+                caption_lines.extend(metadata_caption_lines([unit],cited)[:2])
+            caption_lines=list({s.id:s for s in caption_lines}.values())[:6]
+            if caption_lines:
+                caption_sheet=subtitle_evidence_sheet(video,folder/f'batch-{offset}-narration-captions',caption_lines,'narration')
+                review_images.append(caption_sheet)
+                prompt+=('\n另附本批旁白引用的原片字幕放大图。核对官名、人名、同音字和残句；转写稿不是正确文字的保证。'
+                    '还须按完整稿件判断自然听感与剧情承接，不能把制作核对话术当成合格解说。frame_ids仍使用主图times索引。')
         for retry in range(cfg.repair_attempts+1):
             raw = llm.json('你是独立的影视内容与人物证据审核员，不读取人工答案。',prompt+feedback,review_images)
             try:
@@ -295,6 +355,21 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 checked = decisions.model_dump()
                 checked['passed'] = not decisions.issues and all(u.verdict=='supported' for u in decisions.units)
                 issues = assess_batch(checked,group,selected,len(times),evidence)
+                if (not original and retry<cfg.repair_attempts and caption_sheet is not None
+                        and caption_observations is None
+                        and any(re.search(r'ASR|转写|同音|错字|错词|残句',i['message']) for i in issues)):
+                    caption_observations=read_caption_observations(llm,caption_sheet,[s.id for s in caption_lines])
+                    write_json(folder/f'batch-{offset}-caption-readings.json',{'readings':caption_observations,
+                        'image':str(caption_sheet.resolve()),'image_sha256':file_hash(caption_sheet)})
+                    write_json(folder/f'batch-{offset}-source-recheck-{retry}.json',{'raw':raw,'issues':issues})
+                    feedback=('\n上一轮混淆原片与机器转写，先重核审核自身，不先改稿。'
+                        '这是另一个只看原片图、未看到转写和稿件的字幕辨读结果，仍须对图复核：'
+                        +json.dumps(caption_observations,ensure_ascii=False)
+                        +'。原片图与旁白相符时应supported；不得因原始ASR有错而拒绝正确旁白。'
+                        '抽样图不含某句话不等于原片没说；按实际可见文字修正错字，不补未知事实。'
+                        '只将当前稿件实际存在的事实、人物、剪辑或听感问题列issues；允许准确的同义概括。'
+                        '\n上轮审核：'+json.dumps(raw,ensure_ascii=False))
+                    continue
                 # A reviewer cannot claim voice support that its own cited
                 # candidates do not supply. Recheck the review annotation before
                 # asking the writer to "fix" an otherwise unchanged sentence.
@@ -484,8 +559,9 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
               '时间不得越过相邻镜头，原片区间1–40秒，不能把原声开场移到后面的旁白位置；保留整句原声。'
               f'\ntarget={json.dumps(target,ensure_ascii=False)}\nallowed_evidence_ids={sorted(eligible)}'
               f'\n问题{json.dumps([i for i in issues if i["id"]==uid],ensure_ascii=False)}\n完整稿件（仅供衔接）{revised.model_dump_json()}'
-              f'\n可用字幕{json.dumps([s.model_dump() for s in lines if s.id in eligible],ensure_ascii=False)}'
+              f'\n可用字幕（asr_text为未核实机器转写，实际字词以附图为准）{json.dumps(review_transcript_rows([s for s in lines if s.id in eligible]),ensure_ascii=False)}'
               f'\n人物候选{json.dumps(review_voice_rows([r for r in voices.get("lines",[]) if r["line_id"] in eligible]),ensure_ascii=False)}')
+        prompt+='\n面向观众的写作要求：'+WRITING_RULES
         if max_characters is not None:
             prompt += (f'\n本次为真实配音超出画面余量的缩写：text有效字数必须不超过{max_characters}字（不含标点）。'
                        '必须实质删掉重复复述，只保留必要承接或必要事实，不能仅换同义词、添语气词或照抄。'
@@ -521,6 +597,10 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                 if not set(cited).issubset(eligible):
                     raise ValueError(f'当前单位引用了未允许证据；只能使用{sorted(eligible)}')
                 candidate = apply_plan_changes(revised,raw,{uid})
+                if uid.startswith('beat-'):
+                    index=int(uid.split('-')[1])
+                    if signals:=[s for s in prose_signals(candidate.clips[0]) if s['beat']==index]:
+                        raise ValueError('当前旁白仍混入制作或审查话术，不能进入配音：'+json.dumps(signals,ensure_ascii=False))
                 if max_characters is not None and spoken_characters(candidate.clips[0].beats[int(uid.split('-')[1])].text)>max_characters:
                     raise ValueError(f'实测时长修复没有落实缩写：当前口播必须不超过{max_characters}个有效字')
                 if source_seconds is not None:
@@ -614,6 +694,7 @@ class FrozenAutomaticScript:
 
 
 def assert_approval(report, video, plan, lines, voices):
+    for clip in plan.clips:require_oral_style(clip)
     if (report.get('version')!=VERSION or report.get('mode') != 'automatic_source_review' or report.get('passed') is not True or report.get('issues') != []
             or report.get('metadata_caption_policy')!=METADATA_CAPTION_POLICY
             or not any(f.get('purpose')=='metadata_captions' for f in report.get('frames',[]))

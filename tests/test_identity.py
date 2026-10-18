@@ -134,8 +134,10 @@ def test_render_cannot_reuse_or_write_media_before_identity_gate(tmp_path, monke
 
     monkeypatch.setattr(identity, "enforce_identity", reject)
     monkeypatch.setattr(render, "run", lambda *a: pytest.fail("不得先执行渲染"))
-    with pytest.raises(RepairNeeded):
-        render.render_clip(tmp_path / "video.mp4", tmp_path, None, 0, Settings(), None, [])
+    from test_pipeline import fixture_plan
+    _,plan=fixture_plan()
+    with pytest.raises(RepairNeeded,match='身份不明'):
+        render.render_clip(tmp_path / "video.mp4", tmp_path, plan.clips[0], 0, Settings(), None, [])
     assert not list(tmp_path.rglob("*.mp4"))
 
 

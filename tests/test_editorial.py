@@ -415,3 +415,33 @@ def test_optional_listening_suggestions_do_not_reject_a_clear_script(tmp_path):
     after=polish_clip(clip,[],tmp_path,Settings(),Model())
     assert len(calls)==2 and after.model_dump()==clip.model_dump()
     assert read_json(next(tmp_path.rglob('result.json')))['oral_suggestions']==['结尾可以略微压缩']
+
+
+@pytest.mark.parametrize('text',['字幕里说，这始终就没弄明白。','根据字幕，可以确定此事。',
+                                 '镜头里有人应下差事。','声纹候选显示这就是六叔。',
+                                 '侄儿始终就没弄明白。','这么多年，您当着朝廷的辅相。','把人带下去，朕就问罪他。',
+                                 '小多子，你这碗水还浅着呢。'])
+@pytest.mark.parametrize('frozen',[False,True])
+def test_production_language_cannot_reach_render_even_with_polish_disabled(tmp_path,text,frozen):
+    from autoclip.automatic import FrozenAutomaticScript
+    from autoclip.render import render_clip
+    clip=fixture_clip();clip.beats[1].text=text
+    clip.beats[3].text='他收下银子，结束了问话。'
+    with pytest.raises(RepairNeeded,match='制作或审查措辞'):
+        render_clip(tmp_path/'missing.mp4',tmp_path,clip,0,Settings(oral_edit=False),
+                    FrozenAutomaticScript() if frozen else object(),[])
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize('text',['康熙下令核对账目。','这份证据让案情有了转机。','他让人把信上的字念出来。'])
+def test_plot_actions_and_in_story_evidence_are_not_production_language(text):
+    clip=fixture_clip();clip.beats[1].text=text
+    assert prose_signals(clip)==[]
+
+
+@pytest.mark.parametrize('text',['他答“行，我去”。','皇帝说：“朕就问罪他。”',
+                                 '晚辈说，侄儿始终没弄明白。','他向六叔说，您当着辅相。',
+                                 '皇帝反问：你死了，岂不更伤圣德？','来求差事的晚辈向长辈道谢。'])
+def test_attributed_or_quoted_role_speech_is_allowed(text):
+    clip=fixture_clip();clip.beats[1].text=text
+    assert prose_signals(clip)==[]

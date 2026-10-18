@@ -290,6 +290,8 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
             status("新选题检查完成",candidates=len(selection.stories))
             return {"source":str(video),"candidates":len(selection.stories),"status":"scouted"}
         results,failures,rejected=completed_stories(root),[],[]
+        story_positions={digest(s.model_dump()):i for i,s in enumerate(selection.stories)}
+        results.sort(key=lambda c:story_positions.get(digest(c['story']),len(story_positions)))
         if voices is not None:
             results = retain_approved(results,video,lines,voices,cfg,root)
         if stage=="all":
@@ -368,8 +370,10 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                             storyroot/'plan-approved.json',storyroot/'automatic-review.json',
                             *[Path(f['path']) for f in report['frames']]]
                     from .automatic import METADATA_CAPTION_POLICY
+                    from .editorial import AUDIENCE_STYLE_POLICY
                     approval = checkpoint(storyroot,'voice-approval',{'draft':plan.model_dump(),'voices':voices,
                         'metadata_caption_policy':METADATA_CAPTION_POLICY,
+                        'audience_style_policy':AUDIENCE_STYLE_POLICY,
                         'cfg':local.model_dump(mode='json'),'story':story.model_dump()},approve)
                     plan = Plan.model_validate(approval['plan'])
                     assert_approval(approval['report'],video,plan,lines,voices)
@@ -398,6 +402,7 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                     assert_approval(approval['report'],video,plan,lines,voices)
                     write_json(Path(finished['video']).parent/'manifest.json',finished)
                     results.append(finished)
+                    results.sort(key=lambda c:story_positions.get(digest(c['story']),len(story_positions)))
                     write_json(root/"completed.json",results)
                     write_json(root/"results.json",results)
                     status(f"新片已完成 {len(results)}/{len(selection.stories)}")

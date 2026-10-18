@@ -236,7 +236,7 @@ def test_review_protocol_retry_keeps_script_and_supplies_previous_shown_context(
                 'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
     report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(),Model())
     assert report['passed'] and len(prompts)==4
-    assert len(sheet_roots)==len(set(sheet_roots))==4
+    assert len(sheet_roots)==len(set(sheet_roots))==5
     assert all(len(group)<=3 for group in groups)
     assert [Path(p).name for p in report['batches']]==['batch-0.json','batch-3.json','batch-6.json']
     assert any('上次审核响应' in p for p in prompts[1:]) and plan.model_dump()==before
@@ -469,3 +469,120 @@ def test_required_source_correction_in_notes_blocks_supported_metadata(correctio
     issues=assess_batch(raw,units,[Line(id=0,start=0,end=4,text='乳名暗含绝路')],1,[])
     if correction:assert len(issues)==1 and issues[0]['id']=='angle' and '爵禄' in issues[0]['message']
     else:assert issues==[]
+
+
+def test_local_repair_rejects_process_language_without_blocking_other_pending_units(tmp_path):
+    from autoclip.util import read_json
+    plan=sample_plan();plan.clips[0].beats[1].text='字幕里说，这事没弄明白。'
+    plan.clips[0].beats[2].text='镜头里有人继续说话。'
+    before=plan.model_dump()
+    class Model:
+        calls=0
+        def json(self,system,prompt):
+            self.calls+=1
+            assert '字幕、转写、声纹及审核记录只是内部依据' in prompt
+            if self.calls>1:assert '仍混入制作或审查话术' in prompt
+            return {'changes':[{'id':'beat-1','text':'画面中有人表示不明白。' if self.calls==1 else '他仍不明白这次来意。'}]}
+    model=Model();revised=repair_plan(plan,[{'id':'beat-1','message':'制作话术'}],[],{},tmp_path,
+                                    Settings(repair_attempts=1),model,0)
+    assert model.calls==2 and revised.clips[0].beats[1].text=='他仍不明白这次来意。'
+    assert revised.clips[0].beats[2]==plan.clips[0].beats[2] and plan.model_dump()==before
+    assert '制作或审查话术' in read_json(tmp_path/'automatic-repairs/0/beat-1/attempt-0.json')['error']
+
+
+def test_supported_model_verdict_cannot_approve_production_language(tmp_path,monkeypatch):
+    import json
+    import autoclip.automatic as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'frame')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    plan=sample_plan();plan.clips[0].beats[1].text='字幕里说，这事没弄明白。'
+    lines=[Line(id=i,start=i*10+.1,end=i*10+9,text='当前对白') for i in range(4)]
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':[]}
+    class Model:
+        def json(self,system,prompt,images):
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+            return {'issues':[],'units':[{'id':u['id'],'verdict':'supported','reason':'字面符合',
+                'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
+                'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(),Model())
+    assert not report['passed'] and any(i['id']=='beat-1' and '制作' in i['message'] for i in report['issues'])
+    with pytest.raises(ValueError,match='制作或审查措辞'):
+        assert_approval({**report,'passed':True,'issues':[]},video,plan,lines,voices)
+
+
+@pytest.mark.parametrize('problem',[None,'missing','duplicate'])
+def test_source_caption_reader_receives_only_pixels_and_rejects_wrong_ids(tmp_path,problem):
+    from autoclip.automatic import read_caption_observations
+    frame=tmp_path/'source.jpg';frame.write_bytes(b'source pixels')
+    class Model:
+        def json(self,system,prompt,images):
+            assert images==[frame] and '字幕辨读员' in system
+            assert '李凡院' not in prompt and '手尖' not in prompt and '旁白候选' not in prompt
+            rows=[{'line_id':209,'text':'六叔'},{'line_id':210,'text':'到理藩院当个守监的'}]
+            if problem=='missing':rows=rows[:1]
+            elif problem=='duplicate':rows[1]['line_id']=209
+            return {'readings':rows}
+    if problem:
+        with pytest.raises(ValueError,match='精确覆盖'):read_caption_observations(Model(),frame,[209,210])
+    else:assert read_caption_observations(Model(),frame,[209,210])[1]['text']=='到理藩院当个守监的'
+
+
+def test_asr_dispute_rereads_primary_captions_without_rewriting_correct_narration(tmp_path,monkeypatch):
+    import json
+    import autoclip.automatic as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'source pixels')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    plan=sample_plan();plan.clips[0].beats[0].text='他请求到理藩院当个守监的。';before=plan.model_dump()
+    lines=[Line(id=i,start=i*10+.1,end=i*10+9,text='李凡院，手尖的' if i==0 else '当前对白') for i in range(4)]
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':[]}
+    class Model:
+        reads=0
+        def json(self,system,prompt,images):
+            if '字幕辨读员' in system:
+                self.reads+=1;assert '李凡院' not in prompt and '守监' not in prompt
+                ids=json.loads(prompt.rsplit('：',1)[1])
+                return {'readings':[{'line_id':i,'text':'到理藩院当个守监的' if i==0 else '当前对白'} for i in ids]}
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+            supplied=json.JSONDecoder().raw_decode(prompt.split('\n字幕=',1)[1])[0]
+            assert all('asr_text' in s and 'text' not in s for s in supplied)
+            disputing=any(u['id']=='beat-0' for u in group) and '只看原片图' not in prompt
+            return {'issues':[],'units':[{'id':u['id'],
+                'verdict':'contradicted' if disputing and u['id']=='beat-0' else 'supported',
+                'reason':'转写为李凡院手尖，需核对同音字' if disputing and u['id']=='beat-0' else '原片与旁白相符',
+                'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
+                'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    model=Model();report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=1),model)
+    assert report['passed'] and model.reads==1 and plan.model_dump()==before
+    assert lines[0].text=='李凡院，手尖的'
+    assert list(tmp_path.glob('automatic-review/*/batch-*-caption-readings.json'))
+
+
+@pytest.mark.parametrize('phrase',['无须修改','无需再修正','不需要修改','不必修正','不应修改','不须修改'])
+def test_harmless_asr_notes_do_not_trigger_content_repair(phrase):
+    from autoclip.automatic import required_note_repairs, UnitIssue
+    units=[{'id':'beat-3','text':'他说起先前辅政的经历。'}]
+    assert required_note_repairs([UnitIssue(id='beat-3',message='ASR同音疑点，旁白按原意概括，'+phrase+'。')],units)==[]
+
+
+def test_harmless_note_sentence_does_not_hide_another_required_correction():
+    from autoclip.automatic import required_note_repairs, UnitIssue
+    units=[{'id':'angle','text':'乳名暗含绝路'}]
+    notes=[UnitIssue(id='angle',message='标题无需修改。角度中“绝路”必须更正为“爵禄”。')]
+    assert required_note_repairs(notes,units)==[{'id':'angle','message':notes[0].message}]
+
+
+@pytest.mark.parametrize('note',[
+    '字幕209中“李凡院”应为“理藩院”的机器转写同音错字，原片字幕放大图已显示“理藩院”，旁白使用“理藩院”正确，不应按asr_text修改。',
+    'ASR中“李凡院”需要改为“理藩院”，旁白使用“理藩院”正确，无须修改。',
+    '旁白无须对照错误ASR修改。',
+])
+def test_correct_narration_is_not_rewritten_for_asr_correction_notes(note):
+    units=[{'id':'beat-17','text':'年轻人道谢，请六叔让自己到理藩院当个守监的。'}]
+    raw={'passed':True,'issues':[],'notes':[{'id':'beat-17','message':note}],
+        'units':[{'id':'beat-17','verdict':'supported','reason':'与原片相符',
+            'evidence_ids':[0],'frame_ids':[0],'identity_basis':'no_identity_claim','subjects':[]}]}
+    assert assess_batch(raw,units,[Line(id=0,start=0,end=8,text='李凡院，我手尖的')],1,[])==[]
