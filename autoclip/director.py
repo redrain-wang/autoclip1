@@ -9,16 +9,16 @@ from .config import Settings
 from .editorial import WRITING_RULES, VERSION as EDITORIAL_VERSION, polish_clip
 from .ingest import contact_sheet
 from .llm import LLM
-from .models import Clip, Line, Plan, validate_plan
+from .models import Clip, Line, Plan, evidence_matches, validate_plan
 from .repair import RepairNeeded, enrich_constraints, repair_context
 from .research import background_context
 from .util import digest, read_json, write_json
 
 console = Console()
-VERSION = "director-14"
+VERSION = "director-17"
 
 
-def compile_plan(raw: dict, lines: list[Line], bounds=None) -> Plan:
+def compile_plan(raw: dict, lines: list[Line], bounds=None, *, fit_narration=True) -> Plan:
     """Compile broad narrative footage choices into bounded shots; keep dialogue intact.
 
     Models often select an entire scene for a short sentence. Cropping that scene
@@ -30,8 +30,19 @@ def compile_plan(raw: dict, lines: list[Line], bounds=None) -> Plan:
     lookup = {s.id: s for s in lines}
     for clip in data.get("clips", []):
         beats = clip.get("beats", [])
+        if any(not isinstance(b,dict) or not {'mode','start','end','evidence_ids','reason'}.issubset(b) for b in beats):
+            # Emit a structured model error instead of crashing the whole
+            # episode while attempting to normalize an incomplete proposal.
+            return Plan.model_validate(data)
+        def supported(raw_beat, position):
+            from types import SimpleNamespace
+            beat = SimpleNamespace(**raw_beat)
+            context = {i for b in beats[:position] for i in b['evidence_ids'] if i in lookup
+                       and lookup[i].start<b['end'] and lookup[i].end>b['start']}
+            return any(i in lookup and evidence_matches(lookup[i],beat,context) for i in getattr(beat,'evidence_ids',[]))
         for position, beat in enumerate(beats):
             start, end = float(beat["start"]), float(beat["end"])
+            had_evidence = supported(beat,position)
             if beat["mode"] == "original":
                 speech = [s for s in lines if s.start < end-.2 and s.end > start+.2 and s.confidence >= .4]
                 if speech:
@@ -42,7 +53,7 @@ def compile_plan(raw: dict, lines: list[Line], bounds=None) -> Plan:
                             beat["start"] = max(bounds[0], beat["start"])
                         if speech[-1].end <= bounds[1]:
                             beat["end"] = min(bounds[1], beat["end"])
-            else:
+            elif fit_narration:
                 desired = max(6, min(22, len(beat.get("text", ""))/4.5+.5))
                 if end-start < desired * .72:
                     # The last spoken subtitle is not the end of the footage.
@@ -60,13 +71,24 @@ def compile_plan(raw: dict, lines: list[Line], bounds=None) -> Plan:
                         center = (start+end)/2
                     beat["start"] = round(max(start, min(end-desired,center-desired/2)),3)
                     beat["end"] = round(beat["start"]+desired,3)
-        for previous, current in zip(beats,beats[1:]):
+                if had_evidence and not supported(beat,position):
+                    beat['start'],beat['end'] = start,end
+        for position, (previous, current) in enumerate(zip(beats,beats[1:])):
             overlap = float(previous["end"])-float(current["start"])
             if 0 < overlap <= 1.5:
                 if previous["mode"] == "narration" and current["mode"] == "original":
+                    end, had_evidence = previous['end'],supported(previous,position)
                     previous["end"] = current["start"]
+                    if had_evidence and not supported(previous,position):
+                        previous['end'] = end
+                        speech = [s for s in lines if s.start<current['end']-.2 and s.end>current['start']+.2]
+                        if speech and end <= speech[0].start:
+                            current['start'] = end  # trim padding only, never speech
                 elif current["mode"] == "narration":
+                    start, had_evidence = current['start'],supported(current,position+1)
                     current["start"] = previous["end"]
+                    if had_evidence and not supported(current,position+1):
+                        current['start'] = start
         # Padding complete utterances can make two adjacent original-audio
         # intervals overlap by 0.2s. Preserve their union rather than asking a
         # writer to fix a collision introduced by this compiler itself.
@@ -178,10 +200,14 @@ def analyze(video: Path, root: Path, lines: list[Line], seconds: float, cfg: Set
     return maps
 
 
-def create_plan(video: Path, root: Path, lines: list[Line], seconds: float, maps, cfg: Settings, llm: LLM, previous: list[dict], repair=None, bounds=None):
+def create_plan(video: Path, root: Path, lines: list[Line], seconds: float, maps, cfg: Settings, llm: LLM, previous: list[dict], repair=None, bounds=None, *, measured_review=False):
     signature_input = {"version": VERSION, "editorial_version": EDITORIAL_VERSION, "lines": [s.model_dump() for s in lines], "maps": maps,
                        "cfg": cfg.model_dump(mode="json"), "previous": previous,
                        "background": background_context(cfg.series)}
+    signature_input['measured_review'] = measured_review
+    if measured_review:
+        from .draft import VERSION as DRAFT_VERSION
+        signature_input['draft_repair_version'] = DRAFT_VERSION
     if bounds:
         signature_input["source_bounds"] = bounds
     if repair:
@@ -191,6 +217,13 @@ def create_plan(video: Path, root: Path, lines: list[Line], seconds: float, maps
     def check(plan):
         try:
             validate_plan(plan, lines, seconds, cfg.clips, cfg.target_seconds, cfg.min_seconds, cfg.max_seconds, cfg.opening)
+            if measured_review:
+                lookup = {s.id:s for s in lines}
+                future = [f'clips[{i}].beats[{j}] 没有落在画面区间内的字幕证据：引用未来对白{ids}，画面结束{beat.end:.2f}秒；应先播原声再解释，不能预支剧情'
+                          for i,clip in enumerate(plan.clips) for j,beat in enumerate(clip.beats)
+                          if beat.mode=='narration' and (ids:=[sid for sid in beat.evidence_ids if lookup[sid].start>=beat.end])]
+                if future:
+                    raise ValueError('\n'.join(future))
         except ValueError as ex:
             report=repair_context(ex,plan.clips[0] if plan.clips else None,cfg)
             raise RepairNeeded(enrich_constraints(report,lines,bounds,cfg)) from ex
@@ -276,12 +309,20 @@ evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间�
 末段也要留足时间；允许用解说替代末尾原声来交代结果。不要把必要的事实限定删掉，不要为满足时长添加无证据情节。
 总时长要留出误差余量，优先靠近目标时长，避免刚好卡最低线。事实或证据问题必须纠正，不能仅以审核苛刻为由忽略。
 返回同一Plan JSON格式，保留这个故事的完整冲突与结果。\n修复依据：""" + json.dumps(repair, ensure_ascii=False)
+    prompt += "\n不要让解说预借尚未播放的原声作证据：先保留完整原声，下一段可用反应画面解释刚听到的事实。不要把下一段原声的全部台词提前复述。"
     error = ""
     plan = None
+    # Retain failed drafts across a restart; source/cfg/signature bind the cache.
+    draft = root/'drafts'/f'{signature}.json'
+    raw = read_json(draft) if draft.exists() else None
+    if raw is None and measured_review and repair and repair.get('clip'):
+        raw = {'episode_summary':'当前选题', 'genre':'剧情', 'style':cfg.style,'clips':[repair['clip']]}
     for attempt in range(3):
-        raw = llm.json(system, prompt + error)
+        if raw is None:
+            raw = llm.json(system, prompt + error)
+        write_json(draft,raw)
         try:
-            plan = compile_plan(raw, lines, bounds)
+            plan = compile_plan(raw, lines, bounds,fit_narration=not measured_review)
             check(plan)
             break
         except ValueError as ex:
@@ -291,6 +332,11 @@ evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间�
                 last_report["clip"]=raw.get("clips",[None])[0] if raw.get("clips") else None
             last_report=enrich_constraints(last_report,lines,bounds,cfg)
             error="\n上次输出需修复（镜头与实际证据）："+json.dumps(last_report,ensure_ascii=False)
+            if measured_review and attempt < 2:
+                from .draft import repair_draft
+                raw = repair_draft(raw,last_report,lines,bounds,cfg,llm,root,signature,attempt)
+            else:
+                raw = None
     else:
         last_report["stage"] = "plan_validation"
         raise RepairNeeded(last_report)
@@ -320,7 +366,9 @@ evidence_ids 必须来自下方字幕ID，且至少一个与本段画面时间�
     # Review one story at a time. Mixing two storylines and a whole-episode summary
     # in one review encourages false attribution and demands to cover every subplot.
     voice_context = [m for m in maps if isinstance(m,dict) and m.get('voice_candidates')]
-    for i in range(len(plan.clips)):
+    # Production must subsequently measure and run the shared source/voice unit
+    # audit. Legacy callers keep their original review; this is never an approval.
+    for i in range(0 if measured_review else len(plan.clips)):
         previous_issues = []
         for attempt in range(3):
             clip = plan.clips[i]

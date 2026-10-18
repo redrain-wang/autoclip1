@@ -299,7 +299,10 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
             storyroot.mkdir(parents=True,exist_ok=True)
             relevant=[s for s in lines if s.start>=story.start and s.end<=story.end]
             brief = None
-            repair=None
+            from .draft import resume_report
+            repair=resume_report(storyroot,relevant,seconds,cfg,(story.start,story.end))
+            if repair:
+                console.print('复用结构较完整的失败草稿，修复未通过项；转写和整集分析使用缓存',markup=False)
             clip=None
             for attempt in range(cfg.repair_attempts+1):
                 try:
@@ -318,7 +321,7 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                     if voices is not None:
                         story_maps.append({'voice_policy':voices['policy'],'voice_candidates':review_voice_rows([
                             row for row in voices['lines'] if row['start']<story.end and row['end']>story.start])})
-                    plan=create_plan(video,storyroot,relevant,seconds,story_maps,local,llm,[],repair=repair,bounds=(story.start,story.end))
+                    plan=create_plan(video,storyroot,relevant,seconds,story_maps,local,llm,[],repair=repair,bounds=(story.start,story.end),measured_review=voices is not None)
                     clip=plan.clips[0]
                     check_footage(clip, story, existing+results)
                     write_json(storyroot/"plan.json",plan.model_dump())
@@ -334,6 +337,7 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                     write_json(storyroot/'transcript.json',[s.model_dump() for s in lines])
                     write_json(storyroot/'voice-evidence.json',voices)
                     def approve():
+                        console.print(f'{story.title}：实测配音并逐段核对画面、事实和声纹',markup=False)
                         try:
                             measured,report = complete_long_plan(video,plan,lines,voices,storyroot,local,llm,
                                 validate_clip=lambda c:check_footage(c,story,existing+results))
@@ -382,7 +386,11 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                     editorial=content_rejection(ex)
                     repair=enrich_constraints(repair_context(ex,clip,local),relevant,(story.start,story.end),local)
                     repair["repair_round"]=attempt+1
-                    write_json(storyroot/f"attempt-{attempt}.json",{"error":str(ex)[:2500],"repair":repair,"attempt":attempt+1})
+                    attempt_path=storyroot/f"attempt-{attempt}.json"
+                    if attempt_path.exists():
+                        old_attempt=read_json(attempt_path)
+                        write_json(storyroot/'attempt-history'/f'{digest(old_attempt)}.json',old_attempt)
+                    write_json(attempt_path,{"error":str(ex)[:2500],"repair":repair,"attempt":attempt+1})
                     if not editorial or attempt==cfg.repair_attempts or isinstance(ex,AutomaticReviewRejected):
                         destination=rejected if editorial else failures
                         destination.append({"title":story.title,"error":str(ex)[:2000],"issues":repair["issues"],"attempts":attempt+1})
@@ -393,9 +401,10 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
         write_json(root/"rejected.json",rejected)
         if stage=="all":
             write_json(root/"results.json",results)
-        status("部分完成" if failures else ("脚本完成" if stage=="plan" else "已完成"),clips=len(results),failures=len(failures),rejected=len(rejected))
+        no_delivery = stage=='all' and not results
+        status("未产出成片" if no_delivery else ("部分完成" if failures or rejected else ("脚本完成" if stage=="plan" else "已完成")),clips=len(results),failures=len(failures),rejected=len(rejected))
         return {"source":str(video),"candidates":len(selection.stories),"clips":len(results),"failures":failures,"rejected":rejected,
-                "status":"partial" if failures else "completed"}
+                "status":"no_delivery" if no_delivery else ("partial" if failures else "completed")}
     except Exception as ex:
         status("失败（可断点重试）",error=str(ex)[:2000])
         raise

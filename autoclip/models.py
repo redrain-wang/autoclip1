@@ -93,7 +93,8 @@ def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: 
             if any(s not in lookup for s in beat.evidence_ids):
                 errors.append(f"{label} 引用了不存在的字幕 ID")
             elif not any(eligible(lookup[s]) for s in beat.evidence_ids):
-                errors.append(f"{label} 没有落在画面区间内的字幕证据")
+                cited = ", ".join(f"[{s}] {lookup[s].start:.2f}–{lookup[s].end:.2f}" for s in beat.evidence_ids)
+                errors.append(f"{label} 没有落在画面区间内的字幕证据：画面{beat.start:.2f}–{beat.end:.2f}秒，引用{cited}；仅可引用当前或已展示的事实，不能预借后文对白")
             elif not any(lookup[s].confidence >= .4 and eligible(lookup[s]) for s in beat.evidence_ids):
                 errors.append(f"{label} 只有低置信度识别，不能据此写稿")
             context.update(s for s in beat.evidence_ids if s in lookup and lookup[s].start < beat.end and lookup[s].end > beat.start)
@@ -130,9 +131,11 @@ def validate_plan(plan: Plan, lines: list[Line], source_duration: float, count: 
         # Character-count timing is only a rough estimate; Chinese TTS and
         # punctuation vary considerably. Enforce the tighter limit after actual
         # synthesis rather than rejecting a valid story before measuring it.
-        estimate_ceiling = (max_seconds or target * 1.8) * (1.2 if target > 240 else 1)
+        estimate_ceiling = (max_seconds or target * 1.8) * 1.2
         if check_duration and not (min_seconds * .9 if min_seconds else target * .5) <= estimated <= estimate_ceiling:
-            errors.append(f"clips[{i}] 预计时长 {estimated:.0f} 秒不在目标范围内")
+            minimum, maximum = min_seconds or target*.6, max_seconds or target*1.8
+            difference = f"超出上限{estimated-maximum:.2f}秒" if estimated > maximum else f"距下限差{minimum-estimated:.2f}秒"
+            errors.append(f"clips[{i}] 预计时长 {estimated:.2f} 秒不在目标范围内：成片要求{minimum:.0f}–{maximum:.0f}秒，{difference}；这是字数估算，草稿允许上限20%估算误差，最终须真实配音实测通过")
     for i, a in enumerate(plan.clips):
         for b in plan.clips[i + 1:]:
             overlap = sum(max(0, min(x.end, y.end) - max(x.start, y.start)) for x in a.beats for y in b.beats)

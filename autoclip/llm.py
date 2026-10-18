@@ -44,6 +44,7 @@ class LLM:
             return read_json(cache)["result"]
         last_error = ""
         for attempt in range(3):
+            retry_wait = min(30,5 * 2**attempt)
             with self._lock:
                 if self.calls >= self.settings.max_api_calls:
                     raise RuntimeError("已达到本次 API 调用次数上限；提高 max_api_calls 后重试。")
@@ -55,6 +56,11 @@ class LLM:
                     # Never log request headers, key, full payload, or remote error body.
                     if response.status_code not in (429, 500, 502, 503, 504):
                         raise ValueError(f"模型接口 HTTP {response.status_code}；请检查模型权限/余额/图片支持")
+                    retry_wait = 15*(attempt+1) if response.status_code==429 else retry_wait
+                    try:
+                        retry_wait = min(60,max(retry_wait,float(response.headers.get('Retry-After','0'))))
+                    except ValueError:
+                        pass
                     raise RuntimeError(f"模型接口 HTTP {response.status_code}")
                 body = response.json()
                 choice = body["choices"][0]
@@ -73,7 +79,8 @@ class LLM:
                 return result
             except (httpx.TransportError, RuntimeError, json.JSONDecodeError) as ex:
                 last_error = str(ex)
-                time.sleep(min(2 ** attempt, 4))
+                if attempt<2:
+                    time.sleep(retry_wait)
         raise RuntimeError(f"模型调用失败，已重试：{last_error}")
 
     def usage(self):

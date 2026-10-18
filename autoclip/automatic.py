@@ -313,6 +313,14 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
         if uid not in targets:
             raise ValueError('局部修订收到不存在的单位')
         target = targets[uid]
+        max_characters = None
+        measured = next((i.get('measurement') for i in issues if i['id']==uid and i.get('measurement')),None)
+        if uid.startswith('beat-') and measured and measured.get('voice_seconds',0)>0:
+            from .budget import spoken_characters
+            available = (target['end']-target['start'])*(1.4 if cfg.target_seconds>=150 else 1.28)-.35
+            if available < measured['voice_seconds']:
+                current_chars = spoken_characters(target['text'])
+                max_characters = max(5,min(current_chars-1,int(current_chars*available/measured['voice_seconds']*.92)))
         restored = restore_original_prefix(revised,uid,lines,cfg,source_seconds)
         if restored is not None:
             index = int(uid.split('-')[1])-1
@@ -346,6 +354,10 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
               f'\n问题{json.dumps([i for i in issues if i["id"]==uid],ensure_ascii=False)}\n完整稿件（仅供衔接）{revised.model_dump_json()}'
               f'\n可用字幕{json.dumps([s.model_dump() for s in lines if s.id in eligible],ensure_ascii=False)}'
               f'\n人物候选{json.dumps(review_voice_rows([r for r in voices.get("lines",[]) if r["line_id"] in eligible]),ensure_ascii=False)}')
+        if max_characters is not None:
+            prompt += (f'\n本次为真实配音超出画面余量的缩写：text有效字数必须不超过{max_characters}字（不含标点）。'
+                       '必须实质删掉重复复述，只保留必要承接或必要事实，不能仅换同义词、添语气词或照抄。'
+                       '压缩不得歪曲事实或删除必要限定；后续仍重新配音和独立审核。')
         feedback = ''
         for retry in range(cfg.repair_attempts+1):
             raw = llm.json('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback)
@@ -362,9 +374,13 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                 if not set(cited).issubset(eligible):
                     raise ValueError(f'当前单位引用了未允许证据；只能使用{sorted(eligible)}')
                 candidate = apply_plan_changes(revised,raw,{uid})
+                if max_characters is not None and spoken_characters(candidate.clips[0].beats[int(uid.split('-')[1])].text)>max_characters:
+                    raise ValueError(f'实测时长修复没有落实缩写：当前口播必须不超过{max_characters}个有效字')
                 if source_seconds is not None:
                     validate_plan(candidate,lines,source_seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
                     for index,b in enumerate(candidate.clips[0].beats):
+                        if uid not in {f'beat-{index}',f'original-{index}'}:
+                            continue  # untouched units still undergo the full source audit
                         teaser = set(candidate.clips[0].beats[0].evidence_ids) if cfg.opening=='original_teaser' and index==1 else set()
                         if any(lookup[i].start>=b.end and i not in teaser for i in b.evidence_ids):
                             raise ValueError(f'镜头{index}修订引用了尚未播放的未来对白')

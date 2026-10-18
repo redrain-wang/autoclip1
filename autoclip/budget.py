@@ -50,8 +50,7 @@ def story_budget(lines, bounds, cfg, report=None):
     result["speech_rate"] = {"characters_per_second": round(rate, 3),
                              "basis": "same_script_measured_tts" if voices else "initial_estimate",
                              "note": "不含标点；仅供重写预算，最终仍合成并实测"}
-    if beats:
-        original_target = sum(b["end"]-b["start"] for b in beats if b["mode"] == "original")
+    current_original = sum(b["end"]-b["start"] for b in beats if b["mode"] == "original") if beats else None
     result["planning_reference"] = {
         "target_output_seconds": cfg.target_seconds,
         "original_seconds": round(original_target, 3),
@@ -69,7 +68,8 @@ def story_budget(lines, bounds, cfg, report=None):
                               "seconds": round(end-start, 3),
                               "complete_lines": [s.model_dump() for s in complete],
                               "has_complete_dialogue": bool(complete)})
-    result.update(original_seconds=round(original_target, 3),
+    result.update(original_seconds=round(current_original, 3),
+                  original_excess_above_target_seconds=round(max(0,current_original-original_target),3),
                   unused_source_seconds=round(sum(b-a for a, b in gaps), 3),
                   unused_intervals=opportunities)
     total = (report or {}).get("measured_total_seconds")

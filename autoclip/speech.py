@@ -65,10 +65,16 @@ def edge_synthesize(text, target, boundaries, cfg):
             except Exception as ex:
                 target.unlink(missing_ok=True)
                 boundaries.unlink(missing_ok=True)
+                code = getattr(ex, "status", None)
                 if attempt == 2:
-                    code = getattr(ex, "status", None)
                     raise RuntimeError(f"Edge配音服务失败（{type(ex).__name__}，HTTP {code or '未知'}）；重试或明确选择azure/macos。") from None
-                await asyncio.sleep(2 ** attempt)
+                delay = 15*(attempt+1) if code==429 else 2**attempt
+                if code==429:
+                    try:
+                        delay = min(60,max(delay,float((getattr(ex,'headers',None) or {}).get('Retry-After','0'))))
+                    except ValueError:
+                        pass
+                await asyncio.sleep(delay)
 
     with _EDGE_LOCK:
         previous = communicate.WSS_URL

@@ -524,7 +524,7 @@ def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目
     console.print(f"新片浏览页：{build_report(cfg.output)}")
     if stage=="all" and not any(row.get("clips",0) for row in outcomes):
         console.print("本批未生成成片；详细原因已保存到 batch.json。处理结束不代表候选已通过。",markup=False)
-    if any(row["status"] in {"failed","partial"} for row in outcomes):
+    if any(row["status"] in {"failed","partial","no_delivery"} for row in outcomes):
         raise typer.Exit(1)
 
 
