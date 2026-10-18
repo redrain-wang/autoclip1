@@ -55,7 +55,7 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
                 return {'items':[{'id':i,'text':'事情从这次问答展开。有人提出问题，对方随后作了回应，双方的谈话仍在继续。','evidence_ids':[i]} for i in (1,3)]}
             if '\nunits=' in prompt:
                 group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
-                return {'passed':True,'issues':[],'units':[{'id':u['id'],'verdict':'supported','reason':'测试证据相符',
+                return {'issues':[],'units':[{'id':u['id'],'verdict':'supported','reason':'测试证据相符',
                     'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],'identity_basis':'no_identity_claim'} for u in group]}
             raise AssertionError(system)
     monkeypatch.setattr(series,'LLM',Model)

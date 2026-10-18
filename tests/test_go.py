@@ -72,6 +72,27 @@ def test_go_cache_records_endpoint_without_credentials(tmp_path, monkeypatch):
     finally: m.client.close()
 
 
+@pytest.mark.parametrize('endpoint,model,effort',[
+    ('https://opencode.ai/zen/go/v1','deepseek-v4.1-flash','none'),
+    ('https://opencode.ai/zen/go/v1','deepseek-flash','none'),
+    ('https://api.deepseek.com','deepseek-flash',None),
+    ('https://opencode.ai/zen/go/v1','glm-5.3',None),
+])
+def test_reasoning_switch_is_scoped_to_go_deepseek(tmp_path,monkeypatch,endpoint,model,effort):
+    monkeypatch.setenv('OPENCODE_API_KEY','go-test-key')
+    monkeypatch.setenv('DEEPSEEK_API_KEY','direct-test-key')
+    client=httpx.Client
+    def respond(request):
+        body=json.loads(request.content)
+        assert body.get('reasoning_effort')==effort
+        assert body['thinking']=={'type':'disabled'}
+        return httpx.Response(200,json={'choices':[{'finish_reason':'stop','message':{'content':'{"ok":true}'}}]})
+    monkeypatch.setattr('autoclip.llm.httpx.Client',lambda **kwargs:client(transport=httpx.MockTransport(respond),**kwargs))
+    m=LLM(Settings(llm_base_url=endpoint,llm_model=model),tmp_path)
+    try:assert m.json('system','prompt')=={'ok':True}
+    finally:m.client.close()
+
+
 @pytest.mark.parametrize('always_truncated', [False, True])
 def test_truncated_response_uses_bounded_larger_budget_without_caching_partial_json(tmp_path, monkeypatch, always_truncated):
     monkeypatch.setenv('OPENCODE_API_KEY', 'go-test-key')

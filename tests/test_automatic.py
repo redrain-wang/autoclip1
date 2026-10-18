@@ -81,6 +81,16 @@ def test_valid_review_is_accepted():
     assert assess_batch(*review_fixture()) == []
 
 
+@pytest.mark.parametrize('passed',[False,True])
+def test_new_unit_response_never_accepts_a_model_aggregation_switch(passed):
+    from autoclip.automatic import UnitReviews
+    raw=review_fixture()[0];raw['passed']=passed
+    with pytest.raises(ValueError,match='Extra inputs'):
+        UnitReviews.model_validate(raw)
+    raw.pop('passed')
+    assert len(UnitReviews.model_validate(raw).units)==1
+
+
 def test_supported_verdict_with_future_citation_requires_recheck_instead_of_script_rewrite():
     args=review_fixture();args[1][0]['end']=4
     with pytest.raises(ValueError,match='声称有据但引用未来对白'):
@@ -220,7 +230,7 @@ def test_review_protocol_retry_keeps_script_and_supplies_previous_shown_context(
             prompts.append(prompt)
             group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0];groups.append(group)
             if len(prompts)==1:return {'passed':False,'issues':[],'units':[]}
-            return {'passed':True,'issues':[],'units':[{'id':u['id'],'verdict':'supported',
+            return {'issues':[],'units':[{'id':u['id'],'verdict':'supported',
                 'reason':'给定字幕与画面相符','evidence_ids':[0],'frame_ids':[0],
                 'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
     report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(),Model())
@@ -249,3 +259,100 @@ def test_automatic_approval_binds_exact_plan_voice_and_frames(tmp_path):
     with pytest.raises(ValueError):assert_approval(report,video,plan,lines,{'library_digest':'new'},)
     frame.write_bytes(b'edited')
     with pytest.raises(ValueError):assert_approval(report,video,plan,lines,voices)
+
+
+@pytest.mark.parametrize('broken_cut',[False,True])
+def test_originals_have_separate_review_scope_but_real_cut_failures_still_block(tmp_path,monkeypatch,broken_cut):
+    import json
+    import autoclip.automatic as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'frame')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    plan=sample_plan()
+    for i in (0,2):plan.clips[0].beats[i].mode='original';plan.clips[0].beats[i].text=''
+    before=plan.model_dump()
+    lines=[Line(id=i,start=i*10+.5,end=(i+1)*10-.5,text='当前对白') for i in range(4)]
+    rows=[{'line_id':i,'status':'unknown','samples':[{'name':None,'status':'unknown',
+        'candidates':[{'name':'RANK_ONLY_NOT_AN_IDENTITY','score':.2}]}]} for i in range(4)]
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':rows}
+    original_attempts=[]
+    class Model:
+        def json(self,system,prompt,images):
+            assert 'RANK_ONLY_NOT_AN_IDENTITY' not in prompt
+            timeline=json.JSONDecoder().raw_decode(prompt.split('\nviewer_timeline=',1)[1])[0]
+            assert len(timeline)==len(plan.clips[0].beats)
+            assert timeline[1]['text']==plan.clips[0].beats[1].text
+            assert all('reason' not in row for row in timeline)
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+            original=any(u.get('mode')=='original' for u in group)
+            if original:
+                assert all(u.get('mode')=='original' and u['source_continuity']=='single_uncut_interval' for u in group)
+                assert '\n声音候选=' not in prompt
+                original_attempts.append(1)
+            invalid_scope=original and len(original_attempts)==1
+            return {'issues':[],'notes':[],
+                'units':[{'id':u['id'],'verdict':'contradicted' if original and broken_cut else 'supported',
+                    'reason':'切点截断对白' if original and broken_cut else '对白切点和承接完整',
+                    'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
+                    'identity_basis':'insufficient' if invalid_scope else 'no_identity_claim',
+                    'subjects':[]} for u in group]}
+    report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(),Model())
+    assert report['passed'] is (not broken_cut)
+    assert len(original_attempts)==2 and plan.model_dump()==before
+    assert list(tmp_path.glob('automatic-review/*/batch-*-protocol-0.json'))
+    assert all(i['id'].startswith('original-') for i in report['issues'])
+
+
+@pytest.mark.parametrize('case',['complete_audio','cut_dialogue','service_error'])
+def test_failed_short_bridge_can_only_retain_complete_source_audio_and_needs_review(tmp_path,case):
+    import json
+    plan=Plan(episode_summary='',genre='',style='',clips=[Clip(title='短承接保留原声',angle='',hook='',beats=[
+        Beat(mode=mode,start=a,end=b,text='前段交代事情的来由' if mode=='narration' else '',evidence_ids=[i],reason='承接')
+        for i,(mode,a,b) in enumerate([('original',0,12),('narration',12,20),('original',20,32),
+                                       ('narration',32,36),('original',36,48)])])])
+    before=plan.model_dump()
+    lines=[Line(id=i,start=a,end=b,text='完整对白') for i,(a,b) in enumerate([(1,11),(13,19),(21,31),(32.4,35.6),(37,47)])]
+    if case=='cut_dialogue':lines[3].end=36.7
+    cfg=Settings(duration_profile='long',target_seconds=300,min_seconds=30,max_seconds=600,opening='original',repair_attempts=1)
+    class Model:
+        def json(self,system,prompt):
+            target=json.JSONDecoder().raw_decode(prompt.split('\ntarget=',1)[1])[0]
+            if target['id']=='beat-1':return {'changes':[{'id':'beat-1','text':'前段先交代这件事的来由'}]}
+            if case=='service_error':raise RuntimeError('service unavailable')
+            return {'changes':[{'id':'beat-3','start':33,'end':33.7,'text':'这里接话了'}]}
+    issues=[{'id':'beat-1','message':'自然承接'},{'id':'beat-3','message':'修复短承接'}]
+    if case!='complete_audio':
+        with pytest.raises(RuntimeError if case=='service_error' else ValueError):
+            repair_plan(plan,issues,lines,{},tmp_path,cfg,Model(),0,source_seconds=48)
+        assert not list(tmp_path.rglob('source-audio-fallback.json'))
+    else:
+        revised=repair_plan(plan,issues,lines,{},tmp_path,cfg,Model(),0,source_seconds=48)
+        b=revised.clips[0].beats[3]
+        assert (b.mode,b.start,b.end,b.text,b.evidence_ids)==('original',32,36,'',[3])
+        assert revised.clips[0].beats[1].text=='前段先交代这件事的来由'
+        for i in (0,2,4):assert revised.clips[0].beats[i]==plan.clips[0].beats[i]
+        from autoclip.util import read_json
+        assert read_json(next(tmp_path.rglob('source-audio-fallback.json')))['status']=='requires_full_review'
+        assert not (tmp_path/'plan-approved.json').exists()
+    assert plan.model_dump()==before
+
+
+@pytest.mark.parametrize('adjacent',[False,True])
+def test_original_prefix_restoration_requires_exact_adjacent_complete_source(adjacent):
+    from autoclip.automatic import restore_original_prefix
+    plan=Plan(episode_summary='',genre='',style='',clips=[Clip(title='还原完整句子',angle='',hook='',beats=[
+        Beat(mode=mode,start=a,end=b,text='交代这场问答的经过' if mode=='narration' else '',evidence_ids=[i],reason='承接')
+        for i,(mode,a,b) in enumerate([('original',0,12),('narration',12,20),('original',20,32),
+                                       ('narration',32,36),('original',36,48)])])])
+    plan.clips[0].beats[4].evidence_ids=[3,4]
+    if not adjacent:plan.clips[0].beats[3].end=35
+    before=plan.model_dump()
+    lines=[Line(id=i,start=a,end=b,text='完整对白') for i,(a,b) in enumerate([(1,11),(13,19),(21,31),(32.4,35.6),(37,47)])]
+    cfg=Settings(duration_profile='long',target_seconds=300,min_seconds=30,max_seconds=600,opening='original')
+    revised=restore_original_prefix(plan,'original-4',lines,cfg,48)
+    if adjacent:
+        assert revised.clips[0].beats[3].mode=='original'
+        assert revised.clips[0].beats[3].evidence_ids==[3]
+        for i in (0,1,2,4):assert revised.clips[0].beats[i]==plan.clips[0].beats[i]
+    else:assert revised is None
+    assert plan.model_dump()==before

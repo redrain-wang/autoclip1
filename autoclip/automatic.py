@@ -7,12 +7,13 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from .identity import units_for_clip, file_hash
+from .editorial import audience_script
 from .ingest import contact_sheet
 from .models import Plan, Beat, validate_plan, evidence_matches
 from .util import digest, read_json, source_identity, write_json
 from .voices import match_batch
 
-VERSION = 'automatic-review-5'
+VERSION = 'automatic-review-8'
 
 
 def link_voice_evidence(video, lines, library, manifest):
@@ -62,11 +63,31 @@ class UnitIssue(BaseModel):
     message: str = Field(min_length=1)
 
 
-class ReviewBatch(BaseModel):
+class UnitReviews(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    passed: StrictBool
     units: list[UnitDecision]
     issues: list[UnitIssue]
+    notes: list[UnitIssue] = Field(default_factory=list)
+
+
+class ReviewBatch(UnitReviews):
+    passed: StrictBool
+
+
+class OriginalDecision(UnitDecision):
+    identity_basis: Literal['no_identity_claim']
+    subjects: list[str] = Field(default_factory=list,max_length=0)
+
+
+class OriginalReviewBatch(UnitReviews):
+    units: list[OriginalDecision]
+
+
+def review_voice_rows(rows):
+    """Keep actual accepted names and uncertainty; ranks below the gate aren't identities."""
+    return [{**{k:v for k,v in row.items() if k!='samples'},
+             'samples':[{k:v for k,v in sample.items() if k!='candidates'} for sample in row.get('samples',[])]}
+            for row in rows]
 
 
 def assess_batch(raw, units, lines, frame_count, voice_rows):
@@ -85,6 +106,8 @@ def assess_batch(raw, units, lines, frame_count, voice_rows):
         if not set(unit.evidence_ids).issubset(lookup) or any(i<0 or i>=frame_count for i in unit.frame_ids):
             raise ValueError('自动审核引用了未提供的证据或画面')
         target = expected[unit.id]
+        if target.get('mode')=='original' and (unit.identity_basis!='no_identity_claim' or unit.subjects):
+            raise ValueError(f'{unit.id} 是没有新增身份主张的原声；只核对剪辑，不能因说话人姓名未知改写原声')
         if 'end' in target and any(lookup[i].start >= target['end'] and i not in target.get('shown_evidence',[]) for i in unit.evidence_ids):
             if unit.verdict == 'supported':
                 raise ValueError(f'{unit.id} 声称有据但引用未来对白；请重核引用与结论，不能据此直接改稿')
@@ -115,7 +138,8 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
     clip = plan.clips[0]
     units = units_for_clip(clip)
     # Original footage is audited too: an edit may otherwise invent a response.
-    units += [{'id':f'original-{i}', 'mode':'original', 'text':'连续原声：核对对白切点、问答顺序与场景承接', 'start':b.start, 'end':b.end,
+    units += [{'id':f'original-{i}', 'mode':'original', 'source_continuity':'single_uncut_interval',
+               'text':'连续原声：核对对白切点、问答顺序与场景承接', 'start':b.start, 'end':b.end,
                'evidence_ids':b.evidence_ids} for i,b in enumerate(clip.beats) if b.mode == 'original']
     lookup = {s.id:s for s in lines}
     for unit in units:
@@ -127,8 +151,16 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
     key = digest({'v':VERSION,'plan':plan.model_dump(),'voices':voices,'model':cfg.llm_model,'endpoint':cfg.llm_base_url})
     folder = root/'automatic-review'/key
     all_issues, batches, frames = [], [], []
-    def review_group(offset):
-        group = units[offset:offset+3]
+    groups = []
+    offset = 0
+    for subset in ([u for u in units if u.get('mode')!='original'],[u for u in units if u.get('mode')=='original']):
+        for start in range(0,len(subset),3):
+            group = subset[start:start+3]
+            groups.append((offset,group))
+            offset += len(group)
+    def review_group(job):
+        offset,group = job
+        original = all(u.get('mode')=='original' for u in group)
         ids = {i for u in group for i in u.get('evidence_ids',[]) + u.get('shown_evidence',[])}
         # Metadata is checked against the actual selected footage, not an invented summary.
         if any('start' not in u for u in group):
@@ -144,12 +176,14 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
             selected_beats = [clip.beats[round(i*(len(clip.beats)-1)/max(1,count-1))] for i in range(count)]
             times = sorted({round((b.start+b.end)/2,3) for b in selected_beats})
         sheet = contact_sheet(video,folder/f'batch-{offset}-images',times,f'batch-{offset}')
-        evidence = [r for r in voices['lines'] if r['line_id'] in {s.id for s in selected}]
+        evidence = review_voice_rows([r for r in voices['lines'] if r['line_id'] in {s.id for s in selected}]) if not original else []
         prompt = ('逐项核对文本事实、人物行为归属、画面相关性、连续原声切点、场景承接和重复解释。'
                   '不能因同一模型写稿就默认正确。声纹是候选；画面人物可能是听者。'
                   '声纹有冲突时只能以明确叫名与连续问答核实，否则unknown；不能凭剧名记忆认人。'
                   '身份依据分为无身份主张、声纹加语境、明确称呼回应、依据不足。泛称仍可能有身份主张。'
                   'subjects列出涉及身份归属的实际人物名；声纹加语境必须列出与当前候选一致的名字。'
+                  '区分说话人、被称呼者和被提及者。“四爷和十三爷被叫住”没有指认喊话人，不能因喊话人声纹未知否定被称呼者。用清楚称呼/回应核实相应角色，不能混淆主客体。'
+                  '没有姓名、关系或特定人物暗示的中性叙述（例如当前确实有人说“记住”），若字幕及画面支持，可用no_identity_claim；不要求查出这位说话人的姓名。仍禁止用泛称掩盖错误的特定人物行为。'
                   '不得把承诺写成结果，不能预支当前镜头后文；shown_evidence是此单位之前观众已看到的对白，可支持承接与回顾。分析须与事实分开。'
                   'original单位只有原片本身的连续声音与画面，没有新增旁白或人物标签；只核对切点是否破坏完整对白、伪造问答因果。'
                   '原声本身没有新增身份主张时identity_basis=no_identity_claim、subjects=[]。'
@@ -159,16 +193,37 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                   '只审核本批units；不要求其他批次的标题或镜头出现在这里。每个问题都写具体id，不把单段问题复制给所有单位。'
                   '时间区间包含start、不包含end；end恰好等于下一条字幕start并未剪入该字幕，不得据此误判截断或预支。'
                   '图片编号按times顺序从0开始。证据必须来自给定字幕；每个单位至少引用一条字幕及一幅画面。'
-                  '任何未知或错误均passed=false，issues每项只含id和message，指向本批的具体单位；不要直接修稿。'
-                  f'\n格式{json.dumps(ReviewBatch.model_json_schema(),ensure_ascii=False)}'
+                  '任何未知或错误均逐项标unknown/contradicted，issues每项只含id和message；不要直接修稿。不返回passed总开关，整批是否通过由程序按逐项结论和问题汇总。'
+                  'issues只列真正需要修复的错误，已支持的说明、同音疑点已排除、无需认定身份等观察写notes，不列issues。'
+                  'viewer_timeline提供实际前后剪辑稿；shown_evidence列此前选用的证据，不等于这些对白全部以原声播放，须对照mode和实际旁白text。不得预支后文。'
+                  '回顾上一镜头已经发生的事情不要求该事情在当前画面再发生一次；须有此前证据并自然承接，不能把回顾误判成预支未来。'
+                  f'\n格式{json.dumps(UnitReviews.model_json_schema(),ensure_ascii=False)}'
                   f'\nunits={json.dumps(group,ensure_ascii=False)}\ntimes={times}'
                   f'\n字幕={json.dumps([s.model_dump() for s in selected],ensure_ascii=False)}'
-                  f'\n声音候选={json.dumps(evidence,ensure_ascii=False)}')
+                  f'\n声音候选={json.dumps(evidence,ensure_ascii=False)}'
+                  f'\nviewer_timeline={json.dumps(audience_script(clip),ensure_ascii=False)}')
+        if original:
+            prompt = ('只审核本批连续原声的剪辑：切点是否切断完整对白、是否因剪接伪造问答因果或丢失必要承接。'
+                '这些单位没有新增旁白、姓名标签或角色署名，text只是待核事项，不是观众会听到的附加断言。'
+                '不要求先认出演员或说话人姓名；姓名未知本身不是剪辑错误，不据此标unknown。identity_basis固定no_identity_claim、subjects固定空数组。'
+                'source_continuity=single_uncut_interval是渲染约束：start到end内保留原片全部连续音画，没有本系统内部删剪；字幕空白间隔内的声音及画面也完整保留，不能仅因字幕间有停顿就怀疑本系统剪掉了对白。只检查本系统选取的边界与跨单位承接，不重审原剧导演本身的剪接。'
+                '若切点、问答或承接本身不清楚仍须unknown；实质剪辑问题须拒绝，不能因没有身份主张就默认支持。'
+                'ASR同音字形不等于实际对白错误；区间含start、不含end，end等于下条字幕start没有剪入下条对白。'
+                'issues仅列实际待修问题，已排除的疑点与解释放notes。每项结论必须引用提供的字幕与图片编号，图片从0编号。'
+                '先对照viewer_timeline中的实际相邻原声和旁白，再判断缺失承接；当前单位evidence_ids不是全部所提供的上下文。原声听到字幕内容，旁白听到text，不能混为一谈。'
+                '不要返回passed总开关；程序按每个单位的verdict及issues汇总。未知或实际错误仍须逐项拒绝。'
+                f'\n格式{json.dumps(OriginalReviewBatch.model_json_schema(),ensure_ascii=False)}'
+                f'\nunits={json.dumps(group,ensure_ascii=False)}\ntimes={times}'
+                f'\n字幕={json.dumps([s.model_dump() for s in selected],ensure_ascii=False)}'
+                f'\nviewer_timeline={json.dumps(audience_script(clip),ensure_ascii=False)}')
         feedback = ''
         for retry in range(cfg.repair_attempts+1):
             raw = llm.json('你是独立的影视内容与人物证据审核员，不读取人工答案。',prompt+feedback,[sheet])
             try:
-                issues = assess_batch(raw,group,selected,len(times),evidence)
+                decisions = (OriginalReviewBatch if original else UnitReviews).model_validate(raw)
+                checked = decisions.model_dump()
+                checked['passed'] = not decisions.issues and all(u.verdict=='supported' for u in decisions.units)
+                issues = assess_batch(checked,group,selected,len(times),evidence)
                 break
             except ValueError as exc:
                 write_json(folder/f'batch-{offset}-protocol-{retry}.json',{'raw':raw,'error':str(exc)})
@@ -182,7 +237,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
     # locked request allowance. No partial batch constitutes an approval.
     with ThreadPoolExecutor(max_workers=2) as pool:
         try:
-            for issues,batch,frame in pool.map(review_group,range(0,len(units),3)):
+            for issues,batch,frame in pool.map(review_group,groups):
                 all_issues.extend(issues)
                 batches.append(batch)
                 frames.append(frame)
@@ -198,6 +253,44 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
     return report
 
 
+def retain_short_source_audio(plan, uid, lines, cfg, source_seconds):
+    """A failed short bridge may keep real audio, never invented replacement speech."""
+    if source_seconds is None or not uid.startswith('beat-'):
+        return None
+    index = int(uid.split('-')[1])
+    before = plan.clips[0].beats[index]
+    if before.mode!='narration' or not 1<=before.end-before.start<=8:
+        return None
+    if any(s.start+.001<cut<s.end-.001 for s in lines for cut in (before.start,before.end)):
+        return None
+    ids = [s.id for s in lines if s.start>=before.start-.001 and s.end<=before.end+.001]
+    if not ids:
+        return None
+    revised = plan.model_copy(deep=True)
+    revised.clips[0].beats[index] = Beat(mode='original',start=before.start,end=before.end,
+        text='',evidence_ids=ids,reason='短承接修稿失败，保留当前区间完整真实对白；仍须重新核对剪辑和全稿')
+    try:
+        validate_plan(revised,lines,source_seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+    except ValueError:
+        return None
+    return revised
+
+
+def restore_original_prefix(plan, uid, lines, cfg, source_seconds):
+    """Restore a cited leading phrase covered by the immediately preceding bridge."""
+    if not uid.startswith('original-') or source_seconds is None:
+        return None
+    index = int(uid.split('-')[1])
+    if index==0:
+        return None
+    before,current = plan.clips[0].beats[index-1:index+1]
+    if before.mode!='narration' or abs(before.end-current.start)>.04:
+        return None
+    if not any(s.id in current.evidence_ids and before.start<=s.start<s.end<=current.start+.001 for s in lines):
+        return None
+    return retain_short_source_audio(plan,f'beat-{index-1}',lines,cfg,source_seconds)
+
+
 def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_seconds=None):
     """Repair one failed unit at a time, keeping validated edits and shot IDs."""
     revised = plan.model_copy(deep=True)
@@ -210,6 +303,16 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
         if uid not in targets:
             raise ValueError('局部修订收到不存在的单位')
         target = targets[uid]
+        restored = restore_original_prefix(revised,uid,lines,cfg,source_seconds)
+        if restored is not None:
+            index = int(uid.split('-')[1])-1
+            change = {'id':uid,'operation':'restore_original_prefix','affected_beat':index,
+                'before':revised.clips[0].beats[index].model_dump(),
+                'after':restored.clips[0].beats[index].model_dump(),'status':'requires_full_review'}
+            write_json(root/'automatic-repairs'/str(attempt)/uid/'source-context-fallback.json',change)
+            revised = restored
+            accepted.append(change)
+            continue
         if uid in {'title','angle','hook'}:
             eligible = {i for b in clip.beats for i in b.evidence_ids}
             fields = '当前只允许id、text两个字段；title须2–32字，angle/hook必须是当前选用片段能支持的内容。'
@@ -232,7 +335,7 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
               f'\ntarget={json.dumps(target,ensure_ascii=False)}\nallowed_evidence_ids={sorted(eligible)}'
               f'\n问题{json.dumps([i for i in issues if i["id"]==uid],ensure_ascii=False)}\n完整稿件（仅供衔接）{revised.model_dump_json()}'
               f'\n可用字幕{json.dumps([s.model_dump() for s in lines if s.id in eligible],ensure_ascii=False)}'
-              f'\n人物候选{json.dumps([r for r in voices.get("lines",[]) if r["line_id"] in eligible],ensure_ascii=False)}')
+              f'\n人物候选{json.dumps(review_voice_rows([r for r in voices.get("lines",[]) if r["line_id"] in eligible]),ensure_ascii=False)}')
         feedback = ''
         for retry in range(cfg.repair_attempts+1):
             raw = llm.json('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback)
@@ -264,6 +367,17 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
             except ValueError as exc:
                 write_json(record,{'raw':raw,'error':str(exc)})
                 if retry == cfg.repair_attempts:
+                    fallback = retain_short_source_audio(revised,uid,lines,cfg,source_seconds)
+                    if fallback is not None:
+                        index = int(uid.split('-')[1])
+                        change = {'id':uid,'operation':'retain_source_audio',
+                            'before':revised.clips[0].beats[index].model_dump(),
+                            'after':fallback.clips[0].beats[index].model_dump(),
+                            'status':'requires_full_review'}
+                        write_json(record.with_name('source-audio-fallback.json'),change)
+                        revised = fallback
+                        accepted.append(change)
+                        break
                     raise
                 feedback = '\n上轮局部修订未通过程序检查：'+str(exc)[:1800]+'\n上轮修订：'+json.dumps(raw,ensure_ascii=False)+'\n只返回当前target的合法修改，不能换段、清空口播、变更mode或突破原片时间线。'
     write_json(root/f'automatic-repair-{attempt}.json',{'changes':accepted})
