@@ -21,6 +21,8 @@ def prepare_project(source, paths, cfg, library=None, voice_manifest=None, model
     library = Path(library or saved.get('library') or enrollment/'registry.json').resolve()
     if not library.exists() and library != (enrollment/'registry.json').resolve():
         raise ValueError(f'声纹库文件不存在：{library}')
+    if library.exists():
+        apply_confirmed_followups(output,library,cfg.series)
     def location(name,value):
         return Path(value or saved[name]).resolve() if value or saved.get(name) else None
     voice_manifest = location('voice_manifest',voice_manifest)
@@ -60,6 +62,114 @@ def prepare_project(source, paths, cfg, library=None, voice_manifest=None, model
     write_json(output/'voice-status.json',{'status':'ready','library_digest':project['library_digest']})
     return {**project,'status':'ready','bank':bank,'library':library,'voice_manifest':voice_manifest,
             'model_path':model_path,'voice_python':voice_python}
+
+
+def apply_confirmed_followups(output, library, series):
+    """Only finished human enrollment can append references to its original bank."""
+    import fcntl
+    from .voices import registry, merge_libraries
+    for pointer in output.glob('*/voice-followup.json'):
+        task = read_json(pointer)
+        if task.get('status') in {'applied','resolved'} or task.get('library')!=str(library.resolve()):continue
+        folder = Path(task['review_root'])
+        if not (folder/'review.json').exists():continue
+        manifest,review = read_json(folder/'manifest.json'),read_json(folder/'review.json')
+        if review.get('enrollment',{}).get('status')!='finished':continue
+        if review['dataset_id']!=manifest['dataset_id']:raise ValueError('新增声纹确认记录与候选批次不符')
+        if task.get('source')!=source_identity(Path(task['source']['path'])):
+            raise ValueError('新增声音的原片已改变，请重新准备')
+        if not any(s['source']==task['source'] for s in manifest['sources']):
+            raise ValueError('新增声音确认页与原片不符')
+        additions = registry(manifest,review)
+        if not additions.get('characters'):continue
+        validate_voice_library(additions,series)
+        with library.with_suffix('.enrollment.lock').open('w') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            current = read_json(library)
+            validate_voice_library(current,series)
+            combined = merge_libraries([current,additions])
+            old_samples = {s['id'] for p in current['characters'] for s in p['samples']}
+            if all(s['id'] in old_samples for p in additions['characters'] for s in p['samples']):
+                combined = current  # A crash after writing the bank must not append it twice.
+            validate_voice_library(combined,series)
+            write_json(library.parent/'history'/f'{library.stem}-{digest(current)}.json',current)
+            write_json(library,combined)
+        write_json(pointer,{**task,'status':'applied','review_revision':review['revision'],
+                            'library_digest':digest(combined)})
+
+
+def prepare_voice_followup(video, lines, voices, root, cfg, library, story_roots,
+                           model_path=None, voice_python=None):
+    """Collect only unresolved identity evidence; never prefill character names."""
+    import re
+    from .series import prepare_audio_candidates
+    from .voice_review import ReviewStore
+    from .voices import candidate_spans
+    selected,requests = {},[]
+    lookup = {s.id:s for s in lines}
+    transcript_digest = digest([s.model_dump() for s in lines])
+    for folder in story_roots:
+        if not all((folder/name).exists() for name in ('automatic-review.json','plan-timed.json')):continue
+        report,plan = read_json(folder/'automatic-review.json'),Plan.model_validate(read_json(folder/'plan-timed.json'))
+        if (report.get('passed') or report.get('source')!=source_identity(video)
+                or report.get('transcript_digest')!=transcript_digest
+                or report.get('plan_digest')!=digest(plan.model_dump()) or report.get('voice_digest')!=digest(voices)):
+            continue
+        for issue in report.get('issues',[]):
+            match = re.fullmatch(r'beat-(\d+)',issue['id'])
+            if not match or not re.search(r'声音|身份|人物|主语|说话人',issue['message']):continue
+            index=int(match[1])
+            if index>=len(plan.clips[0].beats):continue
+            beat=plan.clips[0].beats[index]
+            possible=[lookup[i] for i in beat.evidence_ids if i in lookup]
+            valid_ids={s['line_id'] for s in candidate_spans(possible,max(s.end for s in lines))}
+            candidates=sorted((s for s in possible if s.id in valid_ids and s.confidence>=.4),
+                               key=lambda s:-(s.end-s.start)*s.confidence)[:2]
+            selected.update((s.id,s) for s in candidates)
+            requests.append({'unit':issue['id'],'reason':issue['message'],'line_ids':[s.id for s in candidates]})
+    if not selected:return None
+    chosen=sorted(selected.values(),key=lambda s:(s.start,s.id))[:12]
+    bank=read_json(library)
+    signature=digest({'source':source_identity(video),'bank':digest(bank),'lines':[s.model_dump() for s in chosen]})
+    folder=root/'voice-followups'/signature
+    if not (folder/'manifest.json').exists():
+        write_json(folder/'input'/'source.json',source_identity(video))
+        write_json(folder/'input'/'transcript.json',[s.model_dump() for s in chosen])
+        manifest=prepare_audio_candidates([video],[folder/'input'/'transcript.json'],folder,cfg,model_path,voice_python)
+    else:
+        manifest=read_json(folder/'manifest.json')
+    if manifest['model']!=bank['model'] or manifest['series']!=bank['series']:
+        raise ValueError('新增声纹候选与原库模型或剧名不一致')
+    if not any(s['source']==source_identity(video) for s in manifest['sources']):
+        raise ValueError('新增声纹候选原片不一致')
+    if not manifest.get('baseline_library_digest'):
+        if (folder/'review.json').exists():raise ValueError('新增声音批次初始化不完整，请使用新的输出目录')
+        manifest={**manifest,'baseline_library_digest':digest(bank),
+            'dataset_id':digest([manifest['dataset_id'],digest(bank)]),'automatic_gap_requests':requests}
+        write_json(folder/'baseline-library.json',bank)
+        write_json(folder/'manifest.json',manifest)
+    if manifest['baseline_library_digest']!=digest(bank):raise ValueError('新增声音批次基础库不一致')
+    ReviewStore(folder)  # exports an empty local bank; only the human may name a sample
+    task={'status':'waiting_voice_confirmation','review_root':str(folder.resolve()),
+          'library':str(library.resolve()),'source':source_identity(video),'sample_lines':[s.id for s in chosen],
+          'library_digest':digest(bank),'voice_digest':digest(voices),'transcript_digest':transcript_digest,
+          'settings_digest':digest(cfg.model_dump(mode='json')),
+          'instruction':f'voice-review --output "{folder.resolve()}"；试听确认后重跑原制作命令，系统会备份并合并新增人工参考。'}
+    write_json(root/'voice-followup.json',task)
+    return task
+
+
+def pending_voice_followup(video, lines, voices, root, cfg, library):
+    pointer=root/'voice-followup.json'
+    if not pointer.exists():return None
+    task=read_json(pointer)
+    if (task.get('status')=='waiting_voice_confirmation' and task.get('source')==source_identity(video)
+            and task.get('library')==str(library.resolve()) and task.get('library_digest')==digest(read_json(library))
+            and task.get('voice_digest')==digest(voices)
+            and task.get('transcript_digest')==digest([s.model_dump() for s in lines])
+            and task.get('settings_digest')==digest(cfg.model_dump(mode='json'))):
+        return task
+    return None
 
 
 def episode_evidence(video, lines, library, root, cfg, manifest_path=None, model_path=None, voice_python=None):

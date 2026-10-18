@@ -265,3 +265,88 @@ def test_too_short_opening_window_includes_next_complete_shot_before_repair(tmp_
                        Settings(opening='original',target_seconds=45),Model(),tmp_path,'room',0)
     validate_plan(Plan.model_validate(fixed),lines,70,1,45,opening='original')
     assert fixed['clips'][0]['beats'][2:]==raw['clips'][0]['beats'][3:]
+
+
+def test_source_repair_keeps_accepted_changes_when_later_unit_cannot_be_fixed(tmp_path):
+    from autoclip.automatic import repair_plan
+    from autoclip.repair import RepairNeeded
+    lines,plan=fixture_plan()
+    class Model:
+        def json(self,system,prompt):
+            if 'target={"id": "beat-0"' in prompt:
+                return {'changes':[{'id':'beat-0','text':'有依据的必要承接','evidence_ids':[0]}]}
+            return {'changes':[{'id':'beat-2','text':''}]}
+    with pytest.raises(RepairNeeded) as error:
+        repair_plan(plan,[{'id':'beat-0','message':'修第一段'},{'id':'beat-2','message':'修第二段'}],lines,{},tmp_path,
+                    Settings(target_seconds=45,repair_attempts=0),Model(),0,source_seconds=40)
+    assert error.value.report['stage']=='automatic_partial'
+    assert error.value.report['clip']['beats'][0]['text']=='有依据的必要承接'
+    assert error.value.report['clip']['beats'][1:]==plan.model_dump()['clips'][0]['beats'][1:]
+    assert {i['id'] for i in error.value.report['issues']}=={'beat-2'}
+    assert not (tmp_path/'plan-approved.json').exists()
+
+
+def test_partial_source_repair_is_remeasured_and_fully_reviewed_before_approval(tmp_path,monkeypatch):
+    from autoclip import series
+    from autoclip.repair import RepairNeeded
+    from autoclip.util import read_json,write_json
+    lines,plan=fixture_plan();seen=[]
+    monkeypatch.setattr(series,'duration',lambda _:40)
+    def measure(video,plan_path,transcript,cfg,root):
+        write_json(root/'plan-timed.json',read_json(plan_path));return {'issues':[]}
+    monkeypatch.setattr(series,'measure_sample_plan',measure)
+    def audit(video,current,*args):
+        assert not (tmp_path/'plan-approved.json').exists()
+        seen.append(current.clips[0].beats[0].text)
+        return {'passed':len(seen)>1,'issues':[] if len(seen)>1 else [{'id':'beat-0','message':'需修复'}]}
+    monkeypatch.setattr(series,'audit_plan',audit)
+    def repair(current,*args,**kwargs):
+        clip=current.clips[0].model_dump();clip['beats'][0]['text']='有依据的必要承接'
+        raise RepairNeeded({'stage':'automatic_partial','clip':clip,'issues':[{'id':'beat-2','message':'待重核'}]})
+    monkeypatch.setattr(series,'repair_plan',repair)
+    revised,report=series.complete_long_plan(tmp_path/'video.mp4',plan,lines,{},tmp_path,
+        Settings(target_seconds=45,min_seconds=30,max_seconds=90,repair_attempts=1),None)
+    assert len(seen)==2 and seen[0]!=seen[1]=='有依据的必要承接'
+    assert report['passed'] and revised.clips[0].beats[0].text==seen[1]
+
+
+def test_broken_original_cut_can_replan_neighboring_bridge_without_approval(tmp_path):
+    from autoclip.automatic import repair_plan
+    from autoclip.models import Beat,Clip
+    spans=[(i*10,(i+1)*10) for i in range(6)]
+    lines=[Line(id=i,start=a,end=b,text='已有完整对白') for i,(a,b) in enumerate(spans)]
+    clip=Clip(title='完整故事',angle='问答',hook='如何回应',beats=[
+        Beat(mode='narration' if i%2==0 else 'original',start=a,end=b,
+             text='当前对白的必要解释与承接' if i%2==0 else '',evidence_ids=[i],reason='已有依据') for i,(a,b) in enumerate(spans)])
+    plan=Plan(episode_summary='',genre='',style='',clips=[clip]);before=plan.model_dump()
+    class Model:
+        def json(self,system,prompt):
+            if '只替换replace_indices' in prompt:
+                return {'beats':[before['clips'][0]['beats'][0],dict(mode='original',start=10,end=30,
+                    text='',evidence_ids=[1,2],reason='保留完整后续应答，不把命令留在旁白画面里')]}
+            return {'changes':[{'id':'original-1','start':10,'end':20,'evidence_ids':[1],'reason':'已有依据'}]}
+    revised=repair_plan(plan,[{'id':'original-1','message':'应答被相邻旁白截断'}],lines,{},tmp_path,
+                        Settings(target_seconds=45,repair_attempts=0),Model(),0,source_seconds=60)
+    assert revised!=plan and plan.model_dump()==before
+    assert any(b.mode=='original' and b.start<=10 and b.end>=30 for b in revised.clips[0].beats)
+    assert revised.clips[0].beats[-2].text==clip.beats[-2].text
+    assert not (tmp_path/'plan-approved.json').exists()
+
+
+def test_subtitle_zoom_uses_two_source_crops_not_expected_asr_text(tmp_path,monkeypatch):
+    from PIL import Image
+    import autoclip.ingest as module
+    calls=[]
+    def run(command):
+        calls.append(command)
+        Image.new('RGB',(960,120),'red').save(command[-1])
+    monkeypatch.setattr(module,'run',run)
+    lines=[Line(id=7,start=10,end=20,text='不可当作可见字幕的预期文字')]
+    target=module.subtitle_evidence_sheet(tmp_path/'video.mp4',tmp_path,lines,'zoom')
+    assert len(calls)==2
+    assert [float(c[c.index('-ss')+1]) for c in calls]==[13.5,16.5]
+    with Image.open(target) as picture:
+        assert picture.size==(1920,148)
+        assert picture.getpixel((10,60))[0]>200
+    assert module.subtitle_evidence_sheet(tmp_path/'video.mp4',tmp_path,lines,'zoom')==target
+    assert len(calls)==2

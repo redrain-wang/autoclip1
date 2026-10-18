@@ -1,5 +1,6 @@
 """Source-bound automated review and local repair, separate from human approval."""
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
@@ -8,8 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from .identity import units_for_clip, file_hash
 from .editorial import audience_script
-from .ingest import contact_sheet
+from .ingest import contact_sheet, subtitle_evidence_sheet
 from .models import Plan, Beat, validate_plan, evidence_matches
+from .repair import RepairNeeded
 from .util import digest, read_json, source_identity, write_json
 from .voices import match_batch
 
@@ -96,6 +98,21 @@ def review_voice_rows(rows):
     return [{**{k:v for k,v in row.items() if k!='samples'},
              'samples':[{k:v for k,v in sample.items() if k!='candidates'} for sample in row.get('samples',[])]}
             for row in rows]
+
+
+def caption_lines_for_issues(issues, lines, fallback_ids):
+    """Prioritize the actual subtitle IDs disputed by the reviewer, not just endpoints."""
+    lookup = {s.id:s for s in lines}
+    ids = []
+    for issue in issues:
+        for first,last in re.findall(r'(?:字幕|line|ID)\s*(\d+)(?:\s*[-–/、]\s*(\d+))?',issue['message']):
+            a,b = int(first),int(last or first)
+            ids.extend(range(min(a,b),max(a,b)+1) if abs(b-a)<=6 else [a,b])
+    ids.extend(fallback_ids)
+    chosen = list(dict.fromkeys(i for i in ids if i in lookup))[:6]
+    if not chosen and lines:
+        chosen = [lines[i].id for i in sorted({0,len(lines)//2,len(lines)-1})]
+    return [lookup[i] for i in chosen]
 
 
 def assess_batch(raw, units, lines, frame_count, voice_rows):
@@ -227,13 +244,39 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 f'\n字幕={json.dumps([s.model_dump() for s in selected],ensure_ascii=False)}'
                 f'\nviewer_timeline={json.dumps(audience_script(clip),ensure_ascii=False)}')
         feedback = ''
+        review_images = [sheet]
+        caption_sheet = None
         for retry in range(cfg.repair_attempts+1):
-            raw = llm.json('你是独立的影视内容与人物证据审核员，不读取人工答案。',prompt+feedback,[sheet])
+            raw = llm.json('你是独立的影视内容与人物证据审核员，不读取人工答案。',prompt+feedback,review_images)
             try:
                 decisions = (OriginalReviewBatch if original else UnitReviews).model_validate(raw)
                 checked = decisions.model_dump()
                 checked['passed'] = not decisions.issues and all(u.verdict=='supported' for u in decisions.units)
                 issues = assess_batch(checked,group,selected,len(times),evidence)
+                # A reviewer cannot claim voice support that its own cited
+                # candidates do not supply. Recheck the review annotation before
+                # asking the writer to "fix" an otherwise unchanged sentence.
+                supported = {u.id for u in decisions.units if u.verdict=='supported'}
+                inconsistent = [i for i in issues if i['id'] in supported and i['message'].startswith((
+                    '声音候选缺失或冲突','声音依据未支持','列出了人物归属却声明','明确称呼与回应需至少'))]
+                caption_dispute = any(re.search(r'ASR|同音|错字|转写|字形|拆字|文字|看不清|字幕.*(?:不一致|不符|错误|不足|不完整)',i['message']) for i in issues)
+                if retry<cfg.repair_attempts and caption_sheet is None and (inconsistent or caption_dispute):
+                    zoom_ids = set()
+                    for unit in group:
+                        cited = [i for i in unit.get('evidence_ids',[]) if i in ids]
+                        if cited:zoom_ids.update((cited[0],cited[-1]))
+                    zoom_lines = caption_lines_for_issues(issues,selected,sorted(zoom_ids))
+                    if zoom_lines:
+                        caption_sheet = subtitle_evidence_sheet(video,folder/f'batch-{offset}-caption-images',zoom_lines,'captions')
+                        review_images.append(caption_sheet)
+                        raise ValueError('本批存在身份依据或转写字词争议，已追加原片两帧字幕放大图。'
+                            '只读实际可见字幕，不凭记忆补字，不把ASR同音字直接认定为新人物或事实错误；'
+                            'frame_ids仍使用主画面times索引，字幕图仅补文字证据。人物归属仍须核对称呼、回应、声音候选与实际前后稿，'
+                            '原片也不清楚则仍须unknown，不得为了结束修复放行。')
+                if inconsistent and retry<cfg.repair_attempts:
+                    raise ValueError('审核自身的身份依据与所引证据不一致：'+json.dumps(inconsistent,ensure_ascii=False)
+                        +'。先重核说话人、听者、被提及者以及实际称呼和回应，不能仅凭反应画面断定发言人；'
+                        '不得靠改变identity_basis标签或脑补姓名放行。确实有疑点就标unknown/contradicted，并说明实际文案问题。')
                 break
             except ValueError as exc:
                 write_json(folder/f'batch-{offset}-protocol-{retry}.json',{'raw':raw,'error':str(exc)})
@@ -242,7 +285,8 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 feedback = '\n上次审核响应未通过格式/引用检查：'+str(exc)[:1800]+'\n原响应：'+json.dumps(raw,ensure_ascii=False)+'\n请重审同一批units，未知仍须标unknown，不得为了修复格式把存疑内容放行。'
         record = {'units':group,'times':times,'raw':raw,'issues':issues}
         write_json(folder/f'batch-{offset}.json',record)
-        return issues,str((folder/f'batch-{offset}.json').resolve()),{'path':str(sheet.resolve()),'sha256':file_hash(sheet)}
+        frames = [{'path':str(p.resolve()),'sha256':file_hash(p)} for p in review_images]
+        return issues,str((folder/f'batch-{offset}.json').resolve()),frames
     # Batches are independent; keep results in source order and share LLM's
     # locked request allowance. No partial batch constitutes an approval.
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -250,7 +294,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
             for issues,batch,frame in pool.map(review_group,groups):
                 all_issues.extend(issues)
                 batches.append(batch)
-                frames.append(frame)
+                frames.extend(frame)
         except BaseException:
             pool.shutdown(wait=True,cancel_futures=True)
             raise
@@ -305,6 +349,7 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
     """Repair one failed unit at a time, keeping validated edits and shot IDs."""
     revised = plan.model_copy(deep=True)
     accepted = []
+    failed = []
     lookup = {s.id:s for s in lines}
     for uid in dict.fromkeys(issue['id'] for issue in issues):
         clip = revised.clips[0]
@@ -358,9 +403,24 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
             prompt += (f'\n本次为真实配音超出画面余量的缩写：text有效字数必须不超过{max_characters}字（不含标点）。'
                        '必须实质删掉重复复述，只保留必要承接或必要事实，不能仅换同义词、添语气词或照抄。'
                        '压缩不得歪曲事实或删除必要限定；后续仍重新配音和独立审核。')
+        repair_images = []
+        source = voices.get('source',{})
+        if max_characters is None and cfg.vision and source.get('path') and Path(source['path']).is_file():
+            # Give the writer the same primary evidence, not only another
+            # model's description of an ASR/OCR discrepancy.
+            available_lines = [s for s in lines if s.id in eligible]
+            evidence_ids = target.get('evidence_ids',[])
+            fallback_ids = evidence_ids[:1]+evidence_ids[-1:]
+            zoom_lines = caption_lines_for_issues([i for i in issues if i['id']==uid],available_lines,fallback_ids)
+            image_root = root/'automatic-repairs'/str(attempt)/uid/'source-images'
+            if zoom_lines:
+                repair_images.append(subtitle_evidence_sheet(Path(source['path']),image_root,zoom_lines,'captions'))
+                prompt += ('\n附图是实际原片字幕放大图，按原片可见文字核对ASR同音字，不盲从ASR或上轮审核意见，'
+                           '不把短促呼喝误识当作新人物姓名；看不清不得补字。身份仍依当前证据与称呼回应，不能猜。')
         feedback = ''
         for retry in range(cfg.repair_attempts+1):
-            raw = llm.json('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback)
+            raw = (llm.json('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback,repair_images)
+                   if repair_images else llm.json('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback))
             record = root/'automatic-repairs'/str(attempt)/uid/f'attempt-{retry}.json'
             try:
                 changes = raw.get('changes') if isinstance(raw,dict) else None
@@ -404,9 +464,38 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                         revised = fallback
                         accepted.append(change)
                         break
-                    raise
+                    if uid.startswith('original-') and cfg.duration_profile=='short' and source_seconds is not None:
+                        # A cut may need room occupied by the next bridge. A
+                        # one-shot patch cannot repair that; replan only its
+                        # neighboring window and then remeasure/review all units.
+                        from .draft import repair_draft
+                        from .director import compile_plan
+                        index = int(uid.split('-')[1])
+                        bounds = (revised.clips[0].beats[0].start,revised.clips[0].beats[-1].end)
+                        report = {'clip':revised.clips[0].model_dump(),'issues':[{
+                            'code':'semantic_review','message':f'clips[0].beats[{index}] '+i['message']}
+                            for i in issues if i['id']==uid]}
+                        try:
+                            raw_plan = repair_draft(revised.model_dump(),report,lines,bounds,cfg,llm,
+                                root/'automatic-repairs'/str(attempt)/uid,digest(report),retry)
+                            candidate = compile_plan(raw_plan,lines,bounds,fit_narration=False)
+                            validate_plan(candidate,lines,source_seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+                            if any(lookup[i].start>=b.end for b in candidate.clips[0].beats if b.mode=='narration' for i in b.evidence_ids):
+                                raise ValueError('局部重编引用了尚未播放的未来对白')
+                            write_json(root/f'automatic-repair-{attempt}.json',{'changes':accepted,
+                                'structural_unit':uid,'plan':candidate.model_dump(),'status':'requires_full_measurement_and_review'})
+                            return candidate
+                        except ValueError as structural_error:
+                            from .diagnostics import classify_error
+                            if 'service_failure' in classify_error(str(structural_error)):raise
+                            exc = structural_error
+                    failed.extend({**i,'code':'voice_alignment' if i.get('measurement') else 'semantic_review',
+                        'message':i['message']+'；局部修订未完成：'+str(exc)} for i in issues if i['id']==uid)
+                    break
                 feedback = '\n上轮局部修订未通过程序检查：'+str(exc)[:1800]+'\n上轮修订：'+json.dumps(raw,ensure_ascii=False)+'\n只返回当前target的合法修改，不能换段、清空口播、变更mode或突破原片时间线。'
     write_json(root/f'automatic-repair-{attempt}.json',{'changes':accepted})
+    if failed:
+        raise RepairNeeded({'stage':'automatic_partial','clip':revised.clips[0].model_dump(),'issues':failed})
     return revised
 
 

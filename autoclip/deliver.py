@@ -17,7 +17,7 @@ def export_finished(output: Path) -> Path:
     entries, script = [], ["# 成片与最终解说稿", "", "时间码指向原片。以下文本来自实际成片，包含配音时长校准后的修改。", ""]
     for result in sorted(output.glob("*/results.json")):
         state = result.parent / "status.json"
-        if not state.exists() or read_json(state).get("stage") not in {"已完成", "部分完成"}:
+        if not state.exists() or read_json(state).get("stage") not in {"已完成", "部分完成", "等待新增声纹确认"}:
             continue
         completed += 1
         episode = result.parent.name.split("-", 1)[0]

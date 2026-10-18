@@ -98,6 +98,33 @@ def save_transcript(lines: list[Line], root: Path):
     (root / "transcript.srt").write_text("\n\n".join(f"{i+1}\n{timestamp(s.start)} --> {timestamp(s.end)}\n{s.text}" for i,s in enumerate(lines)), encoding="utf-8")
 
 
+def subtitle_evidence_sheet(video: Path, root: Path, lines: list[Line], name: str) -> Path:
+    """Show two actual caption crops per line; never draw an expected ASR word."""
+    from PIL import Image, ImageDraw
+    samples = [(s.id,round(s.start+(s.end-s.start)*fraction,3)) for s in lines for fraction in (.35,.65)]
+    target = root/'frames'/f'{name}-{digest(samples)}.jpg'
+    if target.exists():return target
+    if not samples or len(lines)>6:raise ValueError('字幕补证须为1–6条真实字幕')
+    crops = []
+    for sid,at in samples:
+        path = root/'caption-crops'/f'{sid}-{at:.3f}.jpg'
+        path.parent.mkdir(parents=True,exist_ok=True)
+        if not path.exists():
+            run(['ffmpeg','-v','error','-ss',str(at),'-i',video,'-frames:v','1',
+                 '-vf','crop=iw:ih*0.32:0:ih*0.68,scale=960:-2','-q:v','2','-y',path])
+        with Image.open(path) as picture:crops.append((sid,at,picture.convert('RGB').copy()))
+    height = max(p.height for _,_,p in crops)+28
+    canvas = Image.new('RGB',(1920,height*math.ceil(len(crops)/2)),'#10151c')
+    draw = ImageDraw.Draw(canvas)
+    for index,(sid,at,picture) in enumerate(crops):
+        x,y=(index%2)*960,(index//2)*height
+        draw.text((x+8,y+6),f'caption line {sid} / {at:.3f}s',fill='white')
+        canvas.paste(picture,(x,y+28))
+    target.parent.mkdir(parents=True,exist_ok=True)
+    canvas.save(target,quality=92)
+    return target
+
+
 def contact_sheet(video: Path, root: Path, times: list[float], name: str) -> Path:
     from PIL import Image, ImageDraw
     target = root / "frames" / f"{name}-{digest(times)}.jpg"

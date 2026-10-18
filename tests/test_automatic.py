@@ -356,3 +356,65 @@ def test_original_prefix_restoration_requires_exact_adjacent_complete_source(adj
         for i in (0,1,2,4):assert revised.clips[0].beats[i]==plan.clips[0].beats[i]
     else:assert revised is None
     assert plan.model_dump()==before
+
+
+@pytest.mark.parametrize('recovers',[True,False])
+def test_inconsistent_voice_support_rechecks_review_before_rewriting_script(tmp_path,monkeypatch,recovers):
+    import json
+    import autoclip.automatic as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'frame')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    plan=sample_plan();before=plan.model_dump()
+    lines=[Line(id=i,start=i*10+.5,end=(i+1)*10-.5,text='甲先生，请坐。' if i==0 else '谢谢您。') for i in range(4)]
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':[]}
+    class Model:
+        calls=0
+        def json(self,system,prompt,images):
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+            if any(u['id']=='beat-1' for u in group):self.calls+=1
+            rows=[]
+            for u in group:
+                row={'id':u['id'],'verdict':'supported','reason':'源对白与画面支持',
+                     'evidence_ids':[0],'frame_ids':[0],'identity_basis':'no_identity_claim','subjects':[]}
+                if u['id']=='beat-1':
+                    row.update(identity_basis='voice_and_context',subjects=['甲'])
+                    if recovers and self.calls>1:
+                        assert '字幕放大图' in prompt or '审核自身的身份依据' in prompt
+                        row.update(identity_basis='explicit_address_response',evidence_ids=[0,1])
+                rows.append(row)
+            return {'units':rows,'issues':[]}
+    model=Model();report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=1),model)
+    assert model.calls==2
+    assert report['passed'] is recovers
+    assert plan.model_dump()==before
+    if not recovers:assert any('声音' in i['message'] for i in report['issues'])
+
+
+def test_caption_dispute_samples_named_middle_ids_before_generic_endpoints():
+    from autoclip.automatic import caption_lines_for_issues
+    lines=[Line(id=i,start=i,end=i+1,text='原字幕') for i in range(590,615)]
+    selected=caption_lines_for_issues([{'message':'字幕600-602中的称呼有误，核查字幕612。'}],lines,[590,614])
+    assert [s.id for s in selected]==[600,601,602,612,590,614]
+
+
+def test_local_writer_receives_actual_caption_evidence_not_only_reviewer_claim(tmp_path,monkeypatch):
+    import autoclip.automatic as module
+    from test_pipeline import fixture_plan
+    lines,plan=fixture_plan()
+    video=tmp_path/'source.mp4';video.write_bytes(b'video')
+    frame=tmp_path/'caption.jpg';frame.write_bytes(b'caption')
+    captured=[]
+    def sheet(video,root,selected,name):captured.extend(s.id for s in selected);return frame
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',sheet)
+    class Model:
+        def json(self,system,prompt,images):
+            assert images==[frame] and '实际原片字幕放大图' in prompt
+            return {'changes':[{'id':'beat-0','text':'按原片可见文字作必要承接','evidence_ids':[0]}]}
+    revised=module.repair_plan(plan,[{'id':'beat-0','message':'字幕0的转写字形有误'}],lines,
+        {'source':source_identity(video),'lines':[]},tmp_path,Settings(target_seconds=45),Model(),0,source_seconds=40)
+    assert captured==[0]
+    assert revised.clips[0].beats[0].text=='按原片可见文字作必要承接'
+    assert revised.clips[0].beats[1:]==plan.clips[0].beats[1:]
+    assert not (tmp_path/'plan-approved.json').exists()

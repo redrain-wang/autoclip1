@@ -510,6 +510,8 @@ def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目
             if not latest.get("clips"):
                 for issue in latest.get("rejected",[]) + latest.get("failures",[]):
                     console.print(f"  {issue['title']}：{issue['error'].splitlines()[0][:240]}",markup=False)
+            if latest.get('voice_confirmation'):
+                console.print('存在未核实的新声音，请完成唯一的人工声纹确认步骤：'+latest['voice_confirmation']['instruction'],markup=False)
     try:
         ensure_current_library(voice_context['library'],voice_context['bank'])
     except (ValueError,OSError,RuntimeError) as exc:
@@ -524,6 +526,8 @@ def produce(source: Annotated[Path | None, typer.Argument(help="素材文件/目
     console.print(f"新片浏览页：{build_report(cfg.output)}")
     if stage=="all" and not any(row.get("clips",0) for row in outcomes):
         console.print("本批未生成成片；详细原因已保存到 batch.json。处理结束不代表候选已通过。",markup=False)
+    if any(row['status']=='waiting_voice_confirmation' for row in outcomes):
+        raise typer.Exit(2)
     if any(row["status"] in {"failed","partial","no_delivery"} for row in outcomes):
         raise typer.Exit(1)
 

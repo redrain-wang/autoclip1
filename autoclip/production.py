@@ -257,6 +257,16 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
         if library is not None:
             status('扫描整集语音并关联当前声纹库')
             bank,voices = episode_evidence(video,lines,library,root,cfg,voice_manifest,model_path,voice_python)
+            if stage=='all':
+                from .short_voices import pending_voice_followup
+                pending=pending_voice_followup(video,lines,voices,root,cfg,library)
+                if pending:
+                    results=retain_approved(completed_stories(root),video,lines,voices,cfg,root)
+                    write_json(root/'completed.json',results)
+                    write_json(root/'results.json',results)
+                    status('等待新增声纹确认',clips=len(results))
+                    return {'source':str(video),'candidates':0,'clips':len(results),
+                            'rejected':[],'failures':[],'voice_confirmation':pending,'status':'waiting_voice_confirmation'}
         llm=LLM(cfg,root)
         from .continuity import load_continuity, continuity_prompt
         previous = load_continuity(video, cfg, root)
@@ -285,6 +295,7 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
         if stage=="all":
             write_json(root/"completed.json",results)
             write_json(root/"results.json",results)
+        unsuccessful_roots=[]
         for index,story in enumerate(selection.stories):
             if any(digest(c["story"])==digest(story.model_dump()) for c in results):
                 console.print(f"[green]{video.stem} 已完成，保留：{story.title}[/green]",highlight=False)
@@ -394,6 +405,7 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                     if not editorial or attempt==cfg.repair_attempts or isinstance(ex,AutomaticReviewRejected):
                         destination=rejected if editorial else failures
                         destination.append({"title":story.title,"error":str(ex)[:2000],"issues":repair["issues"],"attempts":attempt+1})
+                        unsuccessful_roots.append(storyroot)
                         console.print(f"[yellow]此选题未通过，继续其他选题：{story.title}[/yellow]")
                         break
                     console.print(f"[yellow]{story.title}：按具体问题修复，第{attempt+1}/{cfg.repair_attempts}轮[/yellow]",highlight=False)
@@ -401,10 +413,21 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
         write_json(root/"rejected.json",rejected)
         if stage=="all":
             write_json(root/"results.json",results)
+        voice_followup=None
+        if stage=='all' and voices is not None and unsuccessful_roots:
+            from .short_voices import prepare_voice_followup
+            try:
+                voice_followup=prepare_voice_followup(video,lines,voices,root,cfg,library,unsuccessful_roots,model_path,voice_python)
+            except (ValueError,RuntimeError,OSError) as exc:
+                write_json(root/'voice-followup-error.json',{'error':str(exc)[:1500]})
+        elif not unsuccessful_roots and (root/'voice-followup.json').exists():
+            pointer=read_json(root/'voice-followup.json')
+            write_json(root/'voice-followup.json',{**pointer,'status':'resolved'})
         no_delivery = stage=='all' and not results
-        status("未产出成片" if no_delivery else ("部分完成" if failures or rejected else ("脚本完成" if stage=="plan" else "已完成")),clips=len(results),failures=len(failures),rejected=len(rejected))
+        status("等待新增声纹确认" if voice_followup else ("未产出成片" if no_delivery else ("部分完成" if failures or rejected else ("脚本完成" if stage=="plan" else "已完成"))),clips=len(results),failures=len(failures),rejected=len(rejected))
         return {"source":str(video),"candidates":len(selection.stories),"clips":len(results),"failures":failures,"rejected":rejected,
-                "status":"no_delivery" if no_delivery else ("partial" if failures else "completed")}
+                "voice_confirmation":voice_followup,
+                "status":"waiting_voice_confirmation" if voice_followup else ("no_delivery" if no_delivery else ("partial" if failures or rejected else "completed"))}
     except Exception as ex:
         status("失败（可断点重试）",error=str(ex)[:2000])
         raise

@@ -285,7 +285,9 @@ def enrollment_progress(manifest, review, baseline=None):
     return {'characters': characters, 'coverage': coverage, 'coverage_complete': complete,
             'voice_discovery': voice_discovery, 'discovery_total': discovery_total,
             'ready_count': sum(p['ready'] for p in characters),
-            'can_finish': bool(characters), 'all_ready': bool(characters) and all(p['ready'] for p in characters),
+            'can_finish': (any(d.get('status')=='named' for d in decisions.values())
+                           if manifest.get('automatic_gap_requests') else bool(characters)),
+            'all_ready': bool(characters) and all(p['ready'] for p in characters),
             'suggested_count': sum(m['status'] == 'suggested' for m in matches.values()),
             'unknown_count': sum(m['status'] == 'unknown' for m in matches.values()),
             'discovery': queue[:5], 'matches': matches,

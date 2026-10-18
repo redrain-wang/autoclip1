@@ -234,7 +234,16 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
             break
         repairs[category] += 1
         write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':category})
-        plan = repair_plan(plan,issues,lines,voices,root,cfg,llm,attempt,source_seconds=duration(video))
+        try:
+            plan = repair_plan(plan,issues,lines,voices,root,cfg,llm,attempt,source_seconds=duration(video))
+        except ValueError as exc:
+            from .repair import RepairNeeded
+            if not isinstance(exc,RepairNeeded) or exc.report.get('stage')!='automatic_partial':raise
+            revised = plan.model_dump()
+            revised['clips'][0] = exc.report['clip']
+            plan = Plan.model_validate(revised)
+            write_json(root/f'partial-repair-{attempt}.json',{'plan':plan.model_dump(),'pending':exc.report['issues'],
+                'status':'requires_full_measurement_and_review'})
         validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
         if validate_clip:
             validate_clip(plan.clips[0])
