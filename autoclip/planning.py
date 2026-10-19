@@ -1,6 +1,7 @@
 """Build a source-bound long-form outline before narration is written."""
 import json
-from concurrent.futures import ThreadPoolExecutor
+import math
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -11,7 +12,7 @@ from .director import compact
 from .models import Beat, Clip, Plan, validate_plan
 from .util import digest, read_json, source_identity, write_json
 
-VERSION = 'planning-7'
+VERSION = 'planning-8'
 
 
 class Chapter(BaseModel):
@@ -44,6 +45,74 @@ class Slots(BaseModel):
     beats: list[Slot] = Field(min_length=1)
 
 
+class BudgetNarration(BaseModel):
+    index: int = Field(ge=0)
+    instruction: str
+    target_chars: int = Field(ge=5)
+    evidence_ids: list[int] = Field(min_length=1)
+
+
+class BudgetSelection(BaseModel):
+    keep: list[int] = Field(min_length=1)
+    narration: list[BudgetNarration] = Field(default_factory=list)
+    rationale: str
+
+
+def apply_budget_selection(previous, raw):
+    """Apply editorial choices without asking the model to retype timestamps."""
+    choice=BudgetSelection.model_validate(raw)
+    slots=Slots.model_validate(previous).beats
+    if choice.keep!=sorted(set(choice.keep)) or any(i<0 or i>=len(slots) for i in choice.keep):
+        raise ValueError('keep必须为已有镜头编号，按原片顺序且不重复')
+    updates={n.index:n for n in choice.narration}
+    if len(updates)!=len(choice.narration) or not set(updates).issubset(choice.keep):
+        raise ValueError('旁白改编编号须唯一且保留在keep中')
+    result=[]
+    for i in choice.keep:
+        slot=slots[i].model_copy(deep=True)
+        if i in updates:
+            patch=updates[i]
+            if not set(patch.evidence_ids).issubset(slot.evidence_ids):
+                raise ValueError(f'镜头{i}改为旁白不能新增证据，须依原区间实际对白转述')
+            slot.mode='narration';slot.instruction=patch.instruction
+            slot.target_chars=patch.target_chars;slot.evidence_ids=patch.evidence_ids
+        result.append(slot.model_dump())
+    return {'beats':result}
+
+
+def revise_chapter_budget(previous, chapter, structure, lines, index, budget, minimum, limit, cfg, llm, folder, round_number):
+    slots=Slots.model_validate(previous).beats
+    candidates=[{'index':i,**s.model_dump(),'estimated_seconds':round(s.end-s.start if s.mode=='original' else s.target_chars/4.5,2),
+                 'narration_max_chars':min(280,round((s.end-s.start)*4.5))} for i,s in enumerate(slots)]
+    evidence=[s for s in lines if chapter.start<=s.start<chapter.end]
+    prompt=(f'只压缩第{index+1}章《{chapter.title}》：{chapter.purpose}。'
+            f'当前{chapter_seconds(previous):.2f}秒、{len(slots)}镜头，必须降到{minimum:.2f}–{budget:.2f}秒、最多{limit}镜头。'
+            '不要重写时间戳，返回要保留的镜头编号keep；必要时把部分原声改编为简洁旁白，填入narration。'
+            '原声耗时为estimated_seconds，改为旁白后耗时按target_chars/4.5计算；仅合并或改instruction不会缩短原声。'
+            '优先将冗长重复问答改为必要转述，或删次要重复部分；保留事件起因、关键行动、结果和场景承接。'
+            '不要剪掉问题却保留回答造成虚假回应。保留至少一个旁白；若是第一章，首个镜头须为旁白。'
+            '旁白只能引用该镜头已有evidence_ids，不得凭剧情记忆添加内容；instruction交代要转述的实际内容。'
+            '先算每项缩短多少秒，再选择足够的实质改动；按原片顺序输出keep，不能重复编号。'
+            f'\n预算协调第{round_number}轮\n候选镜头{json.dumps(candidates,ensure_ascii=False)}'
+            f'\n本章原片对白{compact(evidence)}\n格式{json.dumps(BudgetSelection.model_json_schema(),ensure_ascii=False)}')
+    feedback=''
+    for attempt in range(cfg.repair_attempts+1):
+        raw=llm.json('你是影视解说剪辑编辑，以完整剧情为先，在真实素材中选择删减与转述。',prompt+feedback)
+        prefix=f'chapter-{index}-budget-{round_number}-{attempt}'
+        write_json(folder/f'{prefix}-selection.json',raw)
+        try:
+            draft=apply_budget_selection(previous,raw)
+            draft=split_long_originals(merge_continuous_originals(draft,lines),lines)
+            validate_chapter(draft,chapter,structure,lines,index,budget,cfg,minimum,max_slots=limit)
+            write_json(folder/f'{prefix}-validated.json',draft)
+            return draft
+        except ValueError as ex:
+            write_json(folder/f'{prefix}-error.json',{'error':str(ex)})
+            if attempt==cfg.repair_attempts:raise
+            feedback=f'\n局部修复第{attempt+1}/{cfg.repair_attempts}轮，程序实算：{ex}\n上版选择：'+json.dumps(raw,ensure_ascii=False)
+    raise AssertionError('unreachable')
+
+
 def merge_continuous_originals(raw, lines):
     """Keep nearby original utterances as one continuous source interval.
 
@@ -64,6 +133,33 @@ def merge_continuous_originals(raw, lines):
     return {'beats':[slot.model_dump() for slot in merged]}
 
 
+def split_long_originals(raw, lines):
+    """Split a continuous original clip without dropping or duplicating audio."""
+    output=[]
+    lookup={s.id:s for s in lines}
+    boundaries=None
+    for slot in Slots.model_validate(raw).beats:
+        cuts=[slot.start]
+        if slot.mode=='original':
+            while slot.end-cuts[-1]>40:
+                if boundaries is None:
+                    boundaries={t for s in lines for t in (s.start,s.end)
+                                if not any(other.start+.2<t<other.end-.2 for other in lines)}
+                available=[t for t in boundaries if cuts[-1]+1<=t<=min(cuts[-1]+40,slot.end-1)]
+                if not available:
+                    break  # Keep the invalid remainder for explicit repair.
+                cuts.append(max(available))
+        cuts.append(slot.end)
+        if len(cuts)==2:
+            output.append(slot.model_dump());continue
+        invalid=[i for i in slot.evidence_ids if i not in lookup or not (lookup[i].start<slot.end and lookup[i].end>slot.start)]
+        for index,(start,end) in enumerate(zip(cuts,cuts[1:])):
+            ids=[s.id for s in lines if s.start<end and s.end>start]
+            if index==0:ids.extend(invalid)  # Never hide an invalid citation.
+            output.append({**slot.model_dump(),'start':start,'end':end,'evidence_ids':sorted(set(ids)) or slot.evidence_ids})
+    return {'beats':output}
+
+
 def validate_structure(structure, start, end, cfg, lines=None, enforce_duration=False):
     errors=[]
     if not start <= structure.opening_start < structure.opening_end <= end:
@@ -80,7 +176,12 @@ def validate_structure(structure, start, end, cfg, lines=None, enforce_duration=
     if cfg.opening not in {'original_teaser', 'original'} or cfg.duration_profile != 'long':
         errors.append('自动长片提纲需要long及原声开场配置')
     if cfg.opening == 'original' and structure.chapters and structure.chapters[0].start < structure.opening_end:
-        errors.append('顺叙正文须从开场结束后开始，不得倒叙或重复开场')
+        first = structure.chapters[0]
+        errors.append(f'顺叙正文须从开场结束后开始，不得倒叙或重复开场：当前开场{structure.opening_start:.2f}–{structure.opening_end:.2f}秒，'
+            f'但第一章《{first.title}》从{first.start:.2f}秒开始。原片时间{first.start:.2f}小于{structure.opening_end:.2f}，'
+            '不能用“这是起因”解释时间倒序。只调整opening_start/opening_end/opening_reason及第一章start，'
+            f'从第一章{first.start:.2f}–{first.end:.2f}的早段选10–22秒完整原声，再将第一章start设为新的opening_end；'
+            '其他章节保持不变，不删除早段剧情，不把后半集事件提到开头。')
     if enforce_duration:
         capacity = opening_seconds + sum(c.end-c.start for c in structure.chapters)*1.4
         if capacity < cfg.min_seconds:
@@ -169,7 +270,7 @@ def plan_outline(video, root, lines, seconds, cfg, llm, start=0, end=None, notes
             '开场后用必要旁白衔接正文。先完整走完本集，不因找到早段候选就停止。' +
             ('每章purpose交代本场景的起因、行动、结果与承接，关键转折才分析选择与代价。' if cfg.narrative_mode == 'story_first' else
              '每章purpose明确旁白应解释的选择与代价。') +
-            '不要把人名猜测或角色指责当成定论。按完整场景分章，同场短问答合并为一章，为旁白和原声留出足够空间。'
+            '不要把人名猜测或角色指责当成定论。按完整事件分章，通常6–8章；相邻短转场、同场问答合入所属事件，不把每个过场单独成章。为旁白和原声留出足够空间。'
             '范围是可选素材池，后续会从中交替选原声和解说，不能只选零散几分钟却要求撑成十几分钟。' +
             ('剧情先行：完整交代起因、行动、结果和转场；不强迫每章提出观点，不按目标分钟数填充。' if cfg.narrative_mode == 'story_first' else '') +
             f'\n本集区间{start}–{end}\n编辑建议{json.dumps(brief_context(brief),ensure_ascii=False)}'
@@ -188,18 +289,27 @@ def plan_outline(video, root, lines, seconds, cfg, llm, start=0, end=None, notes
         except ValueError as ex:
             if supplied is not None:
                 raise
-            feedback='\n修正上次提纲结构错误：'+str(ex)+'\n上次提纲：'+json.dumps(raw,ensure_ascii=False)
+            if attempt == cfg.repair_attempts:
+                raise
+            feedback=f'\n第{attempt+1}/{cfg.repair_attempts}轮结构修复，必须实质改正，不得原样返回：'+str(ex)+'\n上次提纲：'+json.dumps(raw,ensure_ascii=False)
     else:raise ValueError(feedback)
     budgets = chapter_budgets(structure, cfg,enforce_duration)
+    slot_limits = chapter_slot_limits(budgets)
     opening_seconds = structure.opening_end-structure.opening_start
-    minimums = ([b*max(0,cfg.min_seconds-opening_seconds)/sum(budgets) for b in budgets]
-                if enforce_duration else [0. for _ in budgets])
-    def chapter_slots(pair):
+    # Scene length is a planning reference, not a per-scene delivery contract.
+    # Check the full film before writing; allow key scenes to borrow time from
+    # brief transitions without forcing filler into the latter.
+    ceilings = ([min(c.end-c.start,b*1.5) for c,b in zip(structure.chapters,budgets,strict=True)]
+                if enforce_duration else budgets)
+    def chapter_slots(pair, *, budget_override=None, minimum_override=0., max_slots_override=None, previous=None, round_number=0):
         index, chapter = pair
-        budget = budgets[index]
+        budget = ceilings[index] if budget_override is None else budget_override
+        limit = (min(95,math.ceil(slot_limits[index]*1.5)) if enforce_duration else slot_limits[index]) if max_slots_override is None else max_slots_override
+        if previous is not None and minimum_override==0:
+            return revise_chapter_budget(previous,chapter,structure,lines,index,budget,minimum_override,limit,cfg,llm,folder,round_number)
         evidence = [s for s in selected if chapter.start-15 <= s.start < chapter.end]
         prompt = (f'只安排第{index+1}章《{chapter.title}》镜头：{chapter.purpose}。'
-            f'合法原片范围{chapter.start}–{chapter.end}，本章预计成片上限{budget:.1f}秒，不需要用满。'
+            f'合法原片范围{chapter.start}–{chapter.end}，本章预计成片上限{budget:.1f}秒，不需要用满。最多{limit}个镜头。'
             f'开场已使用{structure.opening_start}–{structure.opening_end}，必须避开。'
             '镜头按原片顺序，不能重叠或跨章节。原声在完整对白边界切分，每段1–40秒；'
             '长问答可连续拆分，不删掉中间句来制造不存在的回应。旁白交代必要因果和场景转换，避免重复分析。'
@@ -209,34 +319,91 @@ def plan_outline(video, root, lines, seconds, cfg, llm, start=0, end=None, notes
             '每章至少一段必要旁白，第一章第一段必须为旁白连接已播开场。'
             '引用实际字幕ID，不引用镜头之后的对白。只返回beats列表。'
             + ('以顺叙完整讲清剧情为主，不为时长凑字。' if cfg.narrative_mode == 'story_first' else '每章推进主问题。')
-            + f'\n主问题{structure.hook}\n人物候选与依据（不是确定答案）{notes}'
+            + f'\n主问题{structure.hook}\n人物候选与依据（不是确定答案）{chapter_voice_notes(notes, evidence)}'
             + f'\n格式{json.dumps(Slots.model_json_schema(),ensure_ascii=False)}\n本章字幕{compact(evidence)}')
         feedback = ''
         if enforce_duration:
-            prompt += (f'\n本章预计成片须在{minimums[index]:.1f}–{budget:.1f}秒；'
-                       '原声按实际秒数、口播按target_chars/4.5估算，不足时补入本章必要完整剧情与对白，不能靠加空话。')
+            prompt += (f'\n本章参考时长{budgets[index]:.1f}秒，最多{budget:.1f}秒；全片统一验收{cfg.min_seconds:.0f}–{cfg.max_seconds:.0f}秒。'
+                       '原声按实际秒数、口播按target_chars/4.5估算。按完整剧情需要选材，短转场可少用时间，不靠空话填满预算。')
+        if previous is not None:
+            prompt += (f'\n全片预算协调第{round_number}轮，只修改本章。上版实算{chapter_seconds(previous):.2f}秒，'
+                       f'本轮要求{minimum_override:.2f}–{budget:.2f}秒。保留事件起因、关键行动、结果与转场；过长删次要重复问答或以简洁旁白转述，'
+                       '过短仅补入本章尚未展示的必要剧情与完整对白，证据不足不编造，不扩写空话；'
+                       '不能删掉关键问话却保留其回答造成虚假衔接。\n上版本章：'+json.dumps(previous,ensure_ascii=False))
         for attempt in range(cfg.repair_attempts+1):
             draft = llm.json('你是影视剪辑师，按当前原片证据安排镜头。', prompt+feedback)
-            write_json(folder/f'chapter-{index}-attempt-{attempt}.json', draft)
+            prefix = f'chapter-{index}' + (f'-balance-{round_number}' if previous is not None else '')
+            write_json(folder/f'{prefix}-attempt-{attempt}.json', draft)
             try:
                 draft = merge_continuous_originals(draft,lines)
-                write_json(folder/f'chapter-{index}-normalized-{attempt}.json',draft)
-                validate_chapter(draft, chapter, structure, lines, index, budget, cfg,minimums[index])
+                draft = split_long_originals(draft,lines)
+                write_json(folder/f'{prefix}-normalized-{attempt}.json',draft)
+                validate_chapter(draft, chapter, structure, lines, index, budget, cfg,minimum_override,max_slots=limit)
                 return draft
             except ValueError as ex:
-                feedback = '\n只修本章，其他章节保持不变。错误：'+str(ex)+'\n上轮本章：'+json.dumps(draft,ensure_ascii=False)
-                write_json(folder/f'chapter-{index}-error-{attempt}.json', {'error':str(ex)})
+                feedback = (f'\n第{attempt+1}/{cfg.repair_attempts}轮修复，只修本章，其他章节保持不变。必须改正错误，不能原样返回。错误：'+str(ex)
+                    +'\n上轮本章：'+json.dumps(draft,ensure_ascii=False))
+                write_json(folder/f'{prefix}-error-{attempt}.json', {'error':str(ex)})
                 if attempt == cfg.repair_attempts:
                     raise
     # Each chapter has its own bounded repair and content-addressed model cache.
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        drafts = list(pool.map(chapter_slots, enumerate(structure.chapters)))
+    drafts = bounded_chapters(chapter_slots, structure.chapters)
+    if enforce_duration:
+        drafts = balance_chapter_durations(drafts,budgets,opening_seconds,cfg,chapter_slots,structure.chapters,folder)
     write_json(folder/'chapter-slots.json', drafts)
     outline = compile_outline(video, structure, drafts, lines, seconds, cfg, notes)
     write_json(root/'outline.auto.json', outline)
     write_json(root/'outline-inputs.json', inputs)
     write_json(root/'chapter-budgets.json', budgets)
     return outline
+
+
+def chapter_seconds(draft):
+    return sum(s.end-s.start if s.mode=='original' else s.target_chars/4.5 for s in Slots.model_validate(draft).beats)
+
+
+def balance_chapter_durations(drafts,budgets,opening,cfg,rewrite,chapters,folder):
+    """Coordinate scene budgets while retaining the whole-film duration gate."""
+    drafts = list(drafts)
+    slot_limits = chapter_slot_limits(budgets)
+    for attempt in range(cfg.repair_attempts+1):
+        estimates = [chapter_seconds(d) for d in drafts]
+        total = opening+sum(estimates)
+        counts = [len(d['beats']) for d in drafts]
+        report = {'chapter_seconds':estimates,'total_seconds':total,'min_seconds':cfg.min_seconds,
+                  'max_seconds':cfg.max_seconds,'chapter_slots':counts,'body_slots':sum(counts),'max_body_slots':95,
+                  'passed':cfg.min_seconds<=total<=cfg.max_seconds and sum(counts)<=95}
+        write_json(folder/f'film-budget-{attempt}.json',report)
+        if report['passed']:
+            return drafts
+        if attempt == cfg.repair_attempts:
+            raise ValueError(f'全片提纲预计{total:.2f}秒，正文{sum(counts)}镜头；要求{cfg.min_seconds:.0f}–{cfg.max_seconds:.0f}秒且正文最多95镜头，预算协调已达上限')
+        changed=set()
+        # Coordinate both constraints in the same edit. At most three scenes
+        # per round; recompute after each so a sufficient repair stops work.
+        for _ in range(min(3,len(drafts))):
+            estimates=[chapter_seconds(d) for d in drafts]
+            counts=[len(d['beats']) for d in drafts]
+            total=opening+sum(estimates)
+            if cfg.min_seconds<=total<=cfg.max_seconds and sum(counts)<=95:
+                break
+            over,under=total>cfg.max_seconds,total<cfg.min_seconds
+            def priority(i):
+                time_gap=max(0,estimates[i]-budgets[i]) if over else max(0,budgets[i]-estimates[i]) if under else 0
+                slot_gap=max(0,counts[i]-slot_limits[i]) if sum(counts)>95 else 0
+                return time_gap+slot_gap*cfg.target_seconds/95
+            index=max((i for i in range(len(drafts)) if i not in changed),key=priority)
+            if under:
+                ceiling=min(chapters[index].end-chapters[index].start,budgets[index]*1.5)
+                minimum=min(budgets[index],estimates[index]+cfg.target_seconds-total)
+            else:
+                ceiling=min(estimates[index],max(budgets[index],estimates[index]-(total-cfg.target_seconds))) if over else estimates[index]
+                minimum=0.
+            drafts[index]=rewrite((index,chapters[index]),budget_override=ceiling,minimum_override=minimum,
+                                  max_slots_override=slot_limits[index],previous=drafts[index],round_number=attempt+1)
+            changed.add(index)
+            write_json(folder/f'film-budget-{attempt}-chapter-{index}.json',{'chapters':drafts,'changed':sorted(changed)})
+    raise AssertionError('unreachable')
 
 
 def chapter_budgets(structure, cfg,enforce_duration=False):
@@ -247,7 +414,52 @@ def chapter_budgets(structure, cfg,enforce_duration=False):
     return [total*length/sum(lengths) for length in lengths]
 
 
-def validate_chapter(raw, chapter, structure, lines, index, budget, cfg,minimum=0.):
+def chapter_slot_limits(budgets):
+    """Share the 95 body slots by workload, not equally across unequal scenes."""
+    limits = [4]*len(budgets)
+    remaining = 95-sum(limits)
+    weights = [max(0., b) for b in budgets]
+    if not sum(weights):
+        weights = [1.]*len(budgets)
+    shares = [remaining*b/sum(weights) for b in weights]
+    for i, share in enumerate(shares):
+        limits[i] += int(share)
+    for i in sorted(range(len(budgets)),key=lambda i:shares[i]-int(shares[i]),reverse=True)[:95-sum(limits)]:
+        limits[i] += 1
+    return limits
+
+
+def chapter_voice_notes(notes, evidence):
+    """Keep the selected scene's voice evidence without distracting future IDs."""
+    try:
+        data = json.loads(notes)
+    except (ValueError, TypeError):
+        return notes
+    if not isinstance(data,dict) or not isinstance(data.get('lines'),list):
+        return notes
+    ids = {s.id for s in evidence}
+    return json.dumps({**data,'lines':[r for r in data['lines'] if r.get('id') in ids]},ensure_ascii=False)
+
+
+def bounded_chapters(action, chapters):
+    """Stop scheduling new paid work after a chapter exhausts its repair limit."""
+    pairs = iter(enumerate(chapters))
+    results = [None]*len(chapters)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        pending = {pool.submit(action,pair):pair[0] for pair in [next(pairs,None) for _ in range(3)] if pair is not None}
+        while pending:
+            done,_ = wait(pending,return_when=FIRST_COMPLETED)
+            # Observe every completed failure before scheduling another chapter.
+            for future in done:
+                results[pending.pop(future)] = future.result()
+            for _ in done:
+                pair = next(pairs,None)
+                if pair is not None:
+                    pending[pool.submit(action,pair)] = pair[0]
+    return results
+
+
+def validate_chapter(raw, chapter, structure, lines, index, budget, cfg,minimum=0.,*,max_slots=None):
     slots = Slots.model_validate(raw).beats
     lookup = {s.id:s for s in lines}
     opening_ids = {s.id for s in lines if s.start < structure.opening_end and s.end > structure.opening_start}
@@ -255,7 +467,8 @@ def validate_chapter(raw, chapter, structure, lines, index, budget, cfg,minimum=
     seen = set()
     estimate = 0
     errors = []
-    max_slots = max(4, 95//len(structure.chapters))
+    if max_slots is None:
+        max_slots = chapter_slot_limits(chapter_budgets(structure,cfg))[index]
     if len(structure.chapters) == 1 and len(slots) < 3:
         errors.append('单章正文至少3个镜头，加上原声开场形成完整时间线')
     if len(slots) > max_slots:
@@ -269,20 +482,30 @@ def validate_chapter(raw, chapter, structure, lines, index, budget, cfg,minimum=
             errors.append(f'镜头{j}范围{slot.start}–{slot.end}越界、重叠或倒序；须在{max(chapter.start,last)}–{chapter.end}内且start<end，空间不足须替换前面的原声或合并镜头，不能追加零秒旁白')
         if not 1 <= slot.end-slot.start <= 40:
             errors.append(f'镜头{j}实长{slot.end-slot.start:.2f}秒，需在完整对白边界拆为1–40秒')
-        if slot.mode == 'original' and any(s.start+.2 < cut < s.end-.2 for s in lines for cut in (slot.start,slot.end)):
-            errors.append(f'镜头{j}原声切点落在字幕句中，须保留完整对白')
+        cut_lines = [(cut,s.id,s.start,s.end,s.text) for s in lines for cut in (slot.start,slot.end)
+                     if s.start+.2 < cut < s.end-.2] if slot.mode=='original' else []
+        if cut_lines:
+            errors.append(f'镜头{j}原声切点落在字幕句中：{cut_lines}；须移到所列句子的start或end，保留完整对白；'
+                          '若与前一旁白相接，一并调整旁白end，不能造成时间线重叠')
         if max(slot.start, structure.opening_start) < min(slot.end, structure.opening_end)-.04:
             errors.append(f'镜头{j}重复开场')
         teaser = opening_ids if cfg.opening == 'original_teaser' and index == 0 and j == 0 else set()
         if any(i not in lookup or (lookup[i].start >= slot.end and i not in teaser) for i in slot.evidence_ids):
             bad = [(i,lookup[i].start if i in lookup else None) for i in slot.evidence_ids
                    if i not in lookup or (lookup[i].start >= slot.end and i not in teaser)]
-            errors.append(f'镜头{j}结束于{slot.end}秒，引用无效或未来证据{bad}；改引已发生的对白或把镜头移至这些对白之后')
+            nearby = [(s.id,s.start,s.end,s.text) for s in lines if s.start<slot.end and s.end>slot.start and s.confidence>=.4]
+            errors.append(f'镜头{j}结束于{slot.end}秒，引用无效或未来证据{bad}；本画面实际对白{nearby[:16]}。'
+                '只有实际支持instruction才能改引，否则须一并重写instruction或把画面移到所需对白，不能只换编号')
         if not any(i in lookup and lookup[i].confidence >= .4 and
                    ((lookup[i].start < slot.end and lookup[i].end > slot.start) or
                     (slot.mode == 'narration' and (0 <= slot.start-lookup[i].end <= 15 or i in seen or i in teaser)))
                    for i in slot.evidence_ids):
-            errors.append(f'镜头{j}缺少时间匹配且可信的证据')
+            cited=[(i,lookup[i].start,lookup[i].end,round(lookup[i].confidence,3),lookup[i].text)
+                   for i in slot.evidence_ids if i in lookup]
+            nearby=[(s.id,s.start,s.end,s.text) for s in lines if s.confidence>=.4
+                    and slot.start-15<=s.start<min(chapter.end,slot.end+20)]
+            errors.append(f'镜头{j}缺少时间匹配且可信的证据：所引(编号/开始/结束/置信度/文本){cited}，置信度须>=0.4。'
+                f'附近可信对白{nearby[:16]}。不可借未来对白为当前画面作证；必要时把旁白和相邻原声合并改排到可信对白区间，再据实际证据改instruction')
         seen.update(i for i in slot.evidence_ids if i in lookup and lookup[i].start < slot.end)
         char_limit = min(280, round((slot.end-slot.start)*4.5))
         if slot.mode == 'narration' and not 5 <= slot.target_chars <= char_limit:
@@ -290,9 +513,10 @@ def validate_chapter(raw, chapter, structure, lines, index, budget, cfg,minimum=
             errors.append(f'镜头{j}字数预算{slot.target_chars}需适配画面{slot.end-slot.start:.2f}秒，{requirement}')
         estimate += slot.end-slot.start if slot.mode == 'original' else slot.target_chars/4.5
         last = slot.end
+    costs = [round(s.end-s.start if s.mode=='original' else s.target_chars/4.5,2) for s in slots]
     if estimate > budget+1:
-        errors.append(f'本章预计{estimate:.1f}秒超过预算{budget:.1f}秒，删重复与次要分支，保留完整问答')
+        errors.append(f'本章预计{estimate:.1f}秒超过预算{budget:.1f}秒，需至少减少{estimate-budget:.1f}秒；各镜头预计秒数{costs}。删重复与次要分支，必要时用简洁旁白替换完整次要原声，不能只改instruction或引用编号')
     if estimate < minimum:
-        errors.append(f'本章预计{estimate:.1f}秒不足预算下限{minimum:.1f}秒，补入本章有证据的必要剧情与完整对白，不能扩写空话')
+        errors.append(f'本章预计{estimate:.1f}秒不足预算下限{minimum:.1f}秒，还差{minimum-estimate:.1f}秒；各镜头预计秒数{costs}。补入本章有证据的必要剧情与完整对白，不能扩写空话')
     if errors:
         raise ValueError('; '.join(errors))

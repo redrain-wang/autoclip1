@@ -9,8 +9,8 @@ from .repair import RepairNeeded
 from .budget import spoken_characters
 from .util import digest, write_json
 
-VERSION = "oral-edit-15"
-AUDIENCE_STYLE_POLICY = 'audience-narration-4'
+VERSION = "oral-edit-16"
+AUDIENCE_STYLE_POLICY = 'audience-narration-5'
 WRITING_RULES = """
 剧情优先是所有新稿始终遵循的规则，优先于风格参考中的观点或分析要求。
 先讲清谁在何处、事件起因、行动、结果以及场景之间的承接，再在必要转折解释选择、压力或代价。
@@ -48,7 +48,11 @@ _PRODUCTION_LANGUAGE = re.compile(
 def unframed_role_speech(text):
     plain=re.sub(r'“[^”]*”|「[^」]*」|『[^』]*』|"[^\"]*"','',text)
     marks=[]
-    for match in re.finditer(r'朕|儿臣|奴才|本王|本官|您|(?:^|[，,。！？；：])\s*(?:侄儿|[你我](?!们))',plain):
+    # 奴才 is also an ordinary third-person noun (奴才端着饭 / 奴才们送火).
+    # Flag its characteristic self-address forms, not every mention of servants.
+    servant_self = (r'(?<![的这那个名些])奴才(?=该死|遵旨|遵命|领旨|知罪|有罪|罪该|不敢|斗胆|'
+                    r'叩见|叩谢|参见|谢恩|谢主子|谢皇上|请皇上|请主子|愿为|愿替|这就|给您|给主子|有一事禀报)')
+    for match in re.finditer(r'朕|儿臣|本王|本官|您|'+servant_self+r'|(?:^|[，,。！？；：])\s*(?:侄儿|[你我](?!们))',plain):
         prefix=re.split(r'[。！？；]',plain[:match.start()])[-1]
         if re.search(r'说|问|答|喊|解释|表示|反驳|称|请求|恳求|写道',prefix):continue
         marks.append('角色口吻未交代引述：'+match.group().strip('，,。！？；： '))

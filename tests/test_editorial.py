@@ -445,3 +445,22 @@ def test_plot_actions_and_in_story_evidence_are_not_production_language(text):
 def test_attributed_or_quoted_role_speech_is_allowed(text):
     clip=fixture_clip();clip.beats[1].text=text
     assert prose_signals(clip)==[]
+
+
+@pytest.mark.parametrize('text',[
+    '另一边，太子被圈禁的住处，奴才端着饭进来，可连火都没送。',
+    '回到园中，奴才们这才迟迟送火送饭。此前他连声催讨，无人应答。',
+    '十三爷斥责送火送饭的奴才来得太迟。',
+    '这个奴才端来一碗饭。',
+    '他回答，奴才遵旨。',
+    '他低头说：“奴才该死。”',
+])
+def test_servant_as_third_person_noun_or_attributed_quote_is_not_bare_role_speech(text):
+    clip=fixture_clip();clip.beats[1].text=text
+    assert prose_signals(clip)==[]
+
+
+@pytest.mark.parametrize('text',['奴才该死。','奴才遵旨。','奴才愿为主子效劳。','奴才有一事禀报。'])
+def test_unattributed_servant_self_address_is_still_rejected(text):
+    clip=fixture_clip();clip.beats[1].text=text
+    assert prose_signals(clip)

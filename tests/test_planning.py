@@ -44,6 +44,16 @@ def test_structure_cannot_overlap_chapters_or_leave_source(tmp_path):
     with pytest.raises(ValueError,match='章节'):validate_structure(structure,0,140,args[-1])
 
 
+def test_chronological_opening_feedback_identifies_actual_conflicting_times(tmp_path):
+    _,structure,_,_,_,cfg=fixture(tmp_path)
+    cfg.opening='original'
+    with pytest.raises(ValueError) as caught:
+        validate_structure(structure,0,140,cfg)
+    error=str(caught.value)
+    assert '100.00–120.00秒' in error and '从0.00秒开始' in error
+    assert '其他章节保持不变' in error and '设为新的opening_end' in error
+
+
 def test_short_original_utterances_merge_without_losing_intervening_dialogue():
     import copy
     from autoclip.planning import merge_continuous_originals
@@ -259,3 +269,202 @@ def test_short_chapter_is_rejected_before_writing_narration(tmp_path):
     _,structure,drafts,lines,_,cfg=fixture(tmp_path)
     with pytest.raises(ValueError,match='不足预算下限90.0秒'):
         validate_chapter(drafts[0],structure.chapters[0],structure,lines,0,100,cfg,minimum=90.)
+
+
+def test_unequal_chapters_have_feasible_slot_limits_without_exceeding_clip_cap():
+    from autoclip.planning import chapter_slot_limits, validate_chapter
+    budgets=[74,48,53,29,186,69,323,25,26,102,38,211]
+    limits=chapter_slot_limits(budgets)
+    assert sum(limits)==95 and min(limits)>=4
+    assert limits[6]>limits[3] and limits[6]*40>=budgets[6]
+    # The old 7-slot cap rejected this valid 320-second key scene.
+    structure=Structure(title='完整事件',angle='',hook='',opening_start=0,opening_end=20,opening_reason='',
+        chapters=[{'title':'场景','start':20+i*400,'end':420+i*400,'purpose':''} for i in range(12)])
+    start=structure.chapters[6].start
+    lines=[Line(id=i,start=start+i*40+1,end=start+i*40+39,text='完整对白') for i in range(8)]
+    draft={'beats':[dict(mode='narration' if i==0 else 'original',start=start+i*40,end=start+(i+1)*40,
+                        instruction='叙事',evidence_ids=[i],target_chars=180 if i==0 else 0) for i in range(8)]}
+    validate_chapter(draft,structure.chapters[6],structure,lines,6,323,Settings(),minimum=290,max_slots=limits[6])
+
+
+def test_chapter_repair_has_distinct_attempts_even_when_model_repeats_invalid_output(tmp_path,monkeypatch):
+    import autoclip.planning as module
+    video,structure,drafts,lines,seconds,cfg=fixture(tmp_path)
+    monkeypatch.setattr(module,'load_continuity',lambda *a:{'signature':'prior'})
+    monkeypatch.setattr(module,'continuity_prompt',lambda *a:'')
+    monkeypatch.setattr(module,'prepare_conflict_brief',lambda *a,**k:{})
+    monkeypatch.setattr(module,'brief_context',lambda _: {})
+    prompts=[]
+    drafts[0]['beats'][0]['target_chars']=300
+    class Model:
+        def json(self,system,prompt):
+            if '先定章节' in prompt:return structure.model_dump()
+            prompts.append(prompt)
+            return drafts[0]
+    with pytest.raises(ValueError,match='字数预算'):
+        module.plan_outline(video,tmp_path/'run',lines,seconds,cfg,Model())
+    assert len(prompts)==cfg.repair_attempts+1
+    assert len(set(prompts))==len(prompts)
+
+
+def test_chapter_failure_stops_scheduling_remaining_paid_work():
+    from threading import Event, Timer
+    from autoclip.planning import bounded_chapters
+    release=Event();started=[]
+    def action(pair):
+        started.append(pair[0])
+        if pair[0]==0:
+            raise ValueError('修复已用尽')
+        assert release.wait(2)
+        return pair[0]
+    timer=Timer(.1,release.set);timer.start()
+    try:
+        with pytest.raises(ValueError,match='修复已用尽'):
+            bounded_chapters(action,list(range(12)))
+    finally:
+        release.set();timer.join()
+    assert set(started).issubset({0,1,2})
+    assert bounded_chapters(lambda pair:pair[1]*2,[3,1,4,2])==[6,2,8,4]
+
+
+def test_chapter_voice_notes_exclude_unseen_future_ids():
+    import json
+    from autoclip.planning import chapter_voice_notes
+    notes=json.dumps({'policy':'候选不是定论','lines':[{'id':1,'names':['甲']},{'id':90,'names':['乙']}]})
+    result=json.loads(chapter_voice_notes(notes,[Line(id=1,start=1,end=2,text='当场对白')]))
+    assert result=={'policy':'候选不是定论','lines':[{'id':1,'names':['甲']}]}
+    assert chapter_voice_notes('开发备注',[])=='开发备注'
+
+
+def timed_chapter(seconds):
+    beats=[]
+    while seconds:
+        part=min(40,seconds)
+        beats.append(dict(mode='original',start=len(beats)*40,end=len(beats)*40+part,
+                          instruction='完整对白',evidence_ids=[len(beats)]))
+        seconds-=part
+    return {'beats':beats}
+
+
+def test_chapter_overrun_can_borrow_time_when_whole_film_meets_delivery_range(tmp_path):
+    from autoclip.planning import balance_chapter_durations
+    cfg=Settings(duration_profile="long",target_seconds=1200,min_seconds=1080,max_seconds=1320)
+    drafts=[timed_chapter(65),timed_chapter(1115)]
+    def forbidden(*a,**k):pytest.fail('全片合格，无需为局部5秒重写')
+    assert balance_chapter_durations(drafts,[60,1120],20,cfg,forbidden,[],tmp_path)==drafts
+
+
+@pytest.mark.parametrize('estimates,expected_index', [([800,600],0),([400,500],0)])
+def test_whole_film_budget_repairs_only_largest_mismatch_and_rechecks_total(tmp_path,estimates,expected_index):
+    from autoclip.planning import balance_chapter_durations, Chapter, chapter_seconds
+    cfg=Settings(duration_profile="long",target_seconds=1200,min_seconds=1080,max_seconds=1320)
+    chapters=[Chapter(title='事件',start=0,end=1400,purpose='完整起因结果') for _ in range(2)]
+    calls=[]
+    def rewrite(pair,**kwargs):
+        calls.append((pair,kwargs))
+        return timed_chapter(590)
+    original=[timed_chapter(s) for s in estimates]
+    result=balance_chapter_durations(original,[590,590],20,cfg,rewrite,chapters,tmp_path)
+    assert len(calls)==1 and calls[0][0][0]==expected_index
+    assert result[1] is original[1]
+    assert 1080<=20+sum(chapter_seconds(d) for d in result)<=1320
+    assert calls[0][1]['previous']==original[0]
+    if sum(estimates)<1080:assert calls[0][1]['minimum_override']==590
+
+
+def test_whole_film_budget_cannot_be_bypassed_by_repeating_same_chapter(tmp_path):
+    from autoclip.planning import balance_chapter_durations, Chapter
+    cfg=Settings(duration_profile="long",target_seconds=1200,min_seconds=1080,max_seconds=1320,repair_attempts=2)
+    chapter=Chapter(title='事件',start=0,end=1600,purpose='完整事件')
+    calls=[]
+    def unchanged(pair,**kwargs):calls.append(pair);return kwargs['previous']
+    with pytest.raises(ValueError,match='预算协调已达上限'):
+        balance_chapter_durations([timed_chapter(1400)],[1180],20,cfg,unchanged,[chapter],tmp_path)
+    assert len(calls)==2
+
+
+def test_long_original_split_preserves_exact_continuous_audio_and_bad_citations():
+    from autoclip.planning import split_long_originals
+    lines=[Line(id=i,start=i*10,end=i*10+9,text='完整对白') for i in range(6)]
+    raw={'beats':[dict(mode='original',start=0,end=59,instruction='连续对话',evidence_ids=[0,1,2,3,4,5,999])]}
+    result=split_long_originals(raw,lines)['beats']
+    assert len(result)==2
+    assert result[0]['start']==0 and result[-1]['end']==59
+    assert result[0]['end']==result[1]['start']
+    assert all(1<=b['end']-b['start']<=40 for b in result)
+    assert 999 in result[0]['evidence_ids']
+    assert all(not s.start+.2<b['end']<s.end-.2 for s in lines for b in result)
+    # No invented cut within an indivisible long utterance.
+    impossible=[Line(id=0,start=0,end=59,text='一个长句')]
+    assert split_long_originals(raw,impossible)=={'beats':[{**raw['beats'][0],'target_chars':0}]}
+
+
+def test_film_slot_budget_is_checked_even_when_duration_passes(tmp_path):
+    from autoclip.planning import balance_chapter_durations, Chapter
+    cfg=Settings(duration_profile='long',target_seconds=1200,min_seconds=1080,max_seconds=1320)
+    chapters=[Chapter(title='事件',start=0,end=1500,purpose='完整剧情') for _ in range(2)]
+    drafts=[{'beats':[dict(mode='original',start=i*12,end=(i+1)*12,instruction='完整对白',evidence_ids=[i]) for i in range(48)]} for _ in range(2)]
+    calls=[]
+    def rewrite(pair,**kwargs):
+        calls.append(kwargs)
+        return {'beats':kwargs['previous']['beats'][:kwargs['max_slots_override']]}
+    result=balance_chapter_durations(drafts,[590,590],20,cfg,rewrite,chapters,tmp_path)
+    assert len(calls)==1 and sum(len(d['beats']) for d in result)<=95
+
+
+def test_duration_and_slot_overruns_are_repaired_together_in_bounded_round(tmp_path):
+    from autoclip.planning import balance_chapter_durations, Chapter, chapter_seconds
+    cfg=Settings(duration_profile='long',target_seconds=1200,min_seconds=1080,max_seconds=1320,repair_attempts=1)
+    chapters=[Chapter(title='事件',start=0,end=1500,purpose='完整剧情') for _ in range(3)]
+    drafts=[{'beats':[dict(mode='original',start=i*15,end=(i+1)*15,instruction='完整对白',evidence_ids=[i]) for i in range(36)]} for _ in range(3)]
+    calls=[]
+    def rewrite(pair,**kwargs):
+        calls.append(kwargs)
+        assert kwargs['budget_override']<540 and kwargs['max_slots_override']<36
+        return timed_chapter(int(kwargs['budget_override']))
+    result=balance_chapter_durations(drafts,[394,393,393],20,cfg,rewrite,chapters,tmp_path)
+    assert len(calls)==3
+    assert 1080<=20+sum(chapter_seconds(d) for d in result)<=1320
+    assert sum(len(d['beats']) for d in result)<=95
+
+
+def test_cut_and_low_confidence_feedback_include_actual_source_boundaries(tmp_path):
+    from autoclip.planning import validate_chapter
+    _,structure,drafts,lines,_,cfg=fixture(tmp_path)
+    drafts[0]['beats'][1]['start']=25
+    lines[0].confidence=.2
+    with pytest.raises(ValueError) as caught:
+        validate_chapter(drafts[0],structure.chapters[0],structure,lines,0,100,cfg)
+    error=str(caught.value)
+    assert '(25.0, 1, 21.0, 35.0' in error
+    assert '置信度须>=0.4' in error and '附近可信对白' in error
+
+
+def test_budget_selection_preserves_source_intervals_and_evidence(tmp_path):
+    from autoclip.planning import apply_budget_selection
+    _,_,drafts,_,_,_=fixture(tmp_path)
+    edit={'keep':[0,1,3],'narration':[{'index':1,'instruction':'转述已经发生的问答','target_chars':45,'evidence_ids':[1]}],
+          'rationale':'保留起因结果，转述重复问答'}
+    result=apply_budget_selection(drafts[0],edit)
+    assert [(b['start'],b['end']) for b in result['beats']]==[(0,20),(20,40),(60,80)]
+    assert result['beats'][1]['mode']=='narration'
+    assert drafts[0]['beats'][1]['mode']=='original'
+    edit['narration'][0]['evidence_ids']=[999]
+    with pytest.raises(ValueError,match='不能新增证据'):apply_budget_selection(drafts[0],edit)
+    edit['keep']=[1,0,1]
+    with pytest.raises(ValueError,match='不重复'):apply_budget_selection(drafts[0],edit)
+
+
+def test_budget_editor_checks_real_cost_and_retries_only_selection(tmp_path):
+    from autoclip.planning import revise_chapter_budget, chapter_seconds
+    _,structure,drafts,lines,_,cfg=fixture(tmp_path)
+    calls=[]
+    class Model:
+        def json(self,system,prompt):
+            calls.append(prompt)
+            return {'keep':[0,1,2,3] if len(calls)==1 else [0,1,3],
+                    'narration':[] if len(calls)==1 else [{'index':1,'instruction':'转述问答','target_chars':45,'evidence_ids':[1]}],
+                    'rationale':'保留起因结果与必要转场'}
+    result=revise_chapter_budget(drafts[0],structure.chapters[0],structure,lines,0,50,0,3,cfg,Model(),tmp_path,1)
+    assert len(calls)==2 and chapter_seconds(result)==50
+    assert '超过预算' in calls[1] and '不要重写时间戳' in calls[0]
