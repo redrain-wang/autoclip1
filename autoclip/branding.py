@@ -176,12 +176,14 @@ def make_cover(source: Path, manifest: dict, folder: Path, series: str, brand: B
 
 def package_clip(source: Path, root: Path, manifest: dict, index: int, series: str, brand: BrandSettings):
     """Brand from the clean render, never from an already watermarked output."""
+    from .editorial import require_audience_timeline
+    require_audience_timeline(manifest.get('timeline',[]))
+    if manifest.get('base_manifest'):
+        manifest = read_json(Path(manifest['base_manifest']))
+        require_audience_timeline(manifest.get('timeline',[]))
     if not brand.enabled:
-        base = manifest.get("base_manifest")
-        return read_json(Path(base)) if base else manifest
+        return manifest
     brand = brand.for_clip(index)
-    if manifest.get("base_manifest"):
-        manifest = read_json(Path(manifest["base_manifest"]))
     clean = Path(manifest["video"])
     logo_sha = hashlib.sha256(brand.watermark.read_bytes()).hexdigest()
     signature = digest({"version": VERSION, "video": source_identity(clean), "title": manifest["title"],
@@ -194,6 +196,7 @@ def package_clip(source: Path, root: Path, manifest: dict, index: int, series: s
     saved = folder / "manifest.json"
     if saved.exists():
         cached = read_json(saved)
+        require_audience_timeline(cached.get('timeline',[]))
         files = [cached["video"], cached["poster"]] + ([cached["cover"]] if brand.cover else [])
         if all(Path(p).is_file() for p in files):
             if brand.cover and cached.get("cover_details", {}).get("version") != COVER_VERSION:

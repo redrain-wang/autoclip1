@@ -7,21 +7,27 @@ import time
 from pathlib import Path
 
 from .util import read_json, write_json
+from .editorial import require_audience_timeline
 
 
 def export_finished(output: Path) -> Path:
+    batches=[]
+    # Preflight every candidate before replacing any previous delivery file.
+    for result in sorted(output.glob('*/results.json')):
+        state=result.parent/'status.json'
+        if state.exists() and read_json(state).get('stage') in {'已完成','部分完成','等待新增声纹确认'}:
+            clips=read_json(result)
+            for clip in clips:require_audience_timeline(clip['timeline'])
+            batches.append((result,clips))
     target = output / "成片"
     target.mkdir(parents=True, exist_ok=True)
     previous = read_json(target / "清单.json") if (target / "清单.json").exists() else []
     completed = 0
     entries, script = [], ["# 成片与最终解说稿", "", "时间码指向原片。以下文本来自实际成片，包含配音时长校准后的修改。", ""]
-    for result in sorted(output.glob("*/results.json")):
-        state = result.parent / "status.json"
-        if not state.exists() or read_json(state).get("stage") not in {"已完成", "部分完成", "等待新增声纹确认"}:
-            continue
+    for result,clips in batches:
         completed += 1
         episode = result.parent.name.split("-", 1)[0]
-        for number, clip in enumerate(read_json(result), 1):
+        for number, clip in enumerate(clips, 1):
             safe_title = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", clip["title"]).strip("_")[:45]
             prefix = '测试样片_' if clip.get('task_kind') == 'test_sample' else ''
             filename = f"{prefix}{episode}-{number:02d}_{safe_title}.mp4"

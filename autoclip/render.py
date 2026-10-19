@@ -5,7 +5,7 @@ from pathlib import Path
 from rich.console import Console
 
 from .config import Settings
-from .editorial import WRITING_RULES, require_oral_style
+from .editorial import WRITING_RULES, require_oral_style, require_audience_timeline
 from .llm import LLM
 from .models import Clip, Line
 from .repair import voice_fits
@@ -153,6 +153,7 @@ def fit_narration(beat, root, cfg, llm, lines):
     text = beat.text
     available = beat.end - beat.start
     for attempt in range(3):
+        require_audience_timeline([{'mode':'narration','text':text}])
         voice = synthesize(text, root, cfg)
         length = duration(voice)
         ratio = (length + .35) / available
@@ -197,6 +198,10 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
         from .util import read_json
         manifest = read_json(manifest_path)
         if abs(duration(final) - manifest["duration"]) < .3:
+            cached_timeline = manifest.get('timeline',[])
+            if len(cached_timeline) != len(clip.beats):
+                raise ValueError('缓存成片缺少完整口播时间线，无法复核实际口播')
+            require_audience_timeline(cached_timeline)
             # Cached audio may contain a shortened version of the original plan.
             # Recheck the actual spoken text when identity references change.
             if cfg.identity_gate:
@@ -263,11 +268,7 @@ def render_clip(video: Path, root: Path, clip: Clip, index: int, cfg: Settings, 
         cursor += actual
         segments.append(segment)
         console.print(f"[cyan]{video.stem} 成片{index+1} 镜头 {i+1}/{len(clip.beats)} 完成[/cyan]", highlight=False)
-    if cfg.oral_edit and not getattr(llm,"frozen_script",False):
-        spoken_clip = clip.model_copy(deep=True)
-        for beat,item in zip(spoken_clip.beats,timeline):
-            beat.text = item['text']
-        require_oral_style(spoken_clip)
+    require_audience_timeline(timeline)
     changes = [{"before": b.text, "after": t["text"], "evidence": [s.model_dump() for s in lines if s.id in b.evidence_ids]}
                for b,t in zip(clip.beats,timeline) if b.text != t["text"]]
     if changes:

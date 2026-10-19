@@ -10,7 +10,7 @@ from .budget import spoken_characters
 from .util import digest, write_json
 
 VERSION = "oral-edit-15"
-AUDIENCE_STYLE_POLICY = 'audience-narration-3'
+AUDIENCE_STYLE_POLICY = 'audience-narration-4'
 WRITING_RULES = """
 剧情优先是所有新稿始终遵循的规则，优先于风格参考中的观点或分析要求。
 先讲清谁在何处、事件起因、行动、结果以及场景之间的承接，再在必要转折解释选择、压力或代价。
@@ -39,8 +39,9 @@ WRITING_RULES = """
 _CLINICAL = re.compile(r"客观定论|人格结论|控诉方的推论|证据只到|证据局限|不能顺势坐实|"
                        r"单凭[^。！？]{0,35}(?:不能|无法)断定|需进一步核实")
 _PRODUCTION_LANGUAGE = re.compile(
-    r'字幕(?:里|中|上|所|显示|写|说|提|表明|证明|明确)|(?:根据|依据|从)(?:这段|本段|上述|这些)?字幕|'
+    r'字幕(?:里|中|上|所|显示|写|说|提|表明|证明|明确|告诉|交代|说明|给出)|(?:根据|依据|从)(?:这段|本段|上述|这些)?字幕|'
     r'(?:镜头|画面)(?:里|中)(?:有人|有个|一个|能|可|我们|显示|出现|看到|看见|只)|'
+    r'从(?:这段|本段|当前|眼前的?)?(?:镜头|画面)(?:里|中)?(?:可以|能够|能|可)?(?:看到|看出|判断|得知)|'
     r'ASR|转写稿|转写结果|声纹候选|声纹库|证据ID|字幕ID|evidence_ids|frame_ids|审核记录',re.IGNORECASE)
 
 
@@ -87,10 +88,16 @@ class FactualChangeReview(BaseModel):
 
 
 def prose_signals(clip):
+    return timeline_prose_signals([b.model_dump() for b in clip.beats])
+
+
+def timeline_prose_signals(timeline):
+    """Inspect the text actually spoken, including revised/cached manifests."""
     rows = []
-    for i, beat in enumerate(clip.beats):
-        if beat.mode == "narration":
-            marks = _CLINICAL.findall(beat.text)+_PRODUCTION_LANGUAGE.findall(beat.text)+unframed_role_speech(beat.text)
+    for i, beat in enumerate(timeline):
+        if beat['mode'] == "narration":
+            text=beat['text']
+            marks = _CLINICAL.findall(text)+_PRODUCTION_LANGUAGE.findall(text)+unframed_role_speech(text)
             if marks:
                 rows.append({"beat": i, "phrases": marks})
     return rows
@@ -308,6 +315,10 @@ def polish_clip(clip, lines, root, cfg, llm, context=None):
 
 
 def require_oral_style(clip):
-    if signals := prose_signals(clip):
+    require_audience_timeline([b.model_dump() for b in clip.beats])
+
+
+def require_audience_timeline(timeline):
+    if signals := timeline_prose_signals(timeline):
         raise RepairNeeded({'stage':'oral_style','issues':[{'code':'semantic_review',
                            'message':'口播仍有制作或审查措辞，须面向观众讲剧情：'+json.dumps(signals,ensure_ascii=False)}]})

@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from .models import Plan
+from .editorial import require_audience_timeline
 from .util import digest, read_json, write_json
 
 
@@ -46,6 +47,7 @@ def edit_narration(plan_path, output, text, beat=None, at=None, manifest=None):
         raise ValueError('这个位置是原声，请定位到要修改的解说段')
     old = target.text
     target.text = text.strip()
+    require_audience_timeline([target.model_dump()])
     plan = Plan.model_validate(plan.model_dump())
     record = {'status': 'edited_draft_not_remeasured', 'base_plan': str(Path(plan_path).resolve()),
               'base_digest': before, 'new_digest': digest(plan.model_dump()),

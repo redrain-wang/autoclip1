@@ -13,7 +13,7 @@ from .config import Settings
 from .continuity import load_continuity
 from .deliver import export_finished
 from .director import analyze
-from .editorial import VERSION as ORAL_VERSION
+from .editorial import VERSION as ORAL_VERSION, AUDIENCE_STYLE_POLICY, require_audience_timeline
 from .ingest import save_transcript, transcribe
 from .llm import LLM
 from .models import Line, Plan, validate_plan
@@ -46,6 +46,7 @@ def delivery_policy(cfg, test_sample=False):
 
 def check_delivery(finished, cfg, root, test_sample=False):
     """Probe even a cached deliverable before it becomes a completed result."""
+    require_audience_timeline(finished.get('timeline',[]))
     policy = delivery_policy(cfg,test_sample)
     actual = duration(Path(finished['video']))
     passed = policy['min_seconds'] <= actual <= policy['max_seconds']
@@ -297,7 +298,8 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
             state('自动测时、内容核对与局部修复')
             plan,report = complete_long_plan(video,Plan.model_validate(draft),lines,voices,root,cfg,llm)
             return {'plan':plan.model_dump(),'report':report},[root/'plan-approved.json',root/'automatic-review.json',*[Path(f['path']) for f in report['frames']]]
-        approved = checkpoint(root,'approval',{'inputs':inputs,'draft':draft,'voices':voices,'review_version':REVIEW_VERSION},approve_action)
+        approved = checkpoint(root,'approval',{'inputs':inputs,'draft':draft,'voices':voices,'review_version':REVIEW_VERSION,
+            'audience_style_policy':AUDIENCE_STYLE_POLICY},approve_action)
         plan = Plan.model_validate(approved['plan'])
         assert_approval(approved['report'],video,plan,lines,voices)
         def render_action():
@@ -313,7 +315,8 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
             finished = package_clip(video,root,clean,index,cfg.series,brand)
             finished['production_id'] = digest([inputs,approved['plan']])
             return finished,[Path(finished[k]) for k in ('video','cover','poster') if finished.get(k)]
-        finished = checkpoint(root,'render',{'inputs':inputs,'approved':approved},render_action)
+        finished = checkpoint(root,'render',{'inputs':inputs,'approved':approved,
+            'audience_style_policy':AUDIENCE_STYLE_POLICY},render_action)
         finished = check_delivery(finished,cfg,root,test_sample)
         if source_identity(video) != inputs['source']:
             raise ValueError('制作期间原片发生变化，不能交付此版本')

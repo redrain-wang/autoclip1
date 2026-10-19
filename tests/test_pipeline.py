@@ -269,3 +269,11 @@ def test_real_render_has_audio_video_and_valid_timeline(tmp_path, monkeypatch):
     # Rebranding a branded manifest must reuse the clean base and cached package.
     monkeypatch.setattr(branding, "run", lambda *a, **kw: pytest.fail("重跑不应重新合成"))
     assert branding.package_clip(source, tmp_path, finished, 0, "测试作品", brand) == finished
+    # Clean input must not conceal bad spoken text in an old branded cache.
+    from autoclip.repair import RepairNeeded
+    from autoclip.util import write_json
+    corrupted = {**finished,'timeline':[dict(b) for b in finished['timeline']]}
+    corrupted['timeline'][changed_index]['text']='字幕里说，这场问答结束了。'
+    write_json(Path(finished['video']).parent/'manifest.json',corrupted)
+    with pytest.raises(RepairNeeded,match='制作或审查措辞'):
+        branding.package_clip(source,tmp_path,result,0,'测试作品',brand)

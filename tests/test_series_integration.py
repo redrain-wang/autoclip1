@@ -83,6 +83,14 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
     assert not list(output.rglob('development-review.json'))
     approval=read_json(Path(result['episodes'][0]['run'])/'automatic-review.json')
     assert approval['mode']=='automatic_source_review' and approval['passed']
+    # A global narration policy update must re-audit cached long-form work,
+    # while preserving the draft, source analysis and valid media bytes.
+    count=len(calls)
+    monkeypatch.setattr(series,'AUDIENCE_STYLE_POLICY','audience-next-test')
+    refreshed=series.run_series(source,output,test_sample=True)
+    assert refreshed['status']=='completed',refreshed
+    assert len(calls)>count and all('审核员' in call for call in calls[count:])
+    assert result_video.read_bytes()==before
     # A review algorithm update must refresh the persisted evidence as well as
     # the approval, even when source, library and run directory do not change.
     from autoclip import automatic

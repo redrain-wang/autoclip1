@@ -190,7 +190,7 @@ def test_cached_render_checks_actual_spoken_text(tmp_path, monkeypatch, legacy):
     folder = tmp_path / "renders" / f"01-{key}"
     folder.mkdir(parents=True)
     (folder / "video.mp4").write_bytes(b"cached")
-    write_json(folder / "manifest.json", {"duration": 10, "timeline": [{"text": "太子交出户部"} for _ in range(4)]})
+    write_json(folder / "manifest.json", {"duration": 10, "timeline": [{"mode":"narration","text": "太子交出户部"} for _ in range(4)]})
     monkeypatch.setattr(render, "duration", lambda *args: 10)
     def check(video, root, actual, *args):
         if actual.beats[0].text == "太子交出户部":
