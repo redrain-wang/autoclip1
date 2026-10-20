@@ -127,3 +127,27 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
     third_root=Path(third['episodes'][0]['run'])
     assert Path(read_json(third_root/'reference-resume.json')['previous_plan']).parent==resumed_root
     assert len(calls)>count and all('审核员' in call for call in calls[count:])
+    # A service failure after a measured repair resumes that current draft,
+    # not the older pre-enrollment reference, and successful reruns stay cached.
+    real_complete=series.complete_long_plan
+    attempts=[]
+    fixed_text='有人提出问题，对方随后作了回应，谈话还在继续。'
+    def interrupt_after_measurement(v,plan,rows,voices,root,*args,**kwargs):
+        attempts.append(plan.model_dump())
+        if len(attempts)==1:
+            plan.clips[0].beats[1].text=fixed_text
+            write_json(root/'plan-timed.json',plan.model_dump())
+            raise RuntimeError('测试服务中断')
+        assert plan.clips[0].beats[1].text==fixed_text
+        return real_complete(v,plan,rows,voices,root,*args,**kwargs)
+    monkeypatch.setattr(series,'complete_long_plan',interrupt_after_measurement)
+    monkeypatch.setattr(series,'AUDIENCE_STYLE_POLICY','resume-after-service-test')
+    assert series.run_series(source,output,test_sample=True)['status']=='partial_failure'
+    count=len(calls)
+    continued=series.run_series(source,output,test_sample=True)
+    assert continued['status']=='completed',continued
+    assert len(calls)>count and all('审核员' in call for call in calls[count:])
+    assert read_json(third_root/'plan-approved.json')['clips'][0]['beats'][1]['text']==fixed_text
+    count=len(calls)
+    assert series.run_series(source,output,test_sample=True)['status']=='completed'
+    assert len(calls)==count and len(attempts)==2

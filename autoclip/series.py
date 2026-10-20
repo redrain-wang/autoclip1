@@ -297,6 +297,29 @@ def resume_long_reference(video, root, inputs, lines, voices, cfg, seconds):
     return plan
 
 
+def resume_current_long_draft(root, inputs, lines, voices, cfg, seconds, initial):
+    """Resume inside the approval action so its stable checkpoint key is unchanged."""
+    try:
+        if (root.name!=digest(inputs) or read_json(root/'source.json')!=inputs['source']
+                or read_json(root/'transcript.json')!=inputs['lines']
+                or read_json(root/'settings.json')!=inputs['cfg']
+                or read_json(root/'voice-evidence.json')!=voices):
+            return initial
+        path=root/'plan-timed.json'
+        plan=Plan.model_validate(read_json(path))
+        validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+        lookup={s.id:s for s in lines}
+        if any(lookup[i].start>=b.end for b in plan.clips[0].beats if b.mode=='narration'
+               for i in b.evidence_ids):
+            return initial
+    except (OSError,ValueError,KeyError,TypeError):
+        return initial
+    write_json(root/'current-draft-resume.json',{'previous_plan':str(path.resolve()),
+        'plan_digest':digest(plan.model_dump()),'inputs_digest':digest(inputs),
+        'status':'requires_full_measurement_and_review'})
+    return plan
+
+
 def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, brand, index, test_sample=False):
     previous = load_continuity(video,cfg)
     inputs = {'v':VERSION,'source':source_identity(video),'lines':[s.model_dump() for s in lines],
@@ -345,7 +368,8 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
                  if recovered is None else recovered.model_dump())
         def approve_action():
             state('自动测时、内容核对与局部修复')
-            plan,report = complete_long_plan(video,Plan.model_validate(draft),lines,voices,root,cfg,llm)
+            pending=resume_current_long_draft(root,inputs,lines,voices,cfg,seconds,Plan.model_validate(draft))
+            plan,report = complete_long_plan(video,pending,lines,voices,root,cfg,llm)
             return {'plan':plan.model_dump(),'report':report},[root/'plan-approved.json',root/'automatic-review.json',*[Path(f['path']) for f in report['frames']]]
         approved = checkpoint(root,'approval',{'inputs':inputs,'draft':draft,'voices':voices,'review_version':REVIEW_VERSION,
             'audience_style_policy':AUDIENCE_STYLE_POLICY},approve_action)

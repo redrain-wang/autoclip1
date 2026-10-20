@@ -156,3 +156,29 @@ def test_long_reference_resume_preserves_draft_but_never_approval(tmp_path,monke
         assert read_json(root/'reference-resume.json')['status']=='requires_full_measurement_and_review'
         assert read_json(root/'research.json')=={'notes':'model draft'}
     assert not (root/'automatic-review.json').exists() and not (root/'plan-approved.json').exists()
+
+
+@pytest.mark.parametrize('change',[None,'source','transcript','settings','voices','root','future'])
+def test_current_long_draft_resume_requires_same_inputs_and_reaudits(tmp_path,monkeypatch,change):
+    from autoclip.models import Plan
+    video,library,bank,cfg,base,lines,voices,old,report,calls=failed_run(tmp_path,monkeypatch)
+    cfg=cfg.model_copy(update={'opening':'narration','min_seconds':1,'max_seconds':90,'target_seconds':45})
+    inputs={'source':source_identity(video),'lines':[s.model_dump() for s in lines],
+        'cfg':cfg.model_dump(mode='json'),'bank':'bank','prior':'prior'}
+    root=base/'runs'/digest(inputs)
+    saved=read_json(old/'plan-timed.json')
+    for beat in saved['clips'][0]['beats'][2:]:beat.update(mode='original',text='')
+    initial=Plan.model_validate(saved).model_copy(deep=True)
+    saved['clips'][0]['beats'][1]['text']='已经自动修好的旁白。'
+    for name,value in [('source.json',inputs['source']),('transcript.json',inputs['lines']),
+        ('settings.json',inputs['cfg']),('voice-evidence.json',voices),('plan-timed.json',saved)]:
+        write_json(root/name,value)
+    if change in {'source','transcript','settings'}:write_json(root/(change+'.json'),{})
+    elif change=='voices':write_json(root/'voice-evidence.json',{})
+    elif change=='root':inputs['prior']='different'
+    elif change=='future':
+        saved['clips'][0]['beats'][0]['evidence_ids']=[0,3];write_json(root/'plan-timed.json',saved)
+    resumed=series.resume_current_long_draft(root,inputs,lines,voices,cfg,100,initial)
+    assert resumed.model_dump()==(saved if change is None else initial.model_dump())
+    assert not (root/'plan-approved.json').exists()
+    if change is None:assert read_json(root/'current-draft-resume.json')['status']=='requires_full_measurement_and_review'
