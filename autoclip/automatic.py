@@ -664,6 +664,14 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                 repair_images.append(subtitle_evidence_sheet(Path(source['path']),image_root,zoom_lines,'captions'))
                 prompt += ('\n附图是实际原片字幕放大图，按原片可见文字核对ASR同音字，不盲从ASR或上轮审核意见，'
                            '不把短促呼喝误识当作新人物姓名；看不清不得补字。身份仍依当前证据与称呼回应，不能猜。')
+            if 'start' in target:
+                a,b=target['start'],target['end']
+                times=[round(t,3) for t in (a+.1,(a+b)/2,b-.1)]
+                repair_images.append(contact_sheet(Path(source['path']),image_root/'selected',times,'selected'))
+                prompt += ('\n最后一张图是当前实际剪入区间的首、中、尾画面，时间为'+json.dumps(times)
+                    +'。它与引用对白的字幕图可能处于不同时间：此前对白可支持自然回顾，'
+                    '不能据此前字幕图虚构当前画面中的人物、道具或动作。修复画面不符时必须对照这张图，'
+                    '删除无据细节，直接交代有证据的剧情；不要把画面核对过程写进口播。')
         feedback = ''
         for retry in range(cfg.repair_attempts+1):
             raw = (llm.json('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback,repair_images)

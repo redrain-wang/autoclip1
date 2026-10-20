@@ -409,12 +409,19 @@ def test_local_writer_receives_actual_caption_evidence_not_only_reviewer_claim(t
     lines,plan=fixture_plan()
     video=tmp_path/'source.mp4';video.write_bytes(b'video')
     frame=tmp_path/'caption.jpg';frame.write_bytes(b'caption')
+    selected_frame=tmp_path/'selected.jpg';selected_frame.write_bytes(b'selected')
     captured=[]
     def sheet(video,root,selected,name):captured.extend(s.id for s in selected);return frame
     monkeypatch.setattr(module,'subtitle_evidence_sheet',sheet)
+    def selected_sheet(video,root,times,name):
+        target=plan.clips[0].beats[0]
+        assert times==[round(t,3) for t in (target.start+.1,(target.start+target.end)/2,target.end-.1)]
+        return selected_frame
+    monkeypatch.setattr(module,'contact_sheet',selected_sheet)
     class Model:
         def json(self,system,prompt,images):
-            assert images==[frame] and '实际原片字幕放大图' in prompt
+            assert images==[frame,selected_frame] and '实际原片字幕放大图' in prompt
+            assert '当前实际剪入区间' in prompt and '不能据此前字幕图虚构当前画面' in prompt
             return {'changes':[{'id':'beat-0','text':'按原片可见文字作必要承接','evidence_ids':[0]}]}
     revised=module.repair_plan(plan,[{'id':'beat-0','message':'字幕0的转写字形有误'}],lines,
         {'source':source_identity(video),'lines':[]},tmp_path,Settings(target_seconds=45),Model(),0,source_seconds=40)
