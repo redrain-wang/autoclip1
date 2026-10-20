@@ -248,9 +248,17 @@ def review_citation_limits(units, lines, voice_rows):
 def review_recheck_reason(issues, units):
     """Request a bounded source recheck, never silently dismiss a failed unit."""
     original={u['id'] for u in units if u.get('mode')=='original'}
+    text_by_id={u['id']:u.get('text','') for u in units}
+    normalize=lambda text:re.sub(r'[\s，,。；;：:！？!?“”「」"、]','',text)
     reasons=[]
     for issue in issues:
         message=issue['message']
+        alleged=re.findall(r'(?:旁白|口播|正文|稿件)(?:却误|却|误|竟|仍)?'
+            r'(?:写成|写为|称为|说成|使用了?|用了?)[“「"]([^”」"]+)[”」"]',message)
+        if any(normalize(word) not in normalize(text_by_id.get(issue['id'],'')) for word in alleged):
+            reasons.append('审核引述的错误措辞不在该单位实际口播中。该单位实际text为'
+                +json.dumps(text_by_id.get(issue['id'],''),ensure_ascii=False)
+                +'；先逐字核对待审稿，再比较原片，不能改写不存在的文字。其他真实人物或事实问题仍须指出。')
         if re.search(r'“([^”]+)”(?:而非|而不是|不是)“\1”',message):
             reasons.append('审核把相同文字说成不同内容；请核对原片与旁白的实际差异，允许准确同义概括。')
         if re.search(r'(?:字幕|放大图|画面).{0,20}标注.{0,12}(?:说话者|人物|为|是)',message):

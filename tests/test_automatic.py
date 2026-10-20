@@ -655,3 +655,15 @@ def test_invalid_frame_feedback_gives_exact_main_sheet_bounds():
         'evidence_ids':[0],'frame_ids':[9],'identity_basis':'no_identity_claim','subjects':[]}]}
     with pytest.raises(ValueError,match=r'frame_ids只能为\[0, 1, 2\]'):
         assess_batch(raw,[{'id':'beat-0'}],[Line(id=0,start=0,end=3,text='对白')],3,[])
+
+
+@pytest.mark.parametrize('actual,expected',[
+    ('随后有人引路，称一声“二爷，您请”。',True),
+    ('随后有人引路，称一声“阿爷”。',False),
+    ('随后有人引路，称一声“阿 爷”。',False)])
+def test_review_must_quote_actual_target_before_requesting_word_correction(actual,expected):
+    from autoclip.automatic import review_recheck_reason
+    reasons=review_recheck_reason([{'id':'beat-23','message':'引路称呼应为“二爷，您请”，旁白写成“阿爷”，与画面字幕不符。'}],
+        [{'id':'beat-23','text':actual}])
+    assert bool(reasons)==expected
+    if expected:assert actual in reasons[0]
