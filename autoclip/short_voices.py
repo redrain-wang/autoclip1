@@ -111,6 +111,11 @@ def prepare_voice_followup(video, lines, voices, root, cfg, library, story_roots
     for folder in story_roots:
         if not (folder/'automatic-review.json').exists():continue
         report=read_json(folder/'automatic-review.json')
+        state_path=folder/'automatic-review-state.json'
+        if state_path.exists():
+            state=read_json(state_path)
+            if state.get('status')!='completed' or state.get('plan_digest')!=report.get('plan_digest'):
+                continue  # An interrupted new review cannot recycle an older identity problem.
         paths=[folder/'plan-timed.json']
         for batch in report.get('batches',[]):
             parent=Path(batch).resolve().parent

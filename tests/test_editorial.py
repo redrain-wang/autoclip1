@@ -419,6 +419,8 @@ def test_optional_listening_suggestions_do_not_reject_a_clear_script(tmp_path):
 
 @pytest.mark.parametrize('text',['字幕里说，这始终就没弄明白。','根据字幕，可以确定此事。',
                                  '镜头里有人应下差事。','声纹候选显示这就是六叔。',
+                                 '画面中标注的说话者是佟国维，他传下话。',
+                                 '画面标明了人物身份。','镜头上注明这是皇帝。',
                                  '侄儿始终就没弄明白。','这么多年，您当着朝廷的辅相。','把人带下去，朕就问罪他。',
                                  '小多子，你这碗水还浅着呢。'])
 @pytest.mark.parametrize('frozen',[False,True])

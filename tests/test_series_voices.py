@@ -21,6 +21,27 @@ def failed_run(tmp_path, monkeypatch):
     return video,library,bank,cfg,base,lines,voices,root,report,calls
 
 
+def test_protocol_failure_retires_legacy_stale_voice_task(tmp_path,monkeypatch):
+    video,library,bank,cfg,base,lines,voices,root,report,calls=failed_run(tmp_path,monkeypatch)
+    task=series.failed_episode_voice_followup(video,base,lines,voices,cfg,library)
+    assert task
+    write_json(base/'status.json',{'status':'waiting_voice_confirmation','run':str(root),
+        'error':'自动审核批次84格式或引用校验失败，未改写稿件：画面编号错误'})
+    assert series.failed_episode_voice_followup(video,base,lines,voices,cfg,library) is None
+    assert read_json(base/'voice-followup.json')['status']=='superseded'
+    assert len(calls)==1 and read_json(library)==bank
+
+
+@pytest.mark.parametrize('state,matching',[('running',True),('completed',False),('completed',True)])
+def test_followup_requires_latest_review_to_finish(tmp_path,monkeypatch,state,matching):
+    video,library,bank,cfg,base,lines,voices,root,report,calls=failed_run(tmp_path,monkeypatch)
+    write_json(root/'automatic-review-state.json',{'status':state,
+        'plan_digest':report['plan_digest'] if matching else 'new-plan'})
+    task=series.failed_episode_voice_followup(video,base,lines,voices,cfg,library)
+    assert bool(task)==(state=='completed' and matching)
+    assert read_json(library)==bank
+
+
 @pytest.mark.parametrize('change',[None,'source','settings','voices','outside','facts_only'])
 def test_failed_long_review_only_requests_current_identity_evidence(tmp_path,monkeypatch,change):
     video,library,bank,cfg,base,lines,voices,root,report,calls=failed_run(tmp_path,monkeypatch)

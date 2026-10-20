@@ -395,9 +395,18 @@ def run_series(source, output=None, series=None, config=None, library=None, voic
 def failed_episode_voice_followup(video, base, lines, voices, cfg, library, model_path=None, voice_python=None):
     """Resume only a current, source-bound failed review into human enrollment."""
     from .short_voices import pending_voice_followup, prepare_voice_followup
+    status=read_json(base/'status.json') if (base/'status.json').exists() else {}
+    if str(status.get('error','')).startswith('自动审核批次') and '格式或引用校验失败' in status['error']:
+        # Older versions could create a voice task from a stale report after a
+        # protocol failure. Such a task has no completed current identity audit.
+        pointer=base/'voice-followup.json'
+        if pointer.exists():
+            task=read_json(pointer)
+            if task.get('status')=='waiting_voice_confirmation':
+                write_json(pointer,{**task,'status':'superseded','reason':'审核响应校验失败，先继续自动核对'})
+        return None
     pending=pending_voice_followup(video,lines,voices,base,cfg,library)
     if pending:return pending
-    status=read_json(base/'status.json') if (base/'status.json').exists() else {}
     if status.get('status')!='failed' or not status.get('run'):return None
     root=Path(status['run']).resolve()
     if root.parent!=(base/'runs').resolve():return None

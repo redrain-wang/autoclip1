@@ -240,6 +240,7 @@ def test_review_protocol_retry_keeps_script_and_supplies_previous_shown_context(
     assert all(len(group)<=3 for group in groups)
     assert [Path(p).name for p in report['batches']]==['batch-0.json','batch-3.json','batch-6.json']
     assert any('上次审核响应' in p for p in prompts[1:]) and plan.model_dump()==before
+    assert any('逐项引用边界=' in p for p in prompts[1:])
     assert all('内部猜测辛某' not in prompt for prompt in prompts)
     last=next(u for group in groups for u in group if u['id']=='beat-3')
     assert last['shown_evidence']==[0,1,2]
@@ -586,3 +587,71 @@ def test_correct_narration_is_not_rewritten_for_asr_correction_notes(note):
         'units':[{'id':'beat-17','verdict':'supported','reason':'与原片相符',
             'evidence_ids':[0],'frame_ids':[0],'identity_basis':'no_identity_claim','subjects':[]}]}
     assert assess_batch(raw,units,[Line(id=0,start=0,end=8,text='李凡院，我手尖的')],1,[])==[]
+
+
+def test_review_retry_limits_bind_each_unit_time_and_actual_voice_candidates():
+    from autoclip.automatic import review_citation_limits
+    lines=[Line(id=i,start=i*10,end=i*10+5,text='原片对白') for i in range(4)]
+    rows=[{'line_id':0,'status':'candidate','samples':[{'name':'甲'}]},
+          {'line_id':1,'status':'unknown','samples':[{'name':None,'candidates':[{'name':'猜测人物'}]}]},
+          {'line_id':2,'status':'candidate','samples':[{'name':'乙'}]},
+          {'line_id':3,'status':'conflict','samples':[{'name':'甲'},{'name':'乙'}]}]
+    units=[{'id':'beat-1','end':20}, {'id':'beat-2','end':30,'shown_evidence':[3]},
+           {'id':'original-0','mode':'original','end':40},{'id':'title'}]
+    limits=review_citation_limits(units,lines,rows)
+    assert limits[0]['allowed_evidence_ids']==[0,1]
+    assert limits[0]['future_evidence_ids']==[2,3]
+    assert limits[0]['voice_candidates']==[{'line_id':0,'names':['甲']}]
+    assert limits[1]['allowed_evidence_ids']==[0,1,2,3]
+    assert limits[1]['voice_candidates']==[{'line_id':0,'names':['甲']},{'line_id':2,'names':['乙']}]
+    assert limits[2]['voice_candidates']==[]
+    assert limits[3]['allowed_evidence_ids']==[0,1,2,3]
+
+
+@pytest.mark.parametrize('message,expected',[
+    ('请的是“二爷”而非“二爷”，应改写。',True),
+    ('画面字幕放大图标注的说话者为甲，人物归属不符。',True),
+    ('字幕之间有无字幕间隔，无法确认原声完整。',True),
+    ('中间是否有对白被ASR漏记无法从字幕确认。',True),
+    ('切点切断了当前对白，回应丢失。',False),
+    ('说的是“二爷”而非“三爷”。',False)])
+def test_review_self_recheck_does_not_silently_approve_source_problems(message,expected):
+    from autoclip.automatic import review_recheck_reason
+    assert bool(review_recheck_reason([{'id':'original-1','message':message}],
+        [{'id':'original-1','mode':'original'}]))==expected
+
+
+@pytest.mark.parametrize('still_broken',[False,True])
+def test_continuous_original_gap_recheck_is_bounded_and_keeps_real_failures(tmp_path,monkeypatch,still_broken):
+    import json
+    import autoclip.automatic as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'frame')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    plan=sample_plan()
+    plan.clips[0].beats[0].mode='original';plan.clips[0].beats[0].text=''
+    lines=[Line(id=i,start=i*10+.5,end=i*10+5,text='对白') for i in range(4)]
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':[]}
+    attempts=[]
+    class Model:
+        def json(self,system,prompt,images):
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+            original=group[0].get('mode')=='original'
+            if original:attempts.append(prompt)
+            rejected=original and (len(attempts)==1 or still_broken)
+            reason=('字幕之间有无字幕间隔，不能确认原声完整。' if len(attempts)==1 else '实际结束切点丢失回应。') if rejected else '原片支持'
+            return {'issues':[],'units':[{'id':u['id'],'verdict':'unknown' if rejected else 'supported',
+                'reason':reason,'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
+                'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=1),Model())
+    assert len(attempts)==2 and '内部没有删剪' in attempts[1]
+    assert report['passed'] is (not still_broken)
+    if still_broken:assert any('实际结束切点' in i['message'] for i in report['issues'])
+
+
+def test_invalid_frame_feedback_gives_exact_main_sheet_bounds():
+    raw={'passed':True,'issues':[],'units':[{'id':'beat-0','verdict':'supported','reason':'原片支持',
+        'evidence_ids':[0],'frame_ids':[9],'identity_basis':'no_identity_claim','subjects':[]}]}
+    with pytest.raises(ValueError,match=r'frame_ids只能为\[0, 1, 2\]'):
+        assess_batch(raw,[{'id':'beat-0'}],[Line(id=0,start=0,end=3,text='对白')],3,[])

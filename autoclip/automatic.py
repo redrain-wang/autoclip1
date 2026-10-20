@@ -200,8 +200,11 @@ def assess_batch(raw, units, lines, frame_count, voice_rows):
         if issue['id'] not in expected:raise ValueError('审核备注要求修订本批次以外的单位')
         issues.append(issue)
     for unit in parsed.units:
-        if not set(unit.evidence_ids).issubset(lookup) or any(i<0 or i>=frame_count for i in unit.frame_ids):
-            raise ValueError('自动审核引用了未提供的证据或画面')
+        if not set(unit.evidence_ids).issubset(lookup):
+            raise ValueError(f'{unit.id} 引用了未提供的字幕编号：{sorted(set(unit.evidence_ids)-set(lookup))}')
+        if any(i<0 or i>=frame_count for i in unit.frame_ids):
+            raise ValueError(f'{unit.id} 引用了未提供的主画面编号；frame_ids只能为{list(range(frame_count))}，'
+                '字幕放大图不另编号，不能把其格子追加到主图编号后。请按主图times重核对应关系。')
         target = expected[unit.id]
         if target.get('mode')=='original' and (unit.identity_basis!='no_identity_claim' or unit.subjects):
             raise ValueError(f'{unit.id} 是没有新增身份主张的原声；只核对剪辑，不能因说话人姓名未知改写原声')
@@ -227,6 +230,36 @@ def assess_batch(raw, units, lines, frame_count, voice_rows):
     return issues
 
 
+def review_citation_limits(units, lines, voice_rows):
+    """Explain the existing per-unit gates without inventing identity evidence."""
+    result=[]
+    for unit in units:
+        allowed={s.id for s in lines if 'end' not in unit or s.start<unit['end']
+                 or s.id in unit.get('shown_evidence',[])}
+        result.append({'id':unit['id'],'end_exclusive':unit.get('end'),
+            'allowed_evidence_ids':sorted(allowed),
+            'future_evidence_ids':[s.id for s in lines if s.id not in allowed],
+            'voice_candidates':[] if unit.get('mode')=='original' else [
+                {'line_id':r['line_id'],'names':sorted({s['name'] for s in r.get('samples',[]) if s.get('name')})}
+                for r in voice_rows if r['line_id'] in allowed and r.get('status')=='candidate']})
+    return result
+
+
+def review_recheck_reason(issues, units):
+    """Request a bounded source recheck, never silently dismiss a failed unit."""
+    original={u['id'] for u in units if u.get('mode')=='original'}
+    reasons=[]
+    for issue in issues:
+        message=issue['message']
+        if re.search(r'“([^”]+)”(?:而非|而不是|不是)“\1”',message):
+            reasons.append('审核把相同文字说成不同内容；请核对原片与旁白的实际差异，允许准确同义概括。')
+        if re.search(r'(?:字幕|放大图|画面).{0,20}标注.{0,12}(?:说话者|人物|为|是)',message):
+            reasons.append('抽帧图标签仅有时间和对白编号，没有说话人姓名答案；字幕中的姓名可能是被称呼者，不能自动认作发言者。请重核实际称呼与回应。')
+        if issue['id'] in original and re.search(r'无字幕|字幕[^。]{0,35}间隔|ASR漏记|ASR覆盖不足',message):
+            reasons.append('该original单位是原片start到end完整连续音画，内部没有删剪，无字幕间隔也原样保留。请核对实际边界及跨单位衔接；不能仅凭内部停顿或原剧镜头切换推断本系统丢失原声。确有边界或衔接问题仍须拒绝。')
+    return list(dict.fromkeys(reasons))
+
+
 def audit_plan(video, plan, lines, voices, root, cfg, llm):
     if not cfg.vision:
         raise ValueError('自动长片审核需要画面，不能静默跳过')
@@ -250,6 +283,8 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
     # Keep the exact reviewed draft even when later measurement overwrites the
     # mutable plan-timed.json or a subsequent review is interrupted.
     write_json(folder/'plan.json',plan.model_dump())
+    write_json(root/'automatic-review-state.json',{'status':'running','plan_digest':digest(plan.model_dump()),
+        'review_root':str(folder.resolve())})
     all_issues=[{'id':f'beat-{row["beat"]}','message':'旁白混入制作或审查话术，必须面向观众直接讲剧情，不能照读核对记录：'
         +json.dumps(row['phrases'],ensure_ascii=False)} for row in prose_signals(clip)]
     batches, frames = [], []
@@ -358,6 +393,13 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 checked = decisions.model_dump()
                 checked['passed'] = not decisions.issues and all(u.verdict=='supported' for u in decisions.units)
                 issues = assess_batch(checked,group,selected,len(times),evidence)
+                recheck=review_recheck_reason(issues,group)
+                if recheck and retry<cfg.repair_attempts:
+                    write_json(folder/f'batch-{offset}-source-recheck-{retry}.json',{'raw':raw,'issues':issues})
+                    feedback=('\n先核对审核本身，不修改稿件：'+'；'.join(recheck)
+                        +'\n上一轮审核：'+json.dumps(raw,ensure_ascii=False)
+                        +'\n请重新给出本批全部units与真实问题；不能为了通过而忽略仍然未知或错误的内容。')
+                    continue
                 if (not original and retry<cfg.repair_attempts and caption_sheet is not None
                         and caption_observations is None
                         and any(re.search(r'ASR|转写|同音|错字|错词|残句',i['message']) for i in issues)):
@@ -406,7 +448,14 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 write_json(folder/f'batch-{offset}-protocol-{retry}.json',{'raw':raw,'error':str(exc)})
                 if retry == cfg.repair_attempts:
                     raise ValueError(f'自动审核批次{offset}格式或引用校验失败，未改写稿件：{str(exc)[:1200]}') from exc
-                feedback = '\n上次审核响应未通过格式/引用检查：'+str(exc)[:1800]+'\n原响应：'+json.dumps(raw,ensure_ascii=False)+'\n请重审同一批units，未知仍须标unknown，不得为了修复格式把存疑内容放行。'
+                feedback = ('\n上次审核响应未通过格式/引用检查：'+str(exc)[:1800]
+                    +'\n原响应：'+json.dumps(raw,ensure_ascii=False)
+                    +'\n逐项引用边界='+json.dumps(review_citation_limits(group,selected,evidence),ensure_ascii=False)
+                    +'\n每项supported只能引用该项allowed_evidence_ids，不能借用同批较后镜头的证据。'
+                    'voice_and_context必须引用列有相应姓名的voice_candidates，且行为与语境相符；'
+                    '人物姓名本身就是身份主张，不能声称“未点名”来绕过。没有声音候选时，'
+                    '只有真实明确称呼及回应可使用explicit_address_response；没有这种证据就标unknown并说明缺口。'
+                    '请重审同一批units，不要直接修改稿件，不得为了修复格式把存疑内容放行。')
         record = {'units':group,'times':times,'raw':raw,'issues':issues}
         write_json(folder/f'batch-{offset}.json',record)
         frames = [{'path':str(p.resolve()),'sha256':file_hash(p),
@@ -429,6 +478,8 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
               'limitations':['机器审核可能误判；声纹候选不等于人工确定身份。']}
     write_json(folder/'report.json',report)
     write_json(root/'automatic-review.json',report)
+    write_json(root/'automatic-review-state.json',{'status':'completed','plan_digest':report['plan_digest'],
+        'review_root':str(folder.resolve())})
     return report
 
 
