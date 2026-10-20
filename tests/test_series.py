@@ -202,6 +202,7 @@ def test_failed_episode_does_not_block_next_and_failed_run_can_resume(tmp_path,m
     write_json(manifest,{'model':{},'sources':[{'source':source_identity(p)} for p in paths]})
     monkeypatch.setattr(module.Settings,'load',lambda _:Settings(duration_profile='long',target_seconds=300,opening='original'))
     monkeypatch.setattr(module,'ingest_episode',lambda video,base,cfg:(base,[],100))
+    monkeypatch.setattr(module,'link_voice_evidence',lambda *a:{})
     calls=[]
     def episode(video,*args):
         calls.append(video.name)
@@ -230,6 +231,7 @@ def test_every_production_episode_and_resume_use_same_duration_despite_legacy_co
     monkeypatch.setattr(module.Settings,'load',lambda _:legacy.model_copy(deep=True))
     monkeypatch.setattr(module,'duration',lambda _:2800.)
     monkeypatch.setattr(module,'ingest_episode',lambda v,b,c:(b,[],2800.))
+    monkeypatch.setattr(module,'link_voice_evidence',lambda *a:{})
     observed=[]
     def episode(video,base,input_root,lines,seconds,cfg,bank,manifest,brand,index,test_sample):
         observed.append((delivery_policy(cfg),cfg.continuity_history,cfg.conflict_brief,test_sample,cfg.narrative_mode))

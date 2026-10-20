@@ -247,6 +247,9 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 or (cfg.opening=='original_teaser' and index==1 and eid in clip.beats[0].evidence_ids))
     key = digest({'v':VERSION,'plan':plan.model_dump(),'voices':voices,'model':cfg.llm_model,'endpoint':cfg.llm_base_url})
     folder = root/'automatic-review'/key
+    # Keep the exact reviewed draft even when later measurement overwrites the
+    # mutable plan-timed.json or a subsequent review is interrupted.
+    write_json(folder/'plan.json',plan.model_dump())
     all_issues=[{'id':f'beat-{row["beat"]}','message':'旁白混入制作或审查话术，必须面向观众直接讲剧情，不能照读核对记录：'
         +json.dumps(row['phrases'],ensure_ascii=False)} for row in prose_signals(clip)]
     batches, frames = [], []

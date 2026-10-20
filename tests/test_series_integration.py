@@ -111,3 +111,19 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
     assert read_json(output/'reference-impact.json')['affected_episodes']==[str(video)]
     assert all(read_json(p)['stage']!='已完成' for p in (output/'episodes').glob('*/status.json'))
     assert result_video.read_bytes()==before
+    count=len(calls)
+    resumed=series.run_series(source,output,test_sample=True)
+    assert resumed['status']=='completed',resumed
+    resumed_root=Path(resumed['episodes'][0]['run'])
+    assert resumed_root!=run_root and (resumed_root/'reference-resume.json').exists()
+    assert len(calls)>count and all('审核员' in call for call in calls[count:])
+    latest=read_json(resumed_root/'automatic-review.json')
+    assert latest['passed'] and latest['voice_digest']==digest(read_json(resumed_root/'voice-evidence.json'))
+    assert result_video.read_bytes()==before
+    bank['revision']=3;bank['characters'][0]['name']='丙';write_json(library,bank)
+    count=len(calls)
+    third=series.run_series(source,output,test_sample=True)
+    assert third['status']=='completed',third
+    third_root=Path(third['episodes'][0]['run'])
+    assert Path(read_json(third_root/'reference-resume.json')['previous_plan']).parent==resumed_root
+    assert len(calls)>count and all('审核员' in call for call in calls[count:])

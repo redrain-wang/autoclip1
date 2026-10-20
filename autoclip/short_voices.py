@@ -109,8 +109,20 @@ def prepare_voice_followup(video, lines, voices, root, cfg, library, story_roots
     lookup = {s.id:s for s in lines}
     transcript_digest = digest([s.model_dump() for s in lines])
     for folder in story_roots:
-        if not all((folder/name).exists() for name in ('automatic-review.json','plan-timed.json')):continue
-        report,plan = read_json(folder/'automatic-review.json'),Plan.model_validate(read_json(folder/'plan-timed.json'))
+        if not (folder/'automatic-review.json').exists():continue
+        report=read_json(folder/'automatic-review.json')
+        paths=[folder/'plan-timed.json']
+        for batch in report.get('batches',[]):
+            parent=Path(batch).resolve().parent
+            if parent.parent==(folder/'automatic-review').resolve():paths.append(parent/'plan.json')
+        plan=None
+        for path in dict.fromkeys(paths):
+            if not path.is_file():continue
+            candidate=Plan.model_validate(read_json(path))
+            if digest(candidate.model_dump())==report.get('plan_digest'):
+                plan=candidate
+                break
+        if plan is None:continue
         if (report.get('passed') or report.get('source')!=source_identity(video)
                 or report.get('transcript_digest')!=transcript_digest
                 or report.get('plan_digest')!=digest(plan.model_dump()) or report.get('voice_digest')!=digest(voices)):

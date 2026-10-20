@@ -251,6 +251,52 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
     raise ValueError('自动修复达到上限，本集未通过：'+json.dumps(issues,ensure_ascii=False)[:1800])
 
 
+def resume_long_reference(video, root, inputs, lines, voices, cfg, seconds):
+    """Carry a source-bound measured draft across a library change, never approval."""
+    import shutil
+    candidates=[]
+    for previous in root.parent.iterdir():
+        if previous==root:continue
+        try:
+            old_voices=read_json(previous/'voice-evidence.json')
+            old_inputs={**inputs,'bank':old_voices['library_digest'],'manifest':old_voices['manifest_digest']}
+            if (old_inputs['bank']==inputs['bank'] or previous.name!=digest(old_inputs)
+                    or read_json(previous/'source.json')!=inputs['source']
+                    or read_json(previous/'transcript.json')!=inputs['lines']
+                    or read_json(previous/'settings.json')!=inputs['cfg']
+                    or old_voices['source']!=inputs['source']
+                    or old_voices['transcript_digest']!=digest(inputs['lines'])):continue
+            analysis=read_json(previous/'stages/analysis.json')
+            required=[previous/'analysis.json',previous/'research.json']
+            if (analysis.get('status')!='completed'
+                    or analysis['signature']!=digest({'v':VERSION,'inputs':old_inputs})
+                    or analysis['result_digest']!=digest(analysis['result'])
+                    or not all(str(p.resolve()) in analysis['artifacts'] for p in required)
+                    or not all(source_identity(Path(p))==identity for p,identity in analysis['artifacts'].items())):continue
+            path=previous/'plan-timed.json'
+            plan=Plan.model_validate(read_json(path))
+            if len(plan.clips)!=1:continue
+            validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+            lookup={s.id:s for s in lines}
+            if any(lookup[i].start>=b.end for b in plan.clips[0].beats if b.mode=='narration' for i in b.evidence_ids):continue
+            candidates.append((path.stat().st_mtime_ns,path,plan))
+        except (OSError,ValueError,KeyError,TypeError):continue
+    if not candidates:return None
+    _,path,plan=max(candidates,key=lambda row:row[0])
+    def reuse_analysis():
+        for name in ('analysis.json','research.json'):
+            shutil.copy2(path.parent/name,root/name)
+        return read_json(path.parent/'stages/analysis.json')['result'],[root/'analysis.json',root/'research.json']
+    # A later enrollment must be able to carry forward this run's repaired
+    # draft too, rather than falling back to the original pre-enrollment text.
+    checkpoint(root,'analysis',inputs,reuse_analysis)
+    write_json(root/'reference-plan.json',plan.model_dump())
+    write_json(root/'reference-resume.json',{'previous_plan':str(path.resolve()),
+        'plan_digest':digest(plan.model_dump()),'new_voice_digest':digest(voices),
+        'status':'requires_full_measurement_and_review'})
+    return plan
+
+
 def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, brand, index, test_sample=False):
     previous = load_continuity(video,cfg)
     inputs = {'v':VERSION,'source':source_identity(video),'lines':[s.model_dump() for s in lines],
@@ -276,14 +322,16 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
             prepare_research(video,root,lines,seconds,cfg,llm,previous)
             maps = analyze(video,root,lines,seconds,cfg,llm,previous)
             return maps,[root/'analysis.json',root/'research.json']
-        checkpoint(root,'analysis',inputs,analysis_action)
+        recovered=resume_long_reference(video,root,inputs,lines,voices,cfg,seconds)
+        if recovered is None:
+            checkpoint(root,'analysis',inputs,analysis_action)
         notes = json.dumps({'policy':voices['policy'], 'lines':[{'id':r['line_id'],'status':r['status'],
             'names':sorted({s['name'] for s in r['samples'] if s.get('name')})} for r in voices['lines']]},ensure_ascii=False)
         def outline_action():
             state('自动安排章节与镜头')
             result = plan_outline(video,root,lines,seconds,cfg,llm,notes=notes,enforce_duration=not test_sample)
             return result,[root/'outline.auto.json']
-        outline = checkpoint(root,'outline',{'inputs':inputs,'planning_version':PLANNING_VERSION},outline_action)
+        outline = checkpoint(root,'outline',{'inputs':inputs,'planning_version':PLANNING_VERSION},outline_action) if recovered is None else None
         def writing_action():
             state('写稿与口播精修')
             plan = compose_outline(video,root/'transcript.json',root/'outline.auto.json',root,cfg,llm)
@@ -293,7 +341,8 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
             result,_ = writing_action()
             write_json(root/'initial-plan.json',result)
             return result,[root/'initial-plan.json']
-        draft = checkpoint(root,'draft',{'inputs':inputs,'outline':outline,'oral_version':ORAL_VERSION},saved_draft)
+        draft = (checkpoint(root,'draft',{'inputs':inputs,'outline':outline,'oral_version':ORAL_VERSION},saved_draft)
+                 if recovered is None else recovered.model_dump())
         def approve_action():
             state('自动测时、内容核对与局部修复')
             plan,report = complete_long_plan(video,Plan.model_validate(draft),lines,voices,root,cfg,llm)
@@ -341,6 +390,22 @@ def run_series(source, output=None, series=None, config=None, library=None, voic
     with (output/'project.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         return _run_series(source,output,series,config,library,voice_manifest,model_path,voice_python,limit,stage,test_sample)
+
+
+def failed_episode_voice_followup(video, base, lines, voices, cfg, library, model_path=None, voice_python=None):
+    """Resume only a current, source-bound failed review into human enrollment."""
+    from .short_voices import pending_voice_followup, prepare_voice_followup
+    pending=pending_voice_followup(video,lines,voices,base,cfg,library)
+    if pending:return pending
+    status=read_json(base/'status.json') if (base/'status.json').exists() else {}
+    if status.get('status')!='failed' or not status.get('run'):return None
+    root=Path(status['run']).resolve()
+    if root.parent!=(base/'runs').resolve():return None
+    if not all((root/name).is_file() for name in ('settings.json','source.json','voice-evidence.json')):return None
+    if (read_json(root/'settings.json')!=cfg.model_dump(mode='json')
+            or read_json(root/'source.json')!=source_identity(video)
+            or read_json(root/'voice-evidence.json')!=voices):return None
+    return prepare_voice_followup(video,lines,voices,base,cfg,library,[root],model_path,voice_python)
 
 
 def _run_series(source,output,series,config,library,voice_manifest,model_path,voice_python,limit,stage,test_sample):
@@ -416,6 +481,9 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
         from .feedback import summarize_project
         summarize_project(output)
         return result
+    if library.exists():
+        from .short_voices import apply_confirmed_followups
+        apply_confirmed_followups(cfg.output,library,cfg.series)
     bank = read_json(library) if library.exists() else None
     if not bank or not bank.get('characters'):
         enrollment = output/'voice-enrollment'
@@ -458,6 +526,7 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
             if old.get('path') == str(video) and marker.parent != base:
                 write_json(marker.parent/'status.json',{'stage':'原片已变更，旧版本归档','source':str(video)})
         episode_started = time.time()
+        current_voices=None
         try:
             if video in source_errors:
                 raise ValueError(source_errors[video])
@@ -472,7 +541,15 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
                         or not any(s['source']==source_identity(video) for s in current_manifest['sources'])):
                     voice_root = base/'voice-scan'/digest(['vad-production-1',source_identity(video),digest(bank),str(model_path)])
                     current_manifest = scan_production_audio(video,library,voice_root,model_path,voice_python)
-                outcome = run_episode(video,base,input_root,lines,seconds,cfg,bank,current_manifest,brand,index,test_sample)
+                current_voices=link_voice_evidence(video,lines,bank,current_manifest)
+                pending=failed_episode_voice_followup(video,base,lines,current_voices,cfg,library,model_path,voice_python)
+                if pending:
+                    active=read_json(base/'status.json')
+                    outcome={'source':str(video),'status':'waiting_voice_confirmation','run':active.get('run'),
+                             'voice_confirmation':pending,'calls_this_run':0}
+                    write_json(base/'status.json',{'stage':'等待新增声纹确认',**outcome})
+                else:
+                    outcome = run_episode(video,base,input_root,lines,seconds,cfg,bank,current_manifest,brand,index,test_sample)
                 if digest(read_json(library)) != digest(bank):
                     raise ValueError('声纹库在审核期间改变，本集旧核定不交付；重跑后自动复核')
                 outcomes.append(outcome)
@@ -483,19 +560,30 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
             outcome = {'source':str(video),'status':'failed','error':str(exc)[:2000],
                        'run':active.get('run'), 'calls_this_run':usage.get('calls_this_run',0)}
             write_json(base/'status.json',{'stage':'自动处理失败，可续跑',**outcome})
+            if current_voices is not None:
+                try:
+                    pending=(failed_episode_voice_followup(video,base,lines,current_voices,cfg,library,model_path,voice_python)
+                             if digest(read_json(library))==digest(bank) else None)
+                    if pending:
+                        outcome.update(status='waiting_voice_confirmation',voice_confirmation=pending)
+                        write_json(base/'status.json',{'stage':'等待新增声纹确认',**outcome})
+                except Exception as followup_error:
+                    write_json(base/'voice-followup-error.json',{'error':str(followup_error)[:1500]})
             outcomes.append(outcome)
         result = {'status':'running','episodes':outcomes}
         write_json(output/'series-status.json',result)
         write_json(output/'production-metrics.json',{'episodes':len(outcomes),
             'completed':sum(o['status']=='completed' for o in outcomes),
             'failed':sum(o['status']=='failed' for o in outcomes),
+            'waiting_voice_confirmation':sum(o['status']=='waiting_voice_confirmation' for o in outcomes),
             'new_model_calls':sum(o.get('calls_this_run',0) for o in outcomes),
             'automatic_repairs':sum(o.get('repairs',0) for o in outcomes),
             'human_steps':['voice_enrollment'],'human_revision_minutes':None})
     if any(o['status']=='completed' for o in outcomes):
         export_finished(cfg.output)
     build_report(cfg.output)
-    result = {'status':'partial_failure' if any(o['status']=='failed' for o in outcomes) else ('prepared' if stage=='prepare' else 'completed'),
+    result = {'status':'partial_failure' if any(o['status']=='failed' for o in outcomes) else
+              'waiting_voice_confirmation' if any(o['status']=='waiting_voice_confirmation' for o in outcomes) else ('prepared' if stage=='prepare' else 'completed'),
               'purpose':purpose,'duration_policy':delivery_policy(cfg,test_sample),
               'episodes':outcomes,'gallery':str(cfg.output/'index.html'),'exports':str(cfg.output/'成片')}
     write_json(output/'series-status.json',result)
