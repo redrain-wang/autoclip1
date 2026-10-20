@@ -129,6 +129,14 @@ def review_voice_rows(rows):
             for row in rows]
 
 
+def reference_names(name):
+    """Allow the human label before a trailing parenthesis, never invent aliases."""
+    names={name} if name else set()
+    if name and (match:=re.fullmatch(r'([^（）()]+)[（(][^（）()]+[）)]',name)):
+        names.add(match[1].strip())
+    return names
+
+
 def caption_lines_for_issues(issues, lines, fallback_ids):
     """Prioritize the actual subtitle IDs disputed by the reviewer, not just endpoints."""
     lookup = {s.id:s for s in lines}
@@ -220,7 +228,8 @@ def assess_batch(raw, units, lines, frame_count, voice_rows):
             issues.append({'id':unit.id,'message':'明确称呼与回应需至少两条不同证据'})
         if unit.identity_basis == 'voice_and_context':
             associated = [voices.get(i, {}) for i in unit.evidence_ids]
-            candidate_names = {s['name'] for r in associated for s in r.get('samples',[]) if s.get('name')}
+            candidate_names = {name for r in associated for s in r.get('samples',[])
+                               for name in reference_names(s.get('name'))}
             if not any(r.get('status') == 'candidate' for r in associated) or any(r.get('status') == 'conflict' for r in associated):
                 issues.append({'id':unit.id,'message':'声音候选缺失或冲突，须用明确称呼与回应核实或删除不确定归属'})
             if not unit.subjects or not set(unit.subjects).issubset(candidate_names):
@@ -240,7 +249,8 @@ def review_citation_limits(units, lines, voice_rows):
             'allowed_evidence_ids':sorted(allowed),
             'future_evidence_ids':[s.id for s in lines if s.id not in allowed],
             'voice_candidates':[] if unit.get('mode')=='original' else [
-                {'line_id':r['line_id'],'names':sorted({s['name'] for s in r.get('samples',[]) if s.get('name')})}
+                {'line_id':r['line_id'],'names':sorted({name for s in r.get('samples',[])
+                    for name in reference_names(s.get('name'))})}
                 for r in voice_rows if r['line_id'] in allowed and r.get('status')=='candidate']})
     return result
 
@@ -394,6 +404,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 review_images.append(caption_sheet)
                 prompt+=('\n另附本批旁白引用的原片字幕放大图。核对官名、人名、同音字和残句；转写稿不是正确文字的保证。'
                     '还须按完整稿件判断自然听感与剧情承接，不能把制作核对话术当成合格解说。frame_ids仍使用主图times索引。')
+        rejected_record = None
         for retry in range(cfg.repair_attempts+1):
             raw = llm.json('你是独立的影视内容与人物证据审核员，不读取人工答案。',prompt+feedback,review_images)
             try:
@@ -401,6 +412,8 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 checked = decisions.model_dump()
                 checked['passed'] = not decisions.issues and all(u.verdict=='supported' for u in decisions.units)
                 issues = assess_batch(checked,group,selected,len(times),evidence)
+                if issues:
+                    rejected_record=(raw,issues)
                 recheck=review_recheck_reason(issues,group)
                 if recheck and retry<cfg.repair_attempts:
                     write_json(folder/f'batch-{offset}-source-recheck-{retry}.json',{'raw':raw,'issues':issues})
@@ -455,6 +468,13 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
             except ValueError as exc:
                 write_json(folder/f'batch-{offset}-protocol-{retry}.json',{'raw':raw,'error':str(exc)})
                 if retry == cfg.repair_attempts:
+                    if rejected_record is not None:
+                        # Preserve a structurally valid rejection if a later
+                        # recheck is malformed. This can never create approval.
+                        raw,issues=rejected_record
+                        write_json(folder/f'batch-{offset}-recheck-failed.json',
+                            {'error':str(exc),'action':'retain_last_valid_rejection'})
+                        break
                     raise ValueError(f'自动审核批次{offset}格式或引用校验失败，未改写稿件：{str(exc)[:1200]}') from exc
                 feedback = ('\n上次审核响应未通过格式/引用检查：'+str(exc)[:1800]
                     +'\n原响应：'+json.dumps(raw,ensure_ascii=False)
@@ -463,6 +483,8 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                     'voice_and_context必须引用列有相应姓名的voice_candidates，且行为与语境相符；'
                     '人物姓名本身就是身份主张，不能声称“未点名”来绕过。没有声音候选时，'
                     '只有真实明确称呼及回应可使用explicit_address_response；没有这种证据就标unknown并说明缺口。'
+                    'units必须是对象数组，每项完整包含id/verdict/reason/evidence_ids/frame_ids/identity_basis/subjects，'
+                    '不能以单位ID字符串代替对象；顶层必须包含issues数组，无附加问题时返回空数组。'
                     '请重审同一批units，不要直接修改稿件，不得为了修复格式把存疑内容放行。')
         record = {'units':group,'times':times,'raw':raw,'issues':issues}
         write_json(folder/f'batch-{offset}.json',record)

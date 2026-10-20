@@ -667,3 +667,56 @@ def test_review_must_quote_actual_target_before_requesting_word_correction(actua
         [{'id':'beat-23','text':actual}])
     assert bool(reasons)==expected
     if expected:assert actual in reasons[0]
+
+
+@pytest.mark.parametrize('label,subject,accepted',[
+    ('八爷（八阿哥）','八爷',True),
+    ('八爷（八阿哥）','八爷（八阿哥）',True),
+    ('八爷（八阿哥）','八阿哥',False),
+    ('十阿哥','十爷',False),
+    ('道士','张道长',False),
+    ('四爷(雍正)','四爷',True)])
+def test_human_reference_label_prefix_is_not_a_different_person(label,subject,accepted):
+    raw,units,lines,count,voices=review_fixture()
+    raw['units'][0].update(identity_basis='voice_and_context',subjects=[subject])
+    voices=[{'line_id':1,'status':'candidate','samples':[{'name':label}]}]
+    assert (not assess_batch(raw,units,lines,count,voices))==accepted
+
+
+@pytest.mark.parametrize('valid_rejection',[True,False])
+def test_malformed_recheck_only_preserves_valid_rejection_never_creates_approval(tmp_path,monkeypatch,valid_rejection):
+    import json
+    import autoclip.automatic as module
+    from autoclip.util import read_json
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'frame')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    plan=sample_plan()
+    plan.clips[0].beats[0].mode='original';plan.clips[0].beats[0].text=''
+    lines=[Line(id=i,start=i*10+.5,end=i*10+5,text='对白') for i in range(4)]
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':[]}
+    class Model:
+        attempts=0
+        def json(self,system,prompt,images):
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+            original=group[0].get('mode')=='original'
+            if original:
+                self.attempts+=1
+                if not valid_rejection or self.attempts>1:return {'units':[group[0]['id'],'verdict']}
+            return {'issues':[],'units':[{'id':u['id'],'verdict':'unknown' if original else 'supported',
+                'reason':'ASR漏记，无法确认原声完整' if original else '原片支持',
+                'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
+                'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    model=Model()
+    if valid_rejection:
+        report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=1),model)
+        assert not report['passed'] and any('ASR漏记' in i['message'] for i in report['issues'])
+        assert list(tmp_path.glob('automatic-review/*/batch-*-recheck-failed.json'))
+        assert read_json(tmp_path/'automatic-review-state.json')['status']=='completed'
+    else:
+        with pytest.raises(ValueError,match='格式或引用校验失败'):
+            module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=1),model)
+        assert not (tmp_path/'automatic-review.json').exists()
+        assert read_json(tmp_path/'automatic-review-state.json')['status']=='running'
+    assert model.attempts==2 and not (tmp_path/'plan-approved.json').exists()
