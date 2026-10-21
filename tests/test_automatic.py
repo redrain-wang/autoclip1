@@ -922,3 +922,45 @@ def test_late_text_edit_keeps_earlier_review_requests_identical(tmp_path,monkeyp
         assert first.requests[ids]==second.requests[ids]
     for ids in [('title','angle','hook'),('beat-6','beat-7','beat-8'),('beat-9','beat-10','beat-11')]:
         assert first.requests[ids]!=second.requests[ids]
+
+
+@pytest.mark.parametrize('break_kind',['none','gap','overlap','narration'])
+def test_original_continuity_only_marks_exact_uninterrupted_source(break_kind):
+    from autoclip.automatic import original_continuity
+    clip=sample_plan().clips[0]
+    for beat in clip.beats:beat.mode='original';beat.text=''
+    if break_kind=='gap':clip.beats[2].start+=.01
+    if break_kind=='overlap':clip.beats[2].start-=.01
+    if break_kind=='narration':clip.beats[2].mode='narration';clip.beats[2].text='这段有旁白'
+    first=original_continuity(clip,1)['uncut_chain']
+    assert first['first_beat']==0 and first['start_is_internal_boundary']
+    if break_kind=='none':
+        assert first['last_beat']==3 and first['end_is_internal_boundary']
+        assert original_continuity(clip,3)['uncut_chain']['end_is_internal_boundary'] is False
+    else:
+        assert first['last_beat']==1 and not first['end_is_internal_boundary']
+        if break_kind=='narration':assert original_continuity(clip,2)=={}
+
+
+def test_original_review_receives_real_chain_but_still_rejects_external_cut(tmp_path,monkeypatch):
+    import json
+    import autoclip.automatic as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'frame')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    plan=sample_plan()
+    for beat in plan.clips[0].beats:beat.mode='original';beat.text=''
+    lines=[Line(id=i,start=i*10+.5,end=(i+1)*10-.5,text='连续原片对白') for i in range(4)]
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':[]}
+    class Model:
+        def json(self,system,prompt,images):
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+            if group[0]['id'].startswith('original-'):
+                assert '没有删掉声音' in prompt
+                assert all(u['uncut_chain']['first_beat']==0 and u['uncut_chain']['last_beat']==3 for u in group)
+            return {'issues':[],'units':[{'id':u['id'],'verdict':'contradicted' if u['id']=='original-3' else 'supported',
+                'reason':'外部结束点截断后续对白' if u['id']=='original-3' else '内部时间无缝连续',
+                'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=0),Model())
+    assert not report['passed'] and report['issues']==[{'id':'original-3','message':'外部结束点截断后续对白'}]

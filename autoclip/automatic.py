@@ -17,7 +17,7 @@ from .voices import match_batch
 
 VERSION = 'automatic-review-9'
 METADATA_CAPTION_POLICY = 'metadata-captions-2'
-SCENE_OBSERVATION_POLICY = 'blind-selected-frames-2-prefix-context'
+SCENE_OBSERVATION_POLICY = 'blind-selected-frames-3-continuous-boundaries'
 
 
 def validate_voice_library(library, series):
@@ -322,6 +322,20 @@ def review_timeline(clip, group):
     return timeline[:last+3]
 
 
+def original_continuity(clip, index):
+    """Only exact adjacent source intervals constitute an uncut audio chain."""
+    if clip.beats[index].mode!='original':return {}
+    first=last=index
+    while (first>0 and clip.beats[first-1].mode=='original'
+           and abs(clip.beats[first-1].end-clip.beats[first].start)<1e-6):first-=1
+    while (last+1<len(clip.beats) and clip.beats[last+1].mode=='original'
+           and abs(clip.beats[last].end-clip.beats[last+1].start)<1e-6):last+=1
+    if first==last:return {}
+    return {'uncut_chain':{'first_beat':first,'last_beat':last,
+        'start':clip.beats[first].start,'end':clip.beats[last].end,
+        'start_is_internal_boundary':index>first,'end_is_internal_boundary':index<last}}
+
+
 def audit_plan(video, plan, lines, voices, root, cfg, llm):
     if not cfg.vision:
         raise ValueError('自动长片审核需要画面，不能静默跳过')
@@ -332,7 +346,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
     # Original footage is audited too: an edit may otherwise invent a response.
     units += [{'id':f'original-{i}', 'mode':'original', 'source_continuity':'single_uncut_interval',
                'text':'连续原声：核对对白切点、问答顺序与场景承接', 'start':b.start, 'end':b.end,
-               'evidence_ids':b.evidence_ids} for i,b in enumerate(clip.beats) if b.mode == 'original']
+               'evidence_ids':b.evidence_ids,**original_continuity(clip,i)} for i,b in enumerate(clip.beats) if b.mode == 'original']
     lookup = {s.id:s for s in lines}
     for unit in units:
         if unit['id'].startswith(('beat-','original-')):
@@ -425,6 +439,11 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 f'\nunits={json.dumps(group,ensure_ascii=False)}\ntimes={times}'
                 f'\n字幕={json.dumps(review_transcript_rows(selected),ensure_ascii=False)}'
                 f'\nviewer_timeline={json.dumps(timeline,ensure_ascii=False)}')
+            if any(u.get('uncut_chain') for u in group):
+                prompt+=('\nuncut_chain是程序按实际相邻original区间计算的连续原声链，不是模型猜测。'
+                    '其中internal_boundary为true的边界两侧来源时间完全相接，原片对白会在下一段继续播放，'
+                    '中间没有删掉声音，也没有插入旁白。不能仅因当前内部单位在半句话处分段就判整片切断对白；'
+                    '必须沿同一链查看实际起止边界。链的外部切点、真实时间缺口和跨链因果仍须严格核对。')
         feedback = ''
         review_images = [sheet]
         caption_sheet = None
