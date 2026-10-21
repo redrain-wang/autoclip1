@@ -17,7 +17,7 @@ from .voices import match_batch
 
 VERSION = 'automatic-review-9'
 METADATA_CAPTION_POLICY = 'metadata-captions-2'
-SCENE_OBSERVATION_POLICY = 'blind-selected-frames-1'
+SCENE_OBSERVATION_POLICY = 'blind-selected-frames-2-prefix-context'
 
 
 def validate_voice_library(library, series):
@@ -297,6 +297,8 @@ def review_recheck_reason(issues, units):
     reasons=[]
     for issue in issues:
         message=issue['message']
+        if re.search(r'判\s*supported\s*更妥|(?:应|应该|应当)判(?:为|定为)?\s*supported',message,re.IGNORECASE):
+            reasons.append('审核把“应当判supported”的说明列成了错误。请重新核对原片，明确一致的verdict和真实问题；若仍有独立错误必须列明，不能把无错误说明交给写稿器。')
         alleged=re.findall(r'(?:旁白|口播|正文|稿件)(?:却误|却|误|竟|仍)?'
             r'(?:写成|写为|称为|说成|使用了?|用了?)[“「"]([^”」"]+)[”」"]',message)
         if any(normalize(word) not in normalize(text_by_id.get(issue['id'],'')) for word in alleged):
@@ -310,6 +312,14 @@ def review_recheck_reason(issues, units):
         if issue['id'] in original and re.search(r'无字幕|字幕[^。]{0,35}间隔|ASR漏记|ASR覆盖不足',message):
             reasons.append('该original单位是原片start到end完整连续音画，内部没有删剪，无字幕间隔也原样保留。请核对实际边界及跨单位衔接；不能仅凭内部停顿或原剧镜头切换推断本系统丢失原声。确有边界或衔接问题仍须拒绝。')
     return list(dict.fromkeys(reasons))
+
+
+def review_timeline(clip, group):
+    """Keep all preceding story and two following cuts; metadata sees the whole film."""
+    timeline=audience_script(clip)
+    if any('start' not in u for u in group):return timeline
+    last=max(int(u['id'].split('-')[1]) for u in group)
+    return timeline[:last+3]
 
 
 def audit_plan(video, plan, lines, voices, root, cfg, llm):
@@ -366,6 +376,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
             times = sorted({round((b.start+b.end)/2,3) for b in selected_beats})
         sheet = contact_sheet(video,folder/f'batch-{offset}-images',times,f'batch-{offset}')
         evidence = review_voice_rows([r for r in voices['lines'] if r['line_id'] in {s.id for s in selected}]) if not original else []
+        timeline=review_timeline(clip,group)
         prompt = ('逐项核对文本事实、人物行为归属、画面相关性、连续原声切点、场景承接和重复解释。'
                   '旁白必须面向观众讲剧情，不能出现字幕里说、根据字幕、镜头里有人等制作核对话术；'
                   '不能只因与转写字面一致就放行，不成句的残片或明显同音错词须按原片核实并指出问题。'
@@ -399,7 +410,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                   f'\nunits={json.dumps(group,ensure_ascii=False)}\ntimes={times}'
                   f'\n字幕={json.dumps(review_transcript_rows(selected),ensure_ascii=False)}'
                   f'\n声音候选={json.dumps(evidence,ensure_ascii=False)}'
-                  f'\nviewer_timeline={json.dumps(audience_script(clip),ensure_ascii=False)}')
+                  f'\nviewer_timeline={json.dumps(timeline,ensure_ascii=False)}')
         if original:
             prompt = ('只审核本批连续原声的剪辑：切点是否切断完整对白、是否因剪接伪造问答因果或丢失必要承接。'
                 '这些单位没有新增旁白、姓名标签或角色署名，text只是待核事项，不是观众会听到的附加断言。'
@@ -413,7 +424,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 f'\n格式{json.dumps(OriginalReviewBatch.model_json_schema(),ensure_ascii=False)}'
                 f'\nunits={json.dumps(group,ensure_ascii=False)}\ntimes={times}'
                 f'\n字幕={json.dumps(review_transcript_rows(selected),ensure_ascii=False)}'
-                f'\nviewer_timeline={json.dumps(audience_script(clip),ensure_ascii=False)}')
+                f'\nviewer_timeline={json.dumps(timeline,ensure_ascii=False)}')
         feedback = ''
         review_images = [sheet]
         caption_sheet = None
@@ -445,7 +456,10 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 +json.dumps(observations,ensure_ascii=False)
                 +'\n严格区分当前实际剪入画面与引用对白的字幕图。引用字幕图可能在更早时间，不能把其中动作或道具移到当前画面。'
                 '逐项按start/end对应主图times，只能用对应格证明当前动作。若观察与旁白冲突，回看主图，不能直接复述旁白宣布支持；'
-                '无法消除的冲突必须unknown/contradicted并列明问题，不能仅凭对白支持而放过无据动作。')
+                '无法消除的冲突必须unknown/contradicted并列明问题，不能仅凭对白支持而放过无据动作。'
+                '注意：近景未展示环境，不等于人物不在已交代的场所；抽样帧未拍到动作，不等于连续原片中没有该动作。'
+                '准确概括此前已播放的对白、自然回顾已经发生的剧情，不要求当前每格重演一遍；须对照完整前情判断，'
+                '只有确实虚构动作、错配人物或将别处事件说成当前发生才拒绝，不能把未见当成相反事实。')
         rejected_record = None
         for retry in range(cfg.repair_attempts+1):
             raw = llm.json('你是独立的影视内容与人物证据审核员，不读取人工答案。',prompt+feedback,review_images)
@@ -625,7 +639,7 @@ def replan_original_window(plan, uid, issues, lines, root, cfg, llm, attempt, re
     return candidate
 
 
-def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, root, llm):
+def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, root, llm, *, retries=0):
     """Check the changed unit against source before spending a full-film re-audit."""
     index=int(uid.split('-')[1])
     clip=candidate.clips[0]
@@ -655,15 +669,31 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
         +'\n声音候选='+json.dumps(evidence,ensure_ascii=False)
         +'\n逐项引用边界='+json.dumps(review_citation_limits([unit],selected,evidence),ensure_ascii=False)
         +'\nviewer_timeline='+json.dumps(audience_script(clip),ensure_ascii=False))
-    raw=llm.json('你是独立的局部修订核验员，不是写稿者，不读取人工答案。',prompt,images)
-    try:
-        decisions=UnitReviews.model_validate(raw)
-        checked=decisions.model_dump()
-        checked['passed']=not decisions.issues and all(u.verdict=='supported' for u in decisions.units)
-        issues=assess_batch(checked,[unit],selected,len(times),evidence)
-    except ValueError as exc:
-        write_json(root/'verification.json',{'raw':raw,'passed':False,'error':str(exc)})
-        raise
+    feedback=''
+    for retry in range(retries+1):
+        raw=llm.json('你是独立的局部修订核验员，不是写稿者，不读取人工答案。',prompt+feedback,images)
+        try:
+            decisions=UnitReviews.model_validate(raw)
+            checked=decisions.model_dump()
+            checked['passed']=not decisions.issues and all(u.verdict=='supported' for u in decisions.units)
+            issues=assess_batch(checked,[unit],selected,len(times),evidence)
+            supported={u.id for u in decisions.units if u.verdict=='supported'}
+            inconsistent=[i for i in issues if i['id'] in supported and i['message'].startswith((
+                '声音候选缺失或冲突','声音依据未支持','列出了人物归属却声明','明确称呼与回应需至少'))]
+            recheck=review_recheck_reason(issues,[unit])
+            if inconsistent or recheck:
+                raise ValueError('先重核核验结论自身，稿件尚未修改：'+json.dumps(inconsistent+recheck,ensure_ascii=False))
+            break
+        except ValueError as exc:
+            write_json(root/f'protocol-{retry}.json',{'raw':raw,'passed':False,'error':str(exc)})
+            if retry==retries:
+                write_json(root/'verification.json',{'raw':raw,'passed':False,'error':str(exc)})
+                raise
+            feedback=('\n核验响应第'+str(retry+1)+'次未通过格式、引用或结论一致性检查：'+str(exc)
+                +'\n上一轮核验：'+json.dumps(raw,ensure_ascii=False)
+                +'\n只重新核验同一段，不要求改稿。no_identity_claim不能列subjects；若有真实身份主张须提供实际依据。'
+                'voice_and_context必须使用给定候选名；explicit_address_response须有至少两条明确称呼及回应。'
+                '没有依据就unknown并说明缺口，不能仅切换标签放行。返回完整units和issues对象。')
     write_json(root/'verification.json',{'raw':raw,'passed':not issues,'issues':issues,
         'unit':unit,'frames':[{'path':str(p.resolve()),'sha256':file_hash(p)} for p in images]})
     if issues:raise ValueError('局部修订仍未解决原片问题：'+json.dumps(issues,ensure_ascii=False))
@@ -795,7 +825,7 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                 if (uid.startswith('beat-') and max_characters is None and cfg.vision
                         and source.get('path') and Path(source['path']).is_file()):
                     verify_narration_patch(Path(source['path']),candidate,uid,[i for i in issues if i['id']==uid],
-                        lines,voices,record.parent/f'verify-{retry}',llm)
+                        lines,voices,record.parent/f'verify-{retry}',llm,retries=cfg.repair_attempts)
                 revised = candidate
                 accepted.extend(changes)
                 write_json(record,{'raw':raw,'status':'valid_patch'})

@@ -481,7 +481,8 @@ def test_local_patch_requires_source_verification_before_acceptance(tmp_path,mon
     else:
         with pytest.raises(RepairNeeded) as exc:module.repair_plan(*args,source_seconds=40)
         assert exc.value.report['clip']==plan.clips[0].model_dump()
-    assert model.writes==model.checks==2
+    assert model.writes==2
+    assert model.checks==(4 if failure in {"bad_frame","malformed"} else 2)
     assert plan.model_dump()==original and not (tmp_path/'plan-approved.json').exists()
 
 
@@ -843,3 +844,81 @@ def test_audit_compares_selected_frames_with_blind_observation(tmp_path,monkeypa
     assert report['scene_observation_policy']==module.SCENE_OBSERVATION_POLICY
     with pytest.raises(ValueError):module.assert_approval({**report,'passed':True,'issues':[],
         'scene_observation_policy':'old'},video,plan,lines,voices)
+
+
+@pytest.mark.parametrize('resolved',[True,False])
+def test_local_verifier_rechecks_its_own_identity_annotation_before_rewriting(tmp_path,monkeypatch,resolved):
+    import autoclip.automatic as module
+    from autoclip.util import read_json
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'frame')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    plan=sample_plan();before=plan.model_dump()
+    lines=[Line(id=0,start=.5,end=3,text='当前对白'),Line(id=1,start=4,end=8,text='紧接回应')]
+    class Model:
+        calls=0
+        def json(self,system,prompt,images):
+            self.calls+=1
+            assert '局部修订核验员' in system
+            if self.calls>1:assert '先重核核验结论自身' in prompt
+            return {'issues':[],'units':[{'id':'beat-0','verdict':'supported' if self.calls==1 or resolved else 'unknown',
+                'reason':'核验标注错误' if self.calls==1 else ('明确称呼与回应支持' if resolved else '无法确定说话者'),
+                'evidence_ids':[0,1],'frame_ids':[0],
+                'identity_basis':'explicit_address_response' if self.calls>1 and resolved else 'no_identity_claim',
+                'subjects':['角色甲'] if self.calls==1 or resolved else []}]}
+    model=Model();args=(video,plan,'beat-0',[{'id':'beat-0','message':'核实当前归属'}],lines,{'lines':[]},tmp_path,model)
+    if resolved:module.verify_narration_patch(*args,retries=1)
+    else:
+        with pytest.raises(ValueError,match='局部修订仍未解决原片问题'):
+            module.verify_narration_patch(*args,retries=1)
+    assert model.calls==2 and plan.model_dump()==before
+    assert read_json(tmp_path/'verification.json')['passed'] is resolved
+    assert read_json(tmp_path/'protocol-0.json')['passed'] is False
+
+
+def test_review_rechecks_rejection_that_itself_says_supported():
+    from autoclip.automatic import review_recheck_reason
+    units=[{'id':'beat-0','text':'有人请客人进屋。'}]
+    assert review_recheck_reason([{'id':'beat-0','message':'旁白基本有据，判 supported 更妥。'}],units)
+    assert not review_recheck_reason([{'id':'beat-0','message':'当前画面没有提灯者，旁白动作无据。'}],units)
+
+
+def test_review_context_keeps_complete_past_and_two_following_cuts():
+    from autoclip.automatic import review_timeline
+    plan=sample_plan();clip=plan.clips[0]
+    clip.beats=[Beat(mode='narration',start=i*10,end=(i+1)*10,text=f'第{i}段的实际口播',evidence_ids=[i],reason='私下猜测') for i in range(12)]
+    rows=review_timeline(clip,[{'id':'original-5','start':50}])
+    assert [r['beat'] for r in rows]==list(range(8))
+    assert all('reason' not in row for row in rows)
+    assert len(review_timeline(clip,[{'id':'title'}]))==12
+
+
+def test_late_text_edit_keeps_earlier_review_requests_identical(tmp_path,monkeypatch):
+    import json
+    import autoclip.automatic as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'pixels')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
+    plan=sample_plan()
+    plan.clips[0].beats=[Beat(mode='narration',start=i*10,end=(i+1)*10,text=f'第{i}段的实际口播',evidence_ids=[i],reason='衔接') for i in range(12)]
+    lines=[Line(id=i,start=i*10+.5,end=(i+1)*10-.5,text='原片对白') for i in range(12)]
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':[]}
+    class Model:
+        def __init__(self):self.requests={}
+        def json(self,system,prompt,images):
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+            self.requests[tuple(u['id'] for u in group)]=(system,prompt,[p.read_bytes() for p in images])
+            return {'issues':[],'units':[{'id':u['id'],'verdict':'supported','reason':'测试证据相符',
+                'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
+                'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    first=Model();before=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=0),first)
+    plan.clips[0].beats[10].text='后半段修订后的真实口播'
+    second=Model();after=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=0),second)
+    assert before['passed'] and after['passed'] and before['plan_digest']!=after['plan_digest']
+    for ids in [('beat-0','beat-1','beat-2'),('beat-3','beat-4','beat-5')]:
+        assert first.requests[ids]==second.requests[ids]
+    for ids in [('title','angle','hook'),('beat-6','beat-7','beat-8'),('beat-9','beat-10','beat-11')]:
+        assert first.requests[ids]!=second.requests[ids]

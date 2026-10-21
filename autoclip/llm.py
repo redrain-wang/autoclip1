@@ -47,7 +47,7 @@ class LLM:
             retry_wait = min(30,5 * 2**attempt)
             with self._lock:
                 if self.calls >= self.settings.max_api_calls:
-                    raise RuntimeError("已达到本次 API 调用次数上限；提高 max_api_calls 后重试。")
+                    raise RuntimeError("已达到本次 API 调用次数上限；已保存的稿件和缓存保留，可重跑原命令续作。")
                 self.calls += 1
                 self.model_calls[payload["model"]] = self.model_calls.get(payload["model"], 0) + 1
             try:
