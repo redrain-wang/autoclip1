@@ -1,5 +1,7 @@
 """Build a source-bound long-form outline before narration is written."""
 import json
+
+from .titles import TITLE_RULES
 import math
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Literal
@@ -261,7 +263,7 @@ def plan_outline(video, root, lines, seconds, cfg, llm, start=0, end=None, notes
             'supplied_structure':supplied,
             'brief':brief_context(brief),'prior':previous['signature'],'notes':notes,'cfg':cfg.model_dump(mode='json')}
     folder=root/'automatic-outlines'/digest(inputs);folder.mkdir(parents=True,exist_ok=True)
-    prompt=(f'为《{cfg.series}》制作约{cfg.target_seconds}秒的一条长解说提纲；先定章节，不写口播。' +
+    prompt=(TITLE_RULES + f'为《{cfg.series}》制作约{cfg.target_seconds}秒的一条长解说提纲；先定章节，不写口播。' +
             ('剧情优先：围绕本集主要事件，先找全起因、行动、结果与必要场景承接，不为统一观点硬连无关支线。' if cfg.narrative_mode == 'story_first' else
              '找一个总问题，把相关冲突连成因果链；无关支线不选。') +
             '片头片尾歌曲不选，章节按原片顺序、范围不重叠。' +

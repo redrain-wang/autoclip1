@@ -257,12 +257,13 @@ def test_automatic_approval_binds_exact_plan_voice_and_frames(tmp_path):
     video = tmp_path/'a.mp4';video.write_bytes(b'video')
     frame = tmp_path/'a.jpg';frame.write_bytes(b'frame')
     plan=sample_plan();lines=[];voices={'library_digest':'first'}
-    from autoclip.automatic import VERSION,METADATA_CAPTION_POLICY,SCENE_OBSERVATION_POLICY
+    from autoclip.automatic import VERSION,METADATA_CAPTION_POLICY,SCENE_OBSERVATION_POLICY,TITLE_POLICY
     report={'version':VERSION,'mode':'automatic_source_review','passed':True,'issues':[],'source':source_identity(video),
         'plan_digest':digest(plan.model_dump()),'transcript_digest':digest([]),'voice_digest':digest(voices),
-        'metadata_caption_policy':METADATA_CAPTION_POLICY,'scene_observation_policy':SCENE_OBSERVATION_POLICY,
+        'metadata_caption_policy':METADATA_CAPTION_POLICY,'scene_observation_policy':SCENE_OBSERVATION_POLICY,'title_policy':TITLE_POLICY,
         'frames':[{'path':str(frame),'sha256':file_hash(frame),'purpose':'metadata_captions'}]}
     assert_approval(report,video,plan,lines,voices)
+    with pytest.raises(ValueError):assert_approval({**report,'title_policy':'old-title'},video,plan,lines,voices)
     with pytest.raises(ValueError):assert_approval({**report,'version':'old-review'},video,plan,lines,voices)
     with pytest.raises(ValueError):assert_approval(report,video,plan,lines,{'library_digest':'new'},)
     frame.write_bytes(b'edited')

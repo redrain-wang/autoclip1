@@ -117,6 +117,17 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
     assert len(calls)>count and all(any(role in call for role in ('审核员','画面观察员')) for call in calls[count:])
     assert read_json(run_root/'automatic-review.json')['scene_observation_policy']=='scene-next-test'
     assert result_video.read_bytes()==before
+    # Title policy changes recheck metadata even for a previously completed film.
+    count=len(calls)
+    monkeypatch.setattr(automatic,'TITLE_POLICY','title-next-test')
+    monkeypatch.setattr(series,'TITLE_POLICY','title-next-test')
+    from autoclip import titles
+    monkeypatch.setattr(titles,'TITLE_POLICY','title-next-test')
+    retitled=series.run_series(source,output,test_sample=True)
+    assert retitled['status']=='completed',retitled
+    assert len(calls)>count
+    assert read_json(run_root/'automatic-review.json')['title_policy']=='title-next-test'
+    assert result_video.read_bytes()==before
     bank['revision']=2;bank['characters'][0]['name']='乙';write_json(library,bank)
     # Prepare-only still records the impact and retires old approvals from current display.
     series.run_series(source,output,stage='prepare',test_sample=True)

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .automatic import (VERSION as REVIEW_VERSION, FrozenAutomaticScript, assert_approval, audit_plan,
                         link_voice_evidence, repair_plan, validate_voice_library, SCENE_OBSERVATION_POLICY)
+from .titles import TITLE_POLICY, TITLE_COVER_POLICY, reviewed_title_evidence
 from .branding import BrandSettings, package_clip
 from .config import Settings
 from .continuity import load_continuity
@@ -372,7 +373,7 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
             plan,report = complete_long_plan(video,pending,lines,voices,root,cfg,llm)
             return {'plan':plan.model_dump(),'report':report},[root/'plan-approved.json',root/'automatic-review.json',*[Path(f['path']) for f in report['frames']]]
         approved = checkpoint(root,'approval',{'inputs':inputs,'draft':draft,'voices':voices,'review_version':REVIEW_VERSION,
-            'scene_observation_policy':SCENE_OBSERVATION_POLICY,
+            'scene_observation_policy':SCENE_OBSERVATION_POLICY,'title_policy':TITLE_POLICY,
             'audience_style_policy':AUDIENCE_STYLE_POLICY},approve_action)
         plan = Plan.model_validate(approved['plan'])
         assert_approval(approved['report'],video,plan,lines,voices)
@@ -385,11 +386,13 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
                 raise ValueError('渲染文本与自动核定稿不一致')
             clean['qa']['semantic_review'] = 'automatic_source_review_not_human'
             clean['automatic_review'] = str((root/'automatic-review.json').resolve())
+            clean['title_evidence_ids'] = reviewed_title_evidence(approved['report'])
             write_json(Path(clean['video']).parent/'manifest.json',clean)
             finished = package_clip(video,root,clean,index,cfg.series,brand)
             finished['production_id'] = digest([inputs,approved['plan']])
             return finished,[Path(finished[k]) for k in ('video','cover','poster') if finished.get(k)]
         finished = checkpoint(root,'render',{'inputs':inputs,'approved':approved,
+            'title_cover_policy':TITLE_COVER_POLICY,
             'audience_style_policy':AUDIENCE_STYLE_POLICY},render_action)
         finished = check_delivery(finished,cfg,root,test_sample)
         if source_identity(video) != inputs['source']:

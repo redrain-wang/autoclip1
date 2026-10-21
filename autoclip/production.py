@@ -370,10 +370,11 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                             storyroot/'plan-approved.json',storyroot/'automatic-review.json',
                             *[Path(f['path']) for f in report['frames']]]
                     from .automatic import METADATA_CAPTION_POLICY, SCENE_OBSERVATION_POLICY
+                    from .titles import TITLE_POLICY, reviewed_title_evidence
                     from .editorial import AUDIENCE_STYLE_POLICY
                     approval = checkpoint(storyroot,'voice-approval',{'draft':plan.model_dump(),'voices':voices,
                         'metadata_caption_policy':METADATA_CAPTION_POLICY,
-                        'scene_observation_policy':SCENE_OBSERVATION_POLICY,
+                        'scene_observation_policy':SCENE_OBSERVATION_POLICY,'title_policy':TITLE_POLICY,
                         'audience_style_policy':AUDIENCE_STYLE_POLICY,
                         'cfg':local.model_dump(mode='json'),'story':story.model_dump()},approve)
                     plan = Plan.model_validate(approval['plan'])
@@ -388,6 +389,7 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                         raise ValueError('短片实际渲染内容与声纹核定稿不一致')
                     clean['qa']['semantic_review'] = 'automatic_source_review_not_human'
                     clean['automatic_review'] = str((storyroot/'automatic-review.json').resolve())
+                    clean['title_evidence_ids'] = reviewed_title_evidence(approval['report'])
                     write_json(Path(clean['video']).parent/'manifest.json',clean)
                     finished=package_clip(video,storyroot,clean,index,cfg.series,brand)
                     finished=check_delivery(finished,local,storyroot)

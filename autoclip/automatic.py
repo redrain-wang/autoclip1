@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from .identity import units_for_clip, file_hash
 from .editorial import audience_script, prose_signals, require_oral_style, WRITING_RULES
 from .ingest import contact_sheet, subtitle_evidence_sheet
+from .titles import TITLE_POLICY, TITLE_RULES, title_repair_prompt, title_changes, title_issues
 from .models import Plan, Beat, validate_plan, evidence_matches
 from .repair import RepairNeeded
 from .util import digest, read_json, source_identity, write_json
@@ -354,7 +355,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
             prior = {eid for b in clip.beats[:index] for eid in b.evidence_ids}
             unit['shown_evidence'] = sorted(eid for eid in prior if lookup[eid].start<unit['end']
                 or (cfg.opening=='original_teaser' and index==1 and eid in clip.beats[0].evidence_ids))
-    key = digest({'v':VERSION,'scene_policy':SCENE_OBSERVATION_POLICY,'plan':plan.model_dump(),'voices':voices,'model':cfg.llm_model,'endpoint':cfg.llm_base_url})
+    key = digest({'v':VERSION,'scene_policy':SCENE_OBSERVATION_POLICY,'title_policy':TITLE_POLICY,'plan':plan.model_dump(),'voices':voices,'model':cfg.llm_model,'endpoint':cfg.llm_base_url})
     folder = root/'automatic-review'/key
     # Keep the exact reviewed draft even when later measurement overwrites the
     # mutable plan-timed.json or a subsequent review is interrupted.
@@ -363,6 +364,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
         'review_root':str(folder.resolve())})
     all_issues=[{'id':f'beat-{row["beat"]}','message':'旁白混入制作或审查话术，必须面向观众直接讲剧情，不能照读核对记录：'
         +json.dumps(row['phrases'],ensure_ascii=False)} for row in prose_signals(clip)]
+    all_issues.extend(title_issues(clip.title))
     batches, frames = [], []
     groups = []
     offset = 0
@@ -451,6 +453,9 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
         caption_observations=None
         metadata=any('start' not in u for u in group)
         if metadata:
+            prompt += ('\n标题编辑审核规则（只作用于title单位）：'+TITLE_RULES+
+                '分别检查剧情准确性、具体看点、精炼程度；任何不满足均列id=title的具体issues，不能只查事实就放行。'
+                '不因另一种措辞更喜欢而拒绝合格标题；不要求标题覆盖所有支线。')
             caption_lines=metadata_caption_lines(group,selected)
             if not caption_lines:raise ValueError('标题、角度与钩子缺少可核对的原片字幕')
             caption_sheet=subtitle_evidence_sheet(video,folder/f'batch-{offset}-metadata-captions',caption_lines,'metadata')
@@ -596,7 +601,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
             pool.shutdown(wait=True,cancel_futures=True)
             raise
     report = {'mode':'automatic_source_review','version':VERSION,'metadata_caption_policy':METADATA_CAPTION_POLICY,
-              'scene_observation_policy':SCENE_OBSERVATION_POLICY,'source':source_identity(video),
+              'scene_observation_policy':SCENE_OBSERVATION_POLICY,'title_policy':TITLE_POLICY,'source':source_identity(video),
               'plan_digest':digest(plan.model_dump()),'transcript_digest':digest([s.model_dump() for s in lines]),
               'voice_digest':digest(voices),'passed':not all_issues,'issues':all_issues,'batches':batches,'frames':frames,
               'limitations':['机器审核可能误判；声纹候选不等于人工确定身份。']}
@@ -826,12 +831,20 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                     +'。它与引用对白的字幕图可能处于不同时间：此前对白可支持自然回顾，'
                     '不能据此前字幕图虚构当前画面中的人物、道具或动作。修复画面不符时必须对照这张图，'
                     '删除无据细节，直接交代有证据的剧情；不要把画面核对过程写进口播。')
+        if uid == 'title':
+            prompt = title_repair_prompt(clip,[i for i in issues if i['id']==uid],
+                review_transcript_rows([s for s in lines if s.id in eligible]),
+                review_voice_rows([r for r in voices.get('lines',[]) if r['line_id'] in eligible]))
         feedback = ''
         for retry in range(cfg.repair_attempts+1):
             raw = (llm.json('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback,repair_images)
                    if repair_images else llm.json('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback))
             record = root/'automatic-repairs'/str(attempt)/uid/f'attempt-{retry}.json'
             try:
+                if uid == 'title':
+                    write_json(record.with_name(f'candidates-{retry}.json'),{'policy':TITLE_POLICY,'raw':raw,
+                        'status':'draft_requires_source_review'})
+                    raw = title_changes(raw,eligible)
                 changes = raw.get('changes') if isinstance(raw,dict) else None
                 if not isinstance(changes,list) or len(changes)!=1 or not isinstance(changes[0],dict):
                     raise ValueError('单段修订必须恰好返回当前target的一项changes')
@@ -945,9 +958,12 @@ class FrozenAutomaticScript:
 
 def assert_approval(report, video, plan, lines, voices):
     for clip in plan.clips:require_oral_style(clip)
+    if any(title_issues(clip.title) for clip in plan.clips):
+        raise ValueError('标题未满足精炼与单行规则')
     if (report.get('version')!=VERSION or report.get('mode') != 'automatic_source_review' or report.get('passed') is not True or report.get('issues') != []
             or report.get('metadata_caption_policy')!=METADATA_CAPTION_POLICY
             or report.get('scene_observation_policy')!=SCENE_OBSERVATION_POLICY
+            or report.get('title_policy')!=TITLE_POLICY
             or not any(f.get('purpose')=='metadata_captions' for f in report.get('frames',[]))
             or report.get('source') != source_identity(video) or report.get('plan_digest') != digest(plan.model_dump())
             or report.get('transcript_digest') != digest([s.model_dump() for s in lines])
