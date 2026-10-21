@@ -7,6 +7,10 @@ from autoclip.config import Settings
 from autoclip.util import source_identity, digest
 
 
+def _scene_stub(llm, sheet, times, retries):
+    return [{"frame_id":i,"visible":"单元测试画面观察"} for i in range(len(times))]
+
+
 def voice_fixture(tmp_path):
     video = tmp_path/'01.mp4'; video.write_bytes(b'video')
     source = source_identity(video)
@@ -234,6 +238,7 @@ def test_review_protocol_retry_keeps_script_and_supplies_previous_shown_context(
             return {'issues':[],'units':[{'id':u['id'],'verdict':'supported',
                 'reason':'给定字幕与画面相符','evidence_ids':[0],'frame_ids':[0],
                 'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
     report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(),Model())
     assert report['passed'] and len(prompts)==4
     assert len(sheet_roots)==len(set(sheet_roots))==5
@@ -252,10 +257,10 @@ def test_automatic_approval_binds_exact_plan_voice_and_frames(tmp_path):
     video = tmp_path/'a.mp4';video.write_bytes(b'video')
     frame = tmp_path/'a.jpg';frame.write_bytes(b'frame')
     plan=sample_plan();lines=[];voices={'library_digest':'first'}
-    from autoclip.automatic import VERSION,METADATA_CAPTION_POLICY
+    from autoclip.automatic import VERSION,METADATA_CAPTION_POLICY,SCENE_OBSERVATION_POLICY
     report={'version':VERSION,'mode':'automatic_source_review','passed':True,'issues':[],'source':source_identity(video),
         'plan_digest':digest(plan.model_dump()),'transcript_digest':digest([]),'voice_digest':digest(voices),
-        'metadata_caption_policy':METADATA_CAPTION_POLICY,
+        'metadata_caption_policy':METADATA_CAPTION_POLICY,'scene_observation_policy':SCENE_OBSERVATION_POLICY,
         'frames':[{'path':str(frame),'sha256':file_hash(frame),'purpose':'metadata_captions'}]}
     assert_approval(report,video,plan,lines,voices)
     with pytest.raises(ValueError):assert_approval({**report,'version':'old-review'},video,plan,lines,voices)
@@ -300,6 +305,7 @@ def test_originals_have_separate_review_scope_but_real_cut_failures_still_block(
                     'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
                     'identity_basis':'insufficient' if invalid_scope else 'no_identity_claim',
                     'subjects':[]} for u in group]}
+    monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
     report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(),Model())
     assert report['passed'] is (not broken_cut)
     assert len(original_attempts)==2 and plan.model_dump()==before
@@ -389,6 +395,7 @@ def test_inconsistent_voice_support_rechecks_review_before_rewriting_script(tmp_
                         row.update(identity_basis='explicit_address_response',evidence_ids=[0,1])
                 rows.append(row)
             return {'units':rows,'issues':[]}
+    monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
     model=Model();report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=1),model)
     assert model.calls==2
     assert report['passed'] is recovers
@@ -507,6 +514,7 @@ def test_metadata_gets_source_caption_images_before_any_asr_dispute(tmp_path,mon
                 'reason':'原片字幕为爵禄，不能写成绝路' if u['id']=='angle' else '依据相符',
                 'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
                 'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
     report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=0),Model())
     assert not report['passed'] and any(i['id']=='angle' and '爵禄' in i['message'] for i in report['issues'])
     assert report['metadata_caption_policy']==module.METADATA_CAPTION_POLICY
@@ -561,6 +569,7 @@ def test_supported_model_verdict_cannot_approve_production_language(tmp_path,mon
             return {'issues':[],'units':[{'id':u['id'],'verdict':'supported','reason':'字面符合',
                 'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
                 'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
     report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(),Model())
     assert not report['passed'] and any(i['id']=='beat-1' and '制作' in i['message'] for i in report['issues'])
     with pytest.raises(ValueError,match='制作或审查措辞'):
@@ -610,6 +619,7 @@ def test_asr_dispute_rereads_primary_captions_without_rewriting_correct_narratio
                 'reason':'转写为李凡院手尖，需核对同音字' if disputing and u['id']=='beat-0' else '原片与旁白相符',
                 'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
                 'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
     model=Model();report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=1),model)
     assert report['passed'] and model.reads==1 and plan.model_dump()==before
     assert lines[0].text=='李凡院，手尖的'
@@ -698,6 +708,7 @@ def test_continuous_original_gap_recheck_is_bounded_and_keeps_real_failures(tmp_
             return {'issues':[],'units':[{'id':u['id'],'verdict':'unknown' if rejected else 'supported',
                 'reason':reason,'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
                 'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
     report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=1),Model())
     assert len(attempts)==2 and '内部没有删剪' in attempts[1]
     assert report['passed'] is (not still_broken)
@@ -764,13 +775,71 @@ def test_malformed_recheck_only_preserves_valid_rejection_never_creates_approval
                 'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
     model=Model()
     if valid_rejection:
+        monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
         report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=1),model)
         assert not report['passed'] and any('ASR漏记' in i['message'] for i in report['issues'])
         assert list(tmp_path.glob('automatic-review/*/batch-*-recheck-failed.json'))
         assert read_json(tmp_path/'automatic-review-state.json')['status']=='completed'
     else:
         with pytest.raises(ValueError,match='格式或引用校验失败'):
+            monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
             module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=1),model)
         assert not (tmp_path/'automatic-review.json').exists()
         assert read_json(tmp_path/'automatic-review-state.json')['status']=='running'
     assert model.attempts==2 and not (tmp_path/'plan-approved.json').exists()
+
+
+@pytest.mark.parametrize('bad',['missing','duplicate','out_of_range','malformed'])
+def test_blind_scene_observation_rejects_incomplete_or_invalid_frames(tmp_path,bad):
+    from autoclip.automatic import read_scene_observations
+    sheet=tmp_path/'selected.jpg';sheet.write_bytes(b'pixels')
+    class Model:
+        calls=0
+        def json(self,system,prompt,images):
+            self.calls+=1
+            assert images==[sheet] and 'units=' not in prompt and 'asr_text' not in prompt
+            rows=[{'frame_id':i,'visible':'室内固定陈设，未见人物'} for i in range(3)]
+            if bad=='missing':rows.pop()
+            if bad=='duplicate':rows[2]['frame_id']=1
+            if bad=='out_of_range':rows[2]['frame_id']=3
+            if bad=='malformed':rows=['frame-0']
+            return {'frames':rows}
+    model=Model()
+    with pytest.raises(ValueError,match='原片画面观察响应校验失败'):
+        read_scene_observations(model,sheet,[10.,11.,12.],1)
+    assert model.calls==2
+
+
+def test_audit_compares_selected_frames_with_blind_observation(tmp_path,monkeypatch):
+    import json
+    import autoclip.automatic as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    main=tmp_path/'selected.jpg';main.write_bytes(b'selected')
+    captions=tmp_path/'captions.jpg';captions.write_bytes(b'earlier captions')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:main)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:captions)
+    plan=sample_plan();plan.clips[0].beats[0].text='有人提着灯请客人进屋。'
+    lines=[Line(id=i,start=i*10+.5,end=(i+1)*10-.5,text='客人请进') for i in range(4)]
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':[]}
+    class Model:
+        observed=0
+        def json(self,system,prompt,images):
+            if '画面观察员' in system:
+                self.observed+=1
+                assert images==[main] and '有人提着灯请客人进屋' not in prompt and '客人请进' not in prompt
+                times=json.JSONDecoder().raw_decode(prompt.split('\ntimes=',1)[1])[0]
+                return {'frames':[{'frame_id':i,'visible':'室内固定陈设，未见人物'} for i in range(len(times))]}
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+            if any(u['id'].startswith('beat-') for u in group):
+                assert '室内固定陈设，未见人物' in prompt and '不能把其中动作或道具移到当前画面' in prompt
+            return {'issues':[],'units':[{'id':u['id'],'verdict':'contradicted' if u['id']=='beat-0' else 'supported',
+                'reason':'实际剪入画面未见提灯者' if u['id']=='beat-0' else '测试证据相符',
+                'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
+                'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    model=Model();report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=0),model)
+    assert model.observed==2 and not report['passed']
+    assert report['issues']==[{'id':'beat-0','message':'实际剪入画面未见提灯者'}]
+    assert len(list(tmp_path.glob('automatic-review/*/*-scene-observations.json')))==2
+    assert report['scene_observation_policy']==module.SCENE_OBSERVATION_POLICY
+    with pytest.raises(ValueError):module.assert_approval({**report,'passed':True,'issues':[],
+        'scene_observation_policy':'old'},video,plan,lines,voices)

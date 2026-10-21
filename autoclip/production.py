@@ -369,10 +369,11 @@ def produce_episode(video: Path, cfg: Settings, brand: BrandSettings, history: P
                         return {'plan':measured.model_dump(),'report':report},[
                             storyroot/'plan-approved.json',storyroot/'automatic-review.json',
                             *[Path(f['path']) for f in report['frames']]]
-                    from .automatic import METADATA_CAPTION_POLICY
+                    from .automatic import METADATA_CAPTION_POLICY, SCENE_OBSERVATION_POLICY
                     from .editorial import AUDIENCE_STYLE_POLICY
                     approval = checkpoint(storyroot,'voice-approval',{'draft':plan.model_dump(),'voices':voices,
                         'metadata_caption_policy':METADATA_CAPTION_POLICY,
+                        'scene_observation_policy':SCENE_OBSERVATION_POLICY,
                         'audience_style_policy':AUDIENCE_STYLE_POLICY,
                         'cfg':local.model_dump(mode='json'),'story':story.model_dump()},approve)
                     plan = Plan.model_validate(approval['plan'])

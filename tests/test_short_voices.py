@@ -172,6 +172,9 @@ def test_short_voice_gate_real_export_cache_and_reference_change(tmp_path,monkey
         def usage(self):return {'calls_this_run':self.calls}
         def json(self,system,prompt,images=None):
             self.calls+=1;reviews.append(prompt)
+            if '原片画面观察员' in system:
+                times=json.JSONDecoder().raw_decode(prompt.split('\ntimes=',1)[1])[0]
+                return {'frames':[{'frame_id':i,'visible':'测试素材中的颜色画面'} for i in range(len(times))]}
             group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
             supplied=json.JSONDecoder().raw_decode(prompt.split('\n字幕=',1)[1])[0]
             return {'issues':[],'units':[{'id':u['id'],'verdict':'unknown' if unknown is True and u['id']=='beat-1' else 'supported',

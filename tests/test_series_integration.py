@@ -53,6 +53,9 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
                     'instruction':'交代问答','evidence_ids':[i],'target_chars':45 if i%2 else 0} for i in range(1,4)]}
             if '本次只写第' in prompt:
                 return {'items':[{'id':i,'text':'事情从这次问答展开。有人提出问题，对方随后作了回应，双方的谈话仍在继续。','evidence_ids':[i]} for i in (1,3)]}
+            if '原片画面观察员' in system:
+                times=json.JSONDecoder().raw_decode(prompt.split('\ntimes=',1)[1])[0]
+                return {'frames':[{'frame_id':i,'visible':'测试素材中的颜色画面'} for i in range(len(times))]}
             if '\nunits=' in prompt:
                 group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
                 return {'issues':[],'units':[{'id':u['id'],'verdict':'supported','reason':'测试证据相符',
@@ -89,7 +92,7 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
     monkeypatch.setattr(series,'AUDIENCE_STYLE_POLICY','audience-next-test')
     refreshed=series.run_series(source,output,test_sample=True)
     assert refreshed['status']=='completed',refreshed
-    assert len(calls)>count and all('审核员' in call for call in calls[count:])
+    assert len(calls)>count and all(any(role in call for role in ('审核员','画面观察员')) for call in calls[count:])
     assert result_video.read_bytes()==before
     # A review algorithm update must refresh the persisted evidence as well as
     # the approval, even when source, library and run directory do not change.
@@ -105,6 +108,15 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
     approval=read_json(run_root/'automatic-review.json')
     assert persisted['version']==approval['version']=='review-next-test'
     assert approval['voice_digest']==digest(persisted)
+    # Changing the scene gate rechecks the saved draft, without rebuilding source analysis.
+    count=len(calls)
+    monkeypatch.setattr(automatic,'SCENE_OBSERVATION_POLICY','scene-next-test')
+    monkeypatch.setattr(series,'SCENE_OBSERVATION_POLICY','scene-next-test')
+    rechecked=series.run_series(source,output,test_sample=True)
+    assert rechecked['status']=='completed',rechecked
+    assert len(calls)>count and all(any(role in call for role in ('审核员','画面观察员')) for call in calls[count:])
+    assert read_json(run_root/'automatic-review.json')['scene_observation_policy']=='scene-next-test'
+    assert result_video.read_bytes()==before
     bank['revision']=2;bank['characters'][0]['name']='乙';write_json(library,bank)
     # Prepare-only still records the impact and retires old approvals from current display.
     series.run_series(source,output,stage='prepare',test_sample=True)
@@ -116,7 +128,7 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
     assert resumed['status']=='completed',resumed
     resumed_root=Path(resumed['episodes'][0]['run'])
     assert resumed_root!=run_root and (resumed_root/'reference-resume.json').exists()
-    assert len(calls)>count and all('审核员' in call for call in calls[count:])
+    assert len(calls)>count and all(any(role in call for role in ('审核员','画面观察员')) for call in calls[count:])
     latest=read_json(resumed_root/'automatic-review.json')
     assert latest['passed'] and latest['voice_digest']==digest(read_json(resumed_root/'voice-evidence.json'))
     assert result_video.read_bytes()==before
@@ -126,7 +138,7 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
     assert third['status']=='completed',third
     third_root=Path(third['episodes'][0]['run'])
     assert Path(read_json(third_root/'reference-resume.json')['previous_plan']).parent==resumed_root
-    assert len(calls)>count and all('审核员' in call for call in calls[count:])
+    assert len(calls)>count and all(any(role in call for role in ('审核员','画面观察员')) for call in calls[count:])
     # A service failure after a measured repair resumes that current draft,
     # not the older pre-enrollment reference, and successful reruns stay cached.
     real_complete=series.complete_long_plan
@@ -146,7 +158,7 @@ def test_series_exports_resumes_and_invalidates_voice_version(tmp_path,monkeypat
     count=len(calls)
     continued=series.run_series(source,output,test_sample=True)
     assert continued['status']=='completed',continued
-    assert len(calls)>count and all('审核员' in call for call in calls[count:])
+    assert len(calls)>count and all(any(role in call for role in ('审核员','画面观察员')) for call in calls[count:])
     assert read_json(third_root/'plan-approved.json')['clips'][0]['beats'][1]['text']==fixed_text
     count=len(calls)
     assert series.run_series(source,output,test_sample=True)['status']=='completed'

@@ -17,6 +17,7 @@ from .voices import match_batch
 
 VERSION = 'automatic-review-9'
 METADATA_CAPTION_POLICY = 'metadata-captions-2'
+SCENE_OBSERVATION_POLICY = 'blind-selected-frames-1'
 
 
 def validate_voice_library(library, series):
@@ -103,6 +104,39 @@ class CaptionReading(BaseModel):
 class CaptionReadings(BaseModel):
     model_config=ConfigDict(extra='forbid')
     readings: list[CaptionReading] = Field(min_length=1,max_length=6)
+
+
+class SceneObservation(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    frame_id: int
+    visible: str = Field(min_length=1)
+
+
+class SceneObservations(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    frames: list[SceneObservation]
+
+
+def read_scene_observations(llm, sheet, times, retries):
+    """Describe selected pixels without exposing script, ASR or caption crops."""
+    prompt=('只描述主图各格实际可见的场所、人物、动作和道具，不审稿、不识别角色姓名。'
+        '图片从0编号，按times顺序；每格都要单独描述。房间陈设不能写成有人行动，'
+        '固定烛台不能写成人手提灯，不能从字幕文字推测不可见的动作。'
+        '不根据其他格或剧情记忆补当前格；没人就明确写未见人物，看不清就明确写看不清。'
+        '描述只能作为后续核对材料，不能宣布任何稿件通过。'
+        '\n格式='+json.dumps(SceneObservations.model_json_schema(),ensure_ascii=False)
+        +'\ntimes='+json.dumps(times))
+    feedback=''
+    for retry in range(retries+1):
+        raw=llm.json('你是原片画面观察员，只描述所给主图，不读取稿件或字幕转写。',prompt+feedback,[sheet])
+        try:
+            parsed=SceneObservations.model_validate(raw)
+            if len(parsed.frames)!=len(times) or {r.frame_id for r in parsed.frames}!=set(range(len(times))):
+                raise ValueError('画面观察必须精确覆盖每个主图编号一次')
+            return sorted(parsed.model_dump()['frames'],key=lambda r:r['frame_id'])
+        except ValueError as exc:
+            if retry==retries:raise ValueError('原片画面观察响应校验失败：'+str(exc)) from exc
+            feedback='\n上次响应格式有误：'+str(exc)+'\n只重读同一主图，返回全部frames对象。'
 
 
 def read_caption_observations(llm, sheet, line_ids):
@@ -296,7 +330,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
             prior = {eid for b in clip.beats[:index] for eid in b.evidence_ids}
             unit['shown_evidence'] = sorted(eid for eid in prior if lookup[eid].start<unit['end']
                 or (cfg.opening=='original_teaser' and index==1 and eid in clip.beats[0].evidence_ids))
-    key = digest({'v':VERSION,'plan':plan.model_dump(),'voices':voices,'model':cfg.llm_model,'endpoint':cfg.llm_base_url})
+    key = digest({'v':VERSION,'scene_policy':SCENE_OBSERVATION_POLICY,'plan':plan.model_dump(),'voices':voices,'model':cfg.llm_model,'endpoint':cfg.llm_base_url})
     folder = root/'automatic-review'/key
     # Keep the exact reviewed draft even when later measurement overwrites the
     # mutable plan-timed.json or a subsequent review is interrupted.
@@ -404,6 +438,14 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 review_images.append(caption_sheet)
                 prompt+=('\n另附本批旁白引用的原片字幕放大图。核对官名、人名、同音字和残句；转写稿不是正确文字的保证。'
                     '还须按完整稿件判断自然听感与剧情承接，不能把制作核对话术当成合格解说。frame_ids仍使用主图times索引。')
+            observations=read_scene_observations(llm,sheet,times,cfg.repair_attempts)
+            write_json(folder/f'batch-{offset}-scene-observations.json',{'policy':SCENE_OBSERVATION_POLICY,
+                'frames':observations,'times':times,'image':str(sheet.resolve()),'image_sha256':file_hash(sheet)})
+            prompt+=('\n以下是只看主图、未读取稿件和ASR的独立画面观察，仍须对图核实：'
+                +json.dumps(observations,ensure_ascii=False)
+                +'\n严格区分当前实际剪入画面与引用对白的字幕图。引用字幕图可能在更早时间，不能把其中动作或道具移到当前画面。'
+                '逐项按start/end对应主图times，只能用对应格证明当前动作。若观察与旁白冲突，回看主图，不能直接复述旁白宣布支持；'
+                '无法消除的冲突必须unknown/contradicted并列明问题，不能仅凭对白支持而放过无据动作。')
         rejected_record = None
         for retry in range(cfg.repair_attempts+1):
             raw = llm.json('你是独立的影视内容与人物证据审核员，不读取人工答案。',prompt+feedback,review_images)
@@ -502,7 +544,8 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
         except BaseException:
             pool.shutdown(wait=True,cancel_futures=True)
             raise
-    report = {'mode':'automatic_source_review','version':VERSION,'metadata_caption_policy':METADATA_CAPTION_POLICY,'source':source_identity(video),
+    report = {'mode':'automatic_source_review','version':VERSION,'metadata_caption_policy':METADATA_CAPTION_POLICY,
+              'scene_observation_policy':SCENE_OBSERVATION_POLICY,'source':source_identity(video),
               'plan_digest':digest(plan.model_dump()),'transcript_digest':digest([s.model_dump() for s in lines]),
               'voice_digest':digest(voices),'passed':not all_issues,'issues':all_issues,'batches':batches,'frames':frames,
               'limitations':['机器审核可能误判；声纹候选不等于人工确定身份。']}
@@ -837,6 +880,7 @@ def assert_approval(report, video, plan, lines, voices):
     for clip in plan.clips:require_oral_style(clip)
     if (report.get('version')!=VERSION or report.get('mode') != 'automatic_source_review' or report.get('passed') is not True or report.get('issues') != []
             or report.get('metadata_caption_policy')!=METADATA_CAPTION_POLICY
+            or report.get('scene_observation_policy')!=SCENE_OBSERVATION_POLICY
             or not any(f.get('purpose')=='metadata_captions' for f in report.get('frames',[]))
             or report.get('source') != source_identity(video) or report.get('plan_digest') != digest(plan.model_dump())
             or report.get('transcript_digest') != digest([s.model_dump() for s in lines])

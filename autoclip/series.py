@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from .automatic import (VERSION as REVIEW_VERSION, FrozenAutomaticScript, assert_approval, audit_plan,
-                        link_voice_evidence, repair_plan, validate_voice_library)
+                        link_voice_evidence, repair_plan, validate_voice_library, SCENE_OBSERVATION_POLICY)
 from .branding import BrandSettings, package_clip
 from .config import Settings
 from .continuity import load_continuity
@@ -372,6 +372,7 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
             plan,report = complete_long_plan(video,pending,lines,voices,root,cfg,llm)
             return {'plan':plan.model_dump(),'report':report},[root/'plan-approved.json',root/'automatic-review.json',*[Path(f['path']) for f in report['frames']]]
         approved = checkpoint(root,'approval',{'inputs':inputs,'draft':draft,'voices':voices,'review_version':REVIEW_VERSION,
+            'scene_observation_policy':SCENE_OBSERVATION_POLICY,
             'audience_style_policy':AUDIENCE_STYLE_POLICY},approve_action)
         plan = Plan.model_validate(approved['plan'])
         assert_approval(approved['report'],video,plan,lines,voices)
