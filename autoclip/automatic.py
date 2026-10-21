@@ -17,7 +17,7 @@ from .voices import match_batch
 
 VERSION = 'automatic-review-9'
 METADATA_CAPTION_POLICY = 'metadata-captions-2'
-SCENE_OBSERVATION_POLICY = 'blind-selected-frames-3-continuous-boundaries'
+SCENE_OBSERVATION_POLICY = 'blind-selected-frames-4-boundary-context'
 
 
 def validate_voice_library(library, series):
@@ -447,6 +447,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
         feedback = ''
         review_images = [sheet]
         caption_sheet = None
+        boundary_sheet = None
         caption_observations=None
         metadata=any('start' not in u for u in group)
         if metadata:
@@ -489,6 +490,23 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 issues = assess_batch(checked,group,selected,len(times),evidence)
                 if issues:
                     rejected_record=(raw,issues)
+                if original and issues and boundary_sheet is None and retry<cfg.repair_attempts:
+                    disputed={i['id'] for i in issues}
+                    ceiling=max(max(b.end for b in clip.beats),max(s.end for s in lines))-.1
+                    boundary_times=sorted({round(max(0,min(ceiling,t)),3) for u in group if u['id'] in disputed
+                        for t in (u['start']-.8,u['start']+.1,u['end']-.1,u['end']+.8)})
+                    boundary_sheet=contact_sheet(video,folder/f'batch-{offset}-boundary-context',boundary_times,'boundaries')
+                    review_images.append(boundary_sheet)
+                    write_json(folder/f'batch-{offset}-boundary-context.json',{'times':boundary_times,
+                        'image':str(boundary_sheet.resolve()),'image_sha256':file_hash(boundary_sheet),'prior_issues':issues})
+                    feedback=('\n先复核边界疑点，尚未改稿。追加原片切点前后画面，times='+json.dumps(boundary_times)
+                        +'；其中选段之外的图仅作边界上下文，不代表剪入成片，frame_ids仍只用第一张主图编号。'
+                        '逐项指出到底删掉了哪句必要对白或伪造了什么问答，不能仅因原片自身转场或人物变化判系统剪断。'
+                        '每个original区间内部没有删剪，字幕间的声音与画面也全部保留。'
+                        '连续呼唤姓名及完整回应也可以构成合法原声片段，不要求每段都是长句或完整问答。'
+                        '对照实际前后稿和uncut_chain，只有真实边界或承接问题才拒绝；确实无法核实仍unknown。'
+                        '\n上轮核验='+json.dumps(raw,ensure_ascii=False)+'\n返回本批全部units和issues。')
+                    continue
                 recheck=review_recheck_reason(issues,group)
                 if recheck and retry<cfg.repair_attempts:
                     write_json(folder/f'batch-{offset}-source-recheck-{retry}.json',{'raw':raw,'issues':issues})

@@ -308,7 +308,7 @@ def test_originals_have_separate_review_scope_but_real_cut_failures_still_block(
     monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
     report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(),Model())
     assert report['passed'] is (not broken_cut)
-    assert len(original_attempts)==2 and plan.model_dump()==before
+    assert len(original_attempts)==(3 if broken_cut else 2) and plan.model_dump()==before
     assert list(tmp_path.glob('automatic-review/*/batch-*-protocol-0.json'))
     assert all(i['id'].startswith('original-') for i in report['issues'])
 
@@ -964,3 +964,41 @@ def test_original_review_receives_real_chain_but_still_rejects_external_cut(tmp_
                 'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
     report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=0),Model())
     assert not report['passed'] and report['issues']==[{'id':'original-3','message':'外部结束点截断后续对白'}]
+
+
+@pytest.mark.parametrize('fixed',[False,True])
+def test_uncertain_original_gets_cut_context_before_any_script_repair(tmp_path,monkeypatch,fixed):
+    import json
+    import autoclip.automatic as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    main=tmp_path/'main.jpg';main.write_bytes(b'main')
+    boundary=tmp_path/'boundary.jpg';boundary.write_bytes(b'boundary')
+    captured=[]
+    def sheet(video,root,times,name):
+        if name=='boundaries':captured.extend(times);return boundary
+        return main
+    monkeypatch.setattr(module,'contact_sheet',sheet)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:main)
+    monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
+    plan=sample_plan();plan.clips[0].beats[1].mode='original';plan.clips[0].beats[1].text=''
+    before=plan.model_dump()
+    lines=[Line(id=i,start=i*10+.5,end=(i+1)*10-.5,text='完整呼唤或回应') for i in range(4)]
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':[]}
+    class Model:
+        attempts=0
+        def json(self,system,prompt,images):
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+            original=group[0].get('mode')=='original'
+            if original:
+                self.attempts+=1
+                if self.attempts==2:
+                    assert images==[main,boundary] and '选段之外的图仅作边界上下文' in prompt
+            reject=original and (self.attempts==1 or not fixed)
+            return {'issues':[],'units':[{'id':u['id'],'verdict':'unknown' if reject else 'supported',
+                'reason':'仍不能确认切点' if reject else '边界完整',
+                'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+    model=Model();report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=1),model)
+    assert model.attempts==2 and report['passed'] is fixed and plan.model_dump()==before
+    assert captured==[9.2,10.1,19.9,20.8]
+    assert any(f['path']==str(boundary.resolve()) for f in report['frames'])
+    assert list(tmp_path.glob('automatic-review/*/*-boundary-context.json'))
