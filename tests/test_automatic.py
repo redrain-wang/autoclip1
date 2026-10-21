@@ -420,15 +420,62 @@ def test_local_writer_receives_actual_caption_evidence_not_only_reviewer_claim(t
     monkeypatch.setattr(module,'contact_sheet',selected_sheet)
     class Model:
         def json(self,system,prompt,images):
+            if '局部修订核验员' in system:
+                assert images==[selected_frame,frame]
+                return {'issues':[],'units':[{'id':'beat-0','verdict':'supported','reason':'原片支持修订',
+                    'evidence_ids':[0],'frame_ids':[0],'identity_basis':'no_identity_claim','subjects':[]}]}
             assert images==[frame,selected_frame] and '实际原片字幕放大图' in prompt
             assert '当前实际剪入区间' in prompt and '不能据此前字幕图虚构当前画面' in prompt
             return {'changes':[{'id':'beat-0','text':'按原片可见文字作必要承接','evidence_ids':[0]}]}
     revised=module.repair_plan(plan,[{'id':'beat-0','message':'字幕0的转写字形有误'}],lines,
         {'source':source_identity(video),'lines':[]},tmp_path,Settings(target_seconds=45),Model(),0,source_seconds=40)
-    assert captured==[0]
+    assert captured==[0,0]
     assert revised.clips[0].beats[0].text=='按原片可见文字作必要承接'
     assert revised.clips[0].beats[1:]==plan.clips[0].beats[1:]
     assert not (tmp_path/'plan-approved.json').exists()
+
+
+@pytest.mark.parametrize('failure',['fixed','unresolved','bad_frame','malformed'])
+def test_local_patch_requires_source_verification_before_acceptance(tmp_path,monkeypatch,failure):
+    import json
+    import autoclip.automatic as module
+    from autoclip.repair import RepairNeeded
+    from autoclip.util import read_json
+    from test_pipeline import fixture_plan
+    lines,plan=fixture_plan();original=plan.model_dump()
+    video=tmp_path/'source.mp4';video.write_bytes(b'video')
+    frame=tmp_path/'scene.jpg';frame.write_bytes(b'scene')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    class Model:
+        writes=0
+        checks=0
+        def json(self,system,prompt,images):
+            if '局部修订核验员' in system:
+                self.checks+=1
+                group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+                assert len(group)==1 and group[0]['id']=='beat-0'
+                if failure=='malformed':return {'units':['beat-0']}
+                supported=failure in {'bad_frame','fixed'} and self.writes>1
+                return {'issues':[],'units':[{'id':'beat-0','verdict':'supported' if supported else 'contradicted',
+                    'reason':'当前是室内陈设，没有人提灯' if not supported else '原片支持',
+                    'evidence_ids':[0],'frame_ids':[9 if failure=='bad_frame' else 0],
+                    'identity_basis':'no_identity_claim','subjects':[]}]}
+            self.writes+=1
+            if self.writes>1:assert '上轮局部修订未通过程序检查' in prompt
+            return {'changes':[{'id':'beat-0','text':'有人提着灯往里走。' if self.writes==1 else '有人请客人进屋。','evidence_ids':[0]}]}
+    model=Model()
+    args=(plan,[{'id':'beat-0','message':'当前画面中没有提灯者，旁白动作无据'}],lines,
+        {'source':source_identity(video),'lines':[]},tmp_path,Settings(target_seconds=45,repair_attempts=1),model,0)
+    if failure=='fixed':
+        revised=module.repair_plan(*args,source_seconds=40)
+        assert revised.clips[0].beats[0].text=='有人请客人进屋。'
+        assert read_json(tmp_path/'automatic-repairs/0/beat-0/verify-1/verification.json')['passed']
+    else:
+        with pytest.raises(RepairNeeded) as exc:module.repair_plan(*args,source_seconds=40)
+        assert exc.value.report['clip']==plan.clips[0].model_dump()
+    assert model.writes==model.checks==2
+    assert plan.model_dump()==original and not (tmp_path/'plan-approved.json').exists()
 
 
 def test_metadata_crops_prioritize_plot_changing_words_from_asr():

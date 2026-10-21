@@ -582,6 +582,50 @@ def replan_original_window(plan, uid, issues, lines, root, cfg, llm, attempt, re
     return candidate
 
 
+def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, root, llm):
+    """Check the changed unit against source before spending a full-film re-audit."""
+    index=int(uid.split('-')[1])
+    clip=candidate.clips[0]
+    beat=clip.beats[index]
+    shown={eid for b in clip.beats[:index] for eid in b.evidence_ids}
+    unit={'id':uid,'text':beat.text,'start':beat.start,'end':beat.end,
+          'evidence_ids':beat.evidence_ids,
+          'shown_evidence':[s.id for s in lines if s.id in shown and s.start<beat.end]}
+    selected=[s for s in lines if s.id in beat.evidence_ids or beat.start-8<=s.start<beat.end+8]
+    evidence=review_voice_rows([r for r in voices.get('lines',[]) if r['line_id'] in {s.id for s in selected}])
+    times=[round(t,3) for t in (beat.start+.1,(beat.start+beat.end)/2,beat.end-.1)]
+    images=[contact_sheet(video,root/'selected',times,'selected')]
+    caption_lines=caption_lines_for_issues(prior_claims,selected,beat.evidence_ids)
+    if caption_lines:images.append(subtitle_evidence_sheet(video,root/'captions',caption_lines,'captions'))
+    prompt=('只核验这一段修订是否真正解决原片事实、人物归属或画面问题，不改稿。'
+        '上一轮意见也可能有误，必须独立核对实际原片；不要机械坚持旧意见，也不能只因文字变了就放行。'
+        '第一张图是当前实际剪入区间的首中尾画面，frame_ids只能是0、1、2；其后是引用对白字幕图。'
+        '过去对白可以支持自然回顾，但不能将此前出现的动作、道具或人物说成正在当前画面发生。'
+        '字幕中的称呼可能指听者，不能自动当作说话人。明确称呼与回应须引用至少两条不同对白；'
+        '声音加语境须列出实际候选姓名，不能自行添加别名。无法核实就unknown，具体问题写issues。'
+        'ASR不是原片字幕的正确答案，不要求正确转述迎合机器错字。仅换同义词、保留无据动作仍须拒绝。'
+        '每个结论都必须引用提供的对白和主图编号。只返回units、issues及可选notes，不返回passed。'
+        '\n格式'+json.dumps(UnitReviews.model_json_schema(),ensure_ascii=False)
+        +'\nunits='+json.dumps([unit],ensure_ascii=False)+'\ntimes='+json.dumps(times)
+        +'\n上一轮待核意见='+json.dumps(prior_claims,ensure_ascii=False)
+        +'\n字幕='+json.dumps(review_transcript_rows(selected),ensure_ascii=False)
+        +'\n声音候选='+json.dumps(evidence,ensure_ascii=False)
+        +'\n逐项引用边界='+json.dumps(review_citation_limits([unit],selected,evidence),ensure_ascii=False)
+        +'\nviewer_timeline='+json.dumps(audience_script(clip),ensure_ascii=False))
+    raw=llm.json('你是独立的局部修订核验员，不是写稿者，不读取人工答案。',prompt,images)
+    try:
+        decisions=UnitReviews.model_validate(raw)
+        checked=decisions.model_dump()
+        checked['passed']=not decisions.issues and all(u.verdict=='supported' for u in decisions.units)
+        issues=assess_batch(checked,[unit],selected,len(times),evidence)
+    except ValueError as exc:
+        write_json(root/'verification.json',{'raw':raw,'passed':False,'error':str(exc)})
+        raise
+    write_json(root/'verification.json',{'raw':raw,'passed':not issues,'issues':issues,
+        'unit':unit,'frames':[{'path':str(p.resolve()),'sha256':file_hash(p)} for p in images]})
+    if issues:raise ValueError('局部修订仍未解决原片问题：'+json.dumps(issues,ensure_ascii=False))
+
+
 def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_seconds=None):
     """Repair one failed unit at a time, keeping validated edits and shot IDs."""
     revised = plan.model_copy(deep=True)
@@ -705,6 +749,10 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                             raise ValueError(f'镜头{index}修订引用了尚未播放的未来对白')
                         if b.mode=='original' and any(s.start+.2<cut<s.end-.2 for s in lines for cut in (b.start,b.end)):
                             raise ValueError(f'镜头{index}修订后的原声切点落在字幕句中')
+                if (uid.startswith('beat-') and max_characters is None and cfg.vision
+                        and source.get('path') and Path(source['path']).is_file()):
+                    verify_narration_patch(Path(source['path']),candidate,uid,[i for i in issues if i['id']==uid],
+                        lines,voices,record.parent/f'verify-{retry}',llm)
                 revised = candidate
                 accepted.extend(changes)
                 write_json(record,{'raw':raw,'status':'valid_patch'})
