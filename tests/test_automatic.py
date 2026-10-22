@@ -240,10 +240,10 @@ def test_review_protocol_retry_keeps_script_and_supplies_previous_shown_context(
                 'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
     monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
     report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(),Model())
-    assert report['passed'] and len(prompts)==4
-    assert len(sheet_roots)==len(set(sheet_roots))==5
+    assert report['passed'] and len(prompts)==6
+    assert len(sheet_roots)==len(set(sheet_roots))==9
     assert all(len(group)<=3 for group in groups)
-    assert [Path(p).name for p in report['batches']]==['batch-0.json','batch-3.json','batch-6.json']
+    assert [Path(p).name for p in report['batches']]==['batch-0.json','batch-3.json','batch-4.json','batch-5.json','batch-6.json']
     assert any('上次审核响应' in p for p in prompts[1:]) and plan.model_dump()==before
     assert any('逐项引用边界=' in p for p in prompts[1:])
     assert all('内部猜测辛某' not in prompt for prompt in prompts)
@@ -290,7 +290,7 @@ def test_originals_have_separate_review_scope_but_real_cut_failures_still_block(
         def json(self,system,prompt,images):
             assert 'RANK_ONLY_NOT_AN_IDENTITY' not in prompt
             timeline=json.JSONDecoder().raw_decode(prompt.split('\nviewer_timeline=',1)[1])[0]
-            assert len(timeline)==len(plan.clips[0].beats)
+            assert len(timeline)<=len(plan.clips[0].beats)
             assert timeline[1]['text']==plan.clips[0].beats[1].text
             assert all('reason' not in row for row in timeline)
             group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
@@ -336,6 +336,13 @@ def test_failed_short_bridge_can_only_retain_complete_source_audio_and_needs_rev
         with pytest.raises(RuntimeError if case=='service_error' else ValueError):
             repair_plan(plan,issues,lines,{},tmp_path,cfg,Model(),0,source_seconds=48)
         assert not list(tmp_path.rglob('source-audio-fallback.json'))
+        if case=='service_error':
+            from autoclip.util import read_json
+            pending=read_json(tmp_path/'pending-repair.json')
+            assert pending['plan']['clips'][0]['beats'][1]['text']=='前段先交代这件事的来由'
+            assert pending['base_plan_digest']==digest(before)
+            assert pending['status']=='requires_full_measurement_and_review'
+            assert not (tmp_path/'plan-approved.json').exists()
     else:
         revised=repair_plan(plan,issues,lines,{},tmp_path,cfg,Model(),0,source_seconds=48)
         b=revised.clips[0].beats[3]
@@ -839,9 +846,9 @@ def test_audit_compares_selected_frames_with_blind_observation(tmp_path,monkeypa
                 'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
                 'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
     model=Model();report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=0),model)
-    assert model.observed==2 and not report['passed']
+    assert model.observed==4 and not report['passed']
     assert report['issues']==[{'id':'beat-0','message':'实际剪入画面未见提灯者'}]
-    assert len(list(tmp_path.glob('automatic-review/*/*-scene-observations.json')))==2
+    assert len(list(tmp_path.glob('automatic-review/*/*-scene-observations.json')))==4
     assert report['scene_observation_policy']==module.SCENE_OBSERVATION_POLICY
     with pytest.raises(ValueError):module.assert_approval({**report,'passed':True,'issues':[],
         'scene_observation_policy':'old'},video,plan,lines,voices)
@@ -889,7 +896,7 @@ def test_review_context_keeps_complete_past_and_two_following_cuts():
     from autoclip.automatic import review_timeline
     plan=sample_plan();clip=plan.clips[0]
     clip.beats=[Beat(mode='narration',start=i*10,end=(i+1)*10,text=f'第{i}段的实际口播',evidence_ids=[i],reason='私下猜测') for i in range(12)]
-    rows=review_timeline(clip,[{'id':'original-5','start':50}])
+    rows=review_timeline(clip,[{'id':'original-5','mode':'original','start':50}])
     assert [r['beat'] for r in rows]==list(range(8))
     assert all('reason' not in row for row in rows)
     assert len(review_timeline(clip,[{'id':'title'}]))==12
@@ -919,9 +926,9 @@ def test_late_text_edit_keeps_earlier_review_requests_identical(tmp_path,monkeyp
     plan.clips[0].beats[10].text='后半段修订后的真实口播'
     second=Model();after=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=0),second)
     assert before['passed'] and after['passed'] and before['plan_digest']!=after['plan_digest']
-    for ids in [('beat-0','beat-1','beat-2'),('beat-3','beat-4','beat-5')]:
+    for ids in [(f'beat-{i}',) for i in range(10)]:
         assert first.requests[ids]==second.requests[ids]
-    for ids in [('title','angle','hook'),('beat-6','beat-7','beat-8'),('beat-9','beat-10','beat-11')]:
+    for ids in [('title','angle','hook'),('beat-10',),('beat-11',)]:
         assert first.requests[ids]!=second.requests[ids]
 
 
@@ -1003,3 +1010,29 @@ def test_uncertain_original_gets_cut_context_before_any_script_repair(tmp_path,m
     assert captured==[9.2,10.1,19.9,20.8]
     assert any(f['path']==str(boundary.resolve()) for f in report['frames'])
     assert list(tmp_path.glob('automatic-review/*/*-boundary-context.json'))
+
+
+def test_narration_review_cannot_borrow_later_script_or_human_identity(tmp_path):
+    from autoclip.automatic import review_timeline
+    plan=sample_plan()
+    assert [r['beat'] for r in review_timeline(plan.clips[0],[{'id':'beat-1','start':10}])]==[0,1]
+    video,bank,manifest=voice_fixture(tmp_path)
+    # The rescanned vector can be unknown, while this precise human interval remains known.
+    manifest['samples'][0]['embedding']=[0.,1.]
+    lines=[Line(id=0,start=0,end=3,text='给我送火'),Line(id=1,start=4,end=7,text='给另一人送饭')]
+    result=link_voice_evidence(video,lines,bank,manifest)
+    confirmed=[s for s in result['lines'][0]['samples'] if s['status']=='human_confirmed']
+    assert len(confirmed)==1 and confirmed[0]['name']=='甲'
+    assert result['lines'][0]['status']=='candidate'
+    assert result['lines'][1]['status']=='unknown' and not result['lines'][1]['samples']
+    assert bank['characters'][0]['samples'][0]['status']=='human_confirmed'
+
+
+def test_named_narration_cannot_hide_identity_by_omitting_subjects():
+    raw,units,lines,count,voices=review_fixture()
+    units[0]['text']='角色甲吩咐下人送火。'
+    raw['units'][0].update(identity_basis='no_identity_claim',subjects=[])
+    voices=[{'line_id':1,'status':'candidate','samples':[{'name':'角色甲'}]}]
+    assert any('正文明确出现：角色甲' in issue['message'] for issue in assess_batch(raw,units,lines,count,voices))
+    units[0]['text']='有人提到了送火的事情。'
+    assert assess_batch(raw,units,lines,count,voices)==[]

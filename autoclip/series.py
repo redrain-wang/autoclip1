@@ -20,7 +20,8 @@ from .llm import LLM
 from .models import Line, Plan, validate_plan
 from .outline import compose_outline
 from .planning import VERSION as PLANNING_VERSION, plan_outline
-from .render import render_clip
+from .render import render_clip, VERSION as RENDER_VERSION
+from .narrative import NARRATIVE_POLICY, require_commentary, review_commentary, require_commentary_review, formal_long
 from .report import build_report
 from .research import prepare_research
 from .sample import measure_sample_plan
@@ -224,8 +225,19 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
                     issues.append({'id':f'beat-{index}', 'message':item['message'], 'measurement':row})
         else:
             category = 'content'
+            metrics=require_commentary(plan.clips[0],cfg,timing)
+            write_json(root/'commentary-quality.json',{'policy':NARRATIVE_POLICY,**metrics})
             report = audit_plan(video,plan,lines,voices,root,cfg,llm)
             issues = report['issues']
+            if report['passed']:
+                narrative=review_commentary(plan.clips[0],lines,cfg,llm,root)
+                if narrative is not None:
+                    report={**report,'narrative_review':narrative}
+                    issues=[{'id':f'beat-{i["beat"]}','message':'整稿解说质量：'+i['problem']+'；修订方向：'+i['direction']}
+                            for i in narrative['issues']]
+                    report['passed']=narrative['passed']
+                    report['issues']=issues
+                    write_json(root/'automatic-review.json',report)
             if report['passed']:
                 write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':None})
                 write_json(root/'plan-approved.json',plan.model_dump())
@@ -277,6 +289,7 @@ def resume_long_reference(video, root, inputs, lines, voices, cfg, seconds):
             path=previous/'plan-timed.json'
             plan=Plan.model_validate(read_json(path))
             if len(plan.clips)!=1:continue
+            require_commentary(plan.clips[0],cfg)
             validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
             lookup={s.id:s for s in lines}
             if any(lookup[i].start>=b.end for b in plan.clips[0].beats if b.mode=='narration' for i in b.evidence_ids):continue
@@ -308,6 +321,14 @@ def resume_current_long_draft(root, inputs, lines, voices, cfg, seconds, initial
             return initial
         path=root/'plan-timed.json'
         plan=Plan.model_validate(read_json(path))
+        pending=root/'pending-repair.json'
+        if pending.exists():
+            saved=read_json(pending)
+            if (saved.get('base_plan_digest')==digest(plan.model_dump())
+                    and saved.get('voice_digest')==digest(voices)
+                    and saved.get('status')=='requires_full_measurement_and_review'):
+                plan=Plan.model_validate(saved['plan'])
+                path=pending
         validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
         lookup={s.id:s for s in lines}
         if any(lookup[i].start>=b.end for b in plan.clips[0].beats if b.mode=='narration'
@@ -369,14 +390,20 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
                  if recovered is None else recovered.model_dump())
         def approve_action():
             state('自动测时、内容核对与局部修复')
-            pending=resume_current_long_draft(root,inputs,lines,voices,cfg,seconds,Plan.model_validate(draft))
+            generation=digest({'draft':draft,'narrative_policy':NARRATIVE_POLICY})
+            marker=root/'draft-generation.json'
+            pending=(resume_current_long_draft(root,inputs,lines,voices,cfg,seconds,Plan.model_validate(draft))
+                     if marker.exists() and read_json(marker).get('generation')==generation else Plan.model_validate(draft))
+            write_json(marker,{'generation':generation,'policy':NARRATIVE_POLICY})
             plan,report = complete_long_plan(video,pending,lines,voices,root,cfg,llm)
             return {'plan':plan.model_dump(),'report':report},[root/'plan-approved.json',root/'automatic-review.json',*[Path(f['path']) for f in report['frames']]]
         approved = checkpoint(root,'approval',{'inputs':inputs,'draft':draft,'voices':voices,'review_version':REVIEW_VERSION,
-            'scene_observation_policy':SCENE_OBSERVATION_POLICY,'title_policy':TITLE_POLICY,
+            'scene_observation_policy':SCENE_OBSERVATION_POLICY,'title_policy':TITLE_POLICY,'narrative_policy':NARRATIVE_POLICY,
+            'whole_script_review':'whole-script-1',
             'audience_style_policy':AUDIENCE_STYLE_POLICY},approve_action)
         plan = Plan.model_validate(approved['plan'])
         assert_approval(approved['report'],video,plan,lines,voices)
+        if formal_long(cfg):require_commentary_review(approved['report'].get('narrative_review'),plan.clips[0])
         def render_action():
             state('渲染、技术检查与包装')
             # A separate machine gate has approved the exact timed plan. Never forge development-review.json.
@@ -392,7 +419,7 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
             finished['production_id'] = digest([inputs,approved['plan']])
             return finished,[Path(finished[k]) for k in ('video','cover','poster') if finished.get(k)]
         finished = checkpoint(root,'render',{'inputs':inputs,'approved':approved,
-            'title_cover_policy':TITLE_COVER_POLICY,
+            'title_cover_policy':TITLE_COVER_POLICY,'render_version':RENDER_VERSION,
             'audience_style_policy':AUDIENCE_STYLE_POLICY},render_action)
         finished = check_delivery(finished,cfg,root,test_sample)
         if source_identity(video) != inputs['source']:

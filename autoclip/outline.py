@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from .models import Beat, Clip, Line, Plan, validate_plan
 from .editorial import WRITING_RULES, polish_clip
+from .narrative import narration_minimum, require_commentary, formal_long, DEPTH_RULES
 from .util import digest, duration, read_json, source_identity, write_json
 
 
@@ -88,7 +89,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
         permitted = {b['id']: b for b in slots}
         selected = {i for b in slots for i in b['allowed_evidence_ids']}
         evidence = [s for s in lines if s.id in selected]
-        constraints = [{**b, 'min_chars':5 if story_first else round(b['target_chars']*.45),
+        constraints = [{**b, 'min_chars':narration_minimum(b,cfg,story_first),
                         'max_chars':round(b['target_chars']*1.4)} for b in slots]
         narration_rules = (
             "先让观众弄清谁在何处、发生了什么、前一场的结果为何引出这一场。"
@@ -97,6 +98,9 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
             "target_chars只是配音画面预算，短转场可以用很少的字说完，不为了字数或总时长扩写。\n"
             if story_first else
             "以连贯口语解释利益、选择、代价和因果，每个段落推进一个论点；原声已经展示事件，旁白不能只再说一遍。\n")
+        if formal_long(cfg):
+            narration_rules=(DEPTH_RULES+'先把本章写成能连续听懂的完整讲述，再按给定段号承接。'
+                '短转场可简洁，主要冲突不能只写两句过场；字数预算必须承载实际信息与推理，不用同义句填充。\n')
         prompt = (f"作品{cfg.series}，长解说主问题：{outline['hook']}，观点：{outline['angle']}。"
             f"全片章节顺序：{[c['title'] for c in chapters]}。本次只写第{number+1}章{chapter['title']}。"
             + narration_rules +
@@ -127,7 +131,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
                     raise ValueError('写稿必须精确覆盖本章的口播编号')
                 for b in draft.items:
                     slot = permitted[b.id]
-                    if not (5 if story_first else round(slot['target_chars']*.45)) <= len(b.text) <= round(slot['target_chars']*1.4):
+                    if not (narration_minimum(slot,cfg,story_first)) <= len(b.text) <= round(slot['target_chars']*1.4):
                         raise ValueError(f'段{b.id}有{len(b.text)}字，不在要求范围内')
                     if not set(b.evidence_ids).issubset(slot['allowed_evidence_ids']):
                         raise ValueError(f'段{b.id}引用了未允许的证据')
@@ -144,7 +148,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
                         raise
                     for index, b in enumerate(draft.items):
                         slot = permitted[b.id]
-                        low, high = 5 if story_first else round(slot['target_chars']*.45), round(slot['target_chars']*1.4)
+                        low, high = narration_minimum(slot,cfg,story_first), round(slot['target_chars']*1.4)
                         if low <= len(b.text) <= high and set(b.evidence_ids).issubset(slot['allowed_evidence_ids']):
                             continue
                         local_feedback = ''
@@ -181,6 +185,7 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
                   evidence_ids=texts[b['id']].evidence_ids if b['mode']=='narration' else b['evidence_ids'],reason=b['instruction']) for b in all_slots]
     plan = Plan(episode_summary=outline['hook'], genre='剧情解读', style=cfg.style,
                 clips=[Clip(title=outline['title'],angle=outline['angle'],hook=outline['hook'],beats=beats)])
+    require_commentary(plan.clips[0],cfg)
     write_json(root/'draft-plan.json',plan.model_dump())
     validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
     if cfg.oral_edit:

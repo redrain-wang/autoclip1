@@ -5,12 +5,13 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
+from .narrative import DEPTH_RULES, formal_long, require_commentary
 from .repair import RepairNeeded
 from .budget import spoken_characters
 from .util import digest, write_json
 
-VERSION = "oral-edit-17"
-AUDIENCE_STYLE_POLICY = 'audience-narration-6'
+VERSION = "oral-edit-18"
+AUDIENCE_STYLE_POLICY = 'audience-narration-7'
 WRITING_RULES = """
 剧情优先是所有新稿始终遵循的规则，优先于风格参考中的观点或分析要求。
 先讲清谁在何处、事件起因、行动、结果以及场景之间的承接，再在必要转折解释选择、压力或代价。
@@ -34,6 +35,8 @@ WRITING_RULES = """
 对白发言者、听话者、被提及者分开；反应镜头不能证明画面中人物正在说这句话。身份无法落实时不依赖该归属立论。
 旁白承接本段画面正在发生的事，不给无关的诵读、送别或下一场养伤画面强加人物与意义。
 """
+
+WRITING_RULES += DEPTH_RULES
 
 # These signals flag prose for rewriting. They are never automatically removed.
 _CLINICAL = re.compile(r"客观定论|人格结论|控诉方的推论|证据只到|证据局限|不能顺势坐实|"
@@ -244,6 +247,7 @@ def polish_clip(clip, lines, root, cfg, llm, context=None):
             proposal = OralProposal(changes=list(combined.values()))
             proposal = repair_oral_lengths(clip,proposal,lines,folder,cfg,llm,attempt)
             candidate = apply_oral_changes(clip,proposal)
+            if formal_long(cfg):require_commentary(candidate,cfg)
             if signals := prose_signals(candidate):
                 raise ValueError('仍有审查措辞，请自然交代来源后重写：'+json.dumps(signals,ensure_ascii=False))
         except ValueError as ex:

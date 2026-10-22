@@ -12,7 +12,7 @@ from .repair import voice_fits
 from .util import digest, duration, probe, run, timestamp, write_json, source_identity
 
 console = Console()
-VERSION = "render-8"
+VERSION = "render-9"
 
 
 def synthesize(text: str, folder: Path, cfg: Settings):
@@ -74,7 +74,7 @@ def ass_time(t):
     return f"{h}:{m:02}:{s:02}.{cs:02}"
 
 
-def subtitle_chunks(text: str, limit=17):
+def subtitle_chunks(text: str, limit=14):
     parts = re.findall(r"[^，。！？；：、,.!?;:]+[，。！？；：、,.!?;:]?", text)
     result = []
     for part in parts:
@@ -121,11 +121,19 @@ def voice_captions(text: str, voice: Path, voice_seconds: float):
 
 
 def write_ass(path: Path, title: str, series: str, seconds: float, captions, portrait=True):
+    """Warm-gold headline and readable caption cards, separate from source subtitles."""
     width, height = (720,1280) if portrait else (1280,720)
-    font, title_size = (36,46) if portrait else (32,36)
-    title_y, sub_margin = (205, 350) if portrait else (45, 35)
-    title_parts = subtitle_chunks(title, 13 if portrait else 26)
-    title_text = "\\N".join(ass_escape(subtitle_display(x)) for x in title_parts[:3])
+    font, title_size = (42,48) if portrait else (38,40)
+    title_y = 208 if portrait else 36
+    caption_y = 942 if portrait else 645
+    limit=12 if portrait else 25
+    title_parts=[]
+    for phrase in subtitle_chunks(title,limit):
+        phrase=subtitle_display(phrase)
+        if title_parts and len(title_parts[-1])+len(phrase)+1<=limit:
+            title_parts[-1]+=' '+phrase
+        else:
+            title_parts.append(phrase)
     text = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
@@ -134,19 +142,35 @@ WrapStyle: 2
 ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Narration,Arial Unicode MS,{font},&H00FFFFFF,&H000000FF,&H00141414,&H80000000,-1,0,0,0,100,100,1,0,1,2,1,2,42,42,{sub_margin},1
-Style: Title,Arial Unicode MS,{title_size},&H00FFFFFF,&H000000FF,&H00121212,&H00000000,-1,0,0,0,100,100,1,0,1,2,0,8,35,35,0,1
-Style: Label,Arial Unicode MS,22,&H00B4E5FF,&H000000FF,&H00121212,&H00000000,0,0,0,0,100,100,2,0,1,1,0,8,35,35,0,1
+Style: Narration,Hiragino Sans GB,{font},&H00ECF7FB,&H000000FF,&H00151518,&H90000000,-1,0,0,0,100,100,0.5,0,1,1.6,1,5,40,40,0,1
+Style: Title,Kaiti SC,{title_size},&H00ECF7FB,&H000000FF,&H00101820,&H90000000,-1,0,0,0,100,100,2,0,1,1.2,2,8,35,35,0,1
+Style: Label,Hiragino Sans GB,24,&H007EC0E1,&H000000FF,&H00101820,&H00000000,0,0,0,0,100,100,3,0,1,0,0,8,35,35,0,1
+Style: Shape,Arial,10,&H007EC0E1,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-Dialogue: 0,0:00:00.00,{ass_time(seconds)},Title,,0,0,0,,{{\\pos({width//2},{title_y})}}{title_text}
 """
+    def event(layer,start,end,style,body):
+        return f"Dialogue: {layer},{ass_time(start)},{ass_time(end)},{style},,0,0,0,,{body}\n"
+    # Quiet geometric accents establish hierarchy without flashing or karaoke.
     if portrait:
-        text += f"Dialogue: 0,0:00:00.00,{ass_time(seconds)},Label,,0,0,0,,{{\\pos(360,1130)}}{ass_escape(series)}\n"
+        text += event(0,0,seconds,'Shape',r'{\p1\pos(0,0)}m 294 178 l 350 178 350 180 294 180 m 370 178 l 426 178 426 180 370 180 m 360 174 l 365 179 360 184 355 179')
+    for index,part in enumerate(title_parts):
+        accent=index==len(title_parts)-1
+        size=title_size+(6 if accent else 0)
+        color=r'\c&H007EC0E1&' if accent else r'\c&H00ECF7FB&'
+        text += event(1,0,seconds,'Title',f'{{\\pos({width//2},{title_y+index*(66 if portrait else 51)})\\fs{size}{color}}}'+ass_escape(subtitle_display(part)))
+    if portrait:
+        text += event(0,0,seconds,'Label',r'{\pos(360,1130)}'+ass_escape(series))
     for start,end,body,mode in captions:
-        if mode == "narration":
-            text += f"Dialogue: 1,{ass_time(start)},{ass_time(end)},Narration,,0,0,0,,{ass_escape(body)}\n"
-    path.write_text(text, encoding="utf-8")
+        if mode!='narration':continue
+        box_width=min(width-80,max(220,len(body)*(font+1)+52))
+        left=(width-box_width)/2;right=left+box_width
+        top=caption_y-36;bottom=caption_y+36
+        shape=f'm {left+12} {top} l {right-12} {top} b {right} {top} {right} {top} {right} {top+12} l {right} {bottom-12} b {right} {bottom} {right} {bottom} {right-12} {bottom} l {left+12} {bottom} b {left} {bottom} {left} {bottom} {left} {bottom-12} l {left} {top+12} b {left} {top} {left} {top} {left+12} {top}'
+        text += event(2,start,end,'Shape',r'{\p1\pos(0,0)\c&H001B1715&\alpha&H35&\fad(70,70)}'+shape)
+        text += event(3,start,end,'Shape',f'{{\\p1\\pos(0,0)\\c&H007EC0E1&\\fad(70,70)}}m {left} {top+20} l {left+3} {top+20} {left+3} {bottom-20} {left} {bottom-20}')
+        text += event(4,start,end,'Narration',f'{{\\pos({width//2},{caption_y})\\fad(70,70)}}'+ass_escape(body))
+    path.write_text(text,encoding='utf-8')
 
 
 def fit_narration(beat, root, cfg, llm, lines):

@@ -182,3 +182,24 @@ def test_current_long_draft_resume_requires_same_inputs_and_reaudits(tmp_path,mo
     assert resumed.model_dump()==(saved if change is None else initial.model_dump())
     assert not (root/'plan-approved.json').exists()
     if change is None:assert read_json(root/'current-draft-resume.json')['status']=='requires_full_measurement_and_review'
+
+
+@pytest.mark.parametrize('mismatch',[None,'base_plan_digest','voice_digest'])
+def test_pending_repair_survives_service_stop_but_never_bypasses_review(tmp_path,monkeypatch,mismatch):
+    from autoclip.models import Plan
+    video,library,bank,cfg,base,lines,voices,old,report,calls=failed_run(tmp_path,monkeypatch)
+    cfg=cfg.model_copy(update={'opening':'narration','min_seconds':1,'max_seconds':90,'target_seconds':45})
+    inputs={'source':source_identity(video),'lines':[s.model_dump() for s in lines],'cfg':cfg.model_dump(mode='json')}
+    root=base/'runs'/digest(inputs)
+    timed=Plan.model_validate(read_json(old/'plan-timed.json'))
+    for b in timed.clips[0].beats[2:]:b.mode='original';b.text=''
+    patched=timed.model_copy(deep=True);patched.clips[0].beats[1].text='服务中断前已修好的当前段落。'
+    pending={'base_plan_digest':digest(timed.model_dump()),'voice_digest':digest(voices),
+        'plan':patched.model_dump(),'status':'requires_full_measurement_and_review'}
+    if mismatch:pending[mismatch]='stale'
+    for name,value in [('source.json',inputs['source']),('transcript.json',inputs['lines']),
+        ('settings.json',inputs['cfg']),('voice-evidence.json',voices),('plan-timed.json',timed.model_dump()),
+        ('pending-repair.json',pending)]:write_json(root/name,value)
+    resumed=series.resume_current_long_draft(root,inputs,lines,voices,cfg,100,timed)
+    assert resumed==(patched if mismatch is None else timed)
+    assert not (root/'plan-approved.json').exists() and not (root/'automatic-review.json').exists()
