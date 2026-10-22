@@ -246,7 +246,12 @@ def assess_batch(raw, units, lines, frame_count, voice_rows):
     issues = [{'id':u.id,'message':u.reason} for u in parsed.units if u.verdict != 'supported']
     for issue in parsed.issues:
         if issue.id not in expected:
-            raise ValueError('自动审核问题指向了本批次以外的单位')
+            # Some reviewers add a finding suffix (beat-4-identity). Retain the
+            # rejection under its unambiguous parent; never discard the issue.
+            parents=[uid for uid in expected if issue.id.startswith(uid+'-')]
+            if len(parents)!=1:
+                raise ValueError('自动审核问题指向了本批次以外的单位')
+            issue.id=parents[0]
         issues.append(issue.model_dump())
     for issue in required_note_repairs(parsed.notes,units):
         if issue['id'] not in expected:raise ValueError('审核备注要求修订本批次以外的单位')
@@ -721,7 +726,11 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
     images=[contact_sheet(video,root/'selected',times,'selected')]
     caption_lines=caption_lines_for_issues(prior_claims,selected,beat.evidence_ids)
     if caption_lines:images.append(subtitle_evidence_sheet(video,root/'captions',caption_lines,'captions'))
-    prompt=('独立核验units中当前这一段口播的事实、人物归属和画面，不改稿。'
+    schema=UnitReviews.model_json_schema()
+    for name in ('UnitDecision','UnitIssue'):
+        schema['$defs'][name]['properties']['id']={'type':'string','const':uid}
+    prompt=(f'只核验当前单位{uid}，units、issues、notes内的id只能原样写{uid}，不得添加子项编号。'
+        '独立核验units中当前这一段口播的事实、人物归属和画面，不改稿。'
         '只核对实际text中的断言，不猜测旧稿写过什么；逐句核对，不能用其中一句有据替整段放行。'
         '第一张图是当前实际剪入区间的首中尾画面，frame_ids只能是0、1、2；其后是引用对白字幕图。'
         '过去对白可以支持自然回顾，但不能将此前出现的动作、道具或人物说成正在当前画面发生。'
@@ -729,7 +738,7 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
         '声音加语境须列出实际候选姓名，不能自行添加别名。无法核实就unknown，具体问题写issues。'
         'ASR不是原片字幕的正确答案，不要求正确转述迎合机器错字。仅换同义词、保留无据动作仍须拒绝。'
         '每个结论都必须引用提供的对白和主图编号。只返回units、issues及可选notes，不返回passed。'
-        '\n格式'+json.dumps(UnitReviews.model_json_schema(),ensure_ascii=False)
+        '\n格式'+json.dumps(schema,ensure_ascii=False)
         +'\nunits='+json.dumps([unit],ensure_ascii=False)+'\ntimes='+json.dumps(times)
         +'\n字幕='+json.dumps(review_transcript_rows(selected),ensure_ascii=False)
         +'\n声音候选='+json.dumps(evidence,ensure_ascii=False)

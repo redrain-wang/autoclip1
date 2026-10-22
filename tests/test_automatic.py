@@ -1036,3 +1036,12 @@ def test_named_narration_cannot_hide_identity_by_omitting_subjects():
     assert any('正文明确出现：角色甲' in issue['message'] for issue in assess_batch(raw,units,lines,count,voices))
     units[0]['text']='有人提到了送火的事情。'
     assert assess_batch(raw,units,lines,count,voices)==[]
+
+
+def test_scoped_finding_suffix_keeps_rejection_without_accepting_other_beats():
+    raw,units,lines,count,voices=review_fixture()
+    raw['issues']=[{'id':'beat-1-identity','message':'人物归属有误'}]
+    issues=assess_batch(raw,units,lines,count,voices)
+    assert issues==[{'id':'beat-1','message':'人物归属有误'}]
+    raw['issues'][0]['id']='beat-10-identity'
+    with pytest.raises(ValueError,match='本批次以外'):assess_batch(raw,units,lines,count,voices)
