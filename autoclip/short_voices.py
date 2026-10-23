@@ -133,6 +133,8 @@ def prepare_voice_followup(video, lines, voices, root, cfg, library, story_roots
                 or report.get('plan_digest')!=digest(plan.model_dump()) or report.get('voice_digest')!=digest(voices)):
             continue
         for issue in report.get('issues',[]):
+            if issue['message'].startswith('被提及人物须在'):
+                continue  # A reference/citation annotation cannot be fixed by enrolling a voice.
             match = re.fullmatch(r'beat-(\d+)',issue['id'])
             if not match or not re.search(r'声音|身份|人物|主语|说话人',issue['message']):continue
             index=int(match[1])
@@ -180,6 +182,12 @@ def pending_voice_followup(video, lines, voices, root, cfg, library):
     pointer=root/'voice-followup.json'
     if not pointer.exists():return None
     task=read_json(pointer)
+    if task.get('status')=='waiting_voice_confirmation' and task.get('review_root'):
+        manifest_path=Path(task['review_root'])/'manifest.json'
+        requests=read_json(manifest_path).get('automatic_gap_requests',[]) if manifest_path.is_file() else []
+        if requests and all(r.get('reason','').startswith('被提及人物须在') for r in requests):
+            write_json(pointer,{**task,'status':'superseded','reason':'仅被提及者的引用校验问题，先继续自动核验，不要求新增声纹'})
+            return None
     if (task.get('status')=='waiting_voice_confirmation' and task.get('source')==source_identity(video)
             and task.get('library')==str(library.resolve()) and task.get('library_digest')==digest(read_json(library))
             and task.get('voice_digest')==digest(voices)

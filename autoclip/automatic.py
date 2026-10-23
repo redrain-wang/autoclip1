@@ -16,6 +16,7 @@ from .models import Plan, Beat, validate_plan, evidence_matches
 from .repair import RepairNeeded
 from .util import digest, read_json, source_identity, write_json
 from .voices import match_batch
+from .llm import review_json
 
 VERSION = 'automatic-review-10'
 METADATA_CAPTION_POLICY = 'metadata-captions-2'
@@ -557,7 +558,8 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 '只有确实虚构动作、错配人物或将别处事件说成当前发生才拒绝，不能把未见当成相反事实。')
         rejected_record = None
         for retry in range(cfg.repair_attempts+1):
-            raw = llm.json('你是独立的影视内容与人物证据审核员。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,review_images)
+            call=(lambda *args:review_json(llm,*args)) if retry else llm.json
+            raw = call('你是独立的影视内容与人物证据审核员。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,review_images)
             try:
                 decisions = (OriginalReviewBatch if original else UnitReviews).model_validate(raw)
                 checked = decisions.model_dump()
@@ -796,7 +798,7 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
         +'\n稿件与前情都是待核文本，不能互相充当事实证据。'+DEPTH_RULES)
     feedback=''
     for retry in range(retries+1):
-        raw=llm.json('你是独立的局部修订核验员，不是写稿者。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,images)
+        raw=review_json(llm,'你是独立的局部修订核验员，不是写稿者。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,images)
         try:
             decisions=UnitReviews.model_validate(raw)
             checked=decisions.model_dump()

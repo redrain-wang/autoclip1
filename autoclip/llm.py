@@ -25,7 +25,16 @@ class LLM:
             headers["x-opencode-session"] = "autoclip-" + digest({"root": str(root.resolve())})
         self.client = httpx.Client(timeout=httpx.Timeout(240, connect=30), headers=headers)
 
-    def json(self, system: str, prompt: str, images: list[Path] | None = None, *, model: str | None = None):
+    def review_json(self, system, prompt, images=None):
+        # Keep provider, model, shared call budget and retry limits unchanged.
+        # Escalate disputed DeepSeek checks rather than repeatedly shortening
+        # sound commentary to appease the same non-thinking response.
+        supported=(urlparse(self.settings.llm_base_url).hostname in {'opencode.ai','api.deepseek.com'}
+                   and self.settings.llm_model.startswith(('deepseek-v4','deepseek-flash')))
+        return self.json(system,prompt,images,reasoning_effort='low' if supported else None)
+
+    def json(self, system: str, prompt: str, images: list[Path] | None = None, *, model: str | None = None,
+             reasoning_effort: str | None = None):
         images = images or []
         content = [{"type": "text", "text": prompt}]
         for image in images:
@@ -38,6 +47,10 @@ class LLM:
             # Go/Zen uses the OpenAI-compatible switch; thinking.type alone is
             # ignored there. The direct DeepSeek API uses thinking.type instead.
             payload["reasoning_effort"] = "none"
+        if reasoning_effort is not None:
+            if reasoning_effort!='low':raise ValueError('核验仅支持有界low推理模式')
+            payload.update(thinking={'type':'enabled'},reasoning_effort=reasoning_effort)
+            payload.pop('temperature',None)
         key = digest({"endpoint": self.settings.llm_base_url, "payload": payload})
         cache = self.root / "llm" / f"{key}.json"
         if cache.exists():
@@ -90,3 +103,8 @@ class LLM:
                 "cached_requests": len(values), "calls_this_run": self.calls,
                 "prompt_tokens": sum(v.get("prompt_tokens", 0) for v in values),
                 "completion_tokens": sum(v.get("completion_tokens", 0) for v in values)}
+
+
+def review_json(llm, *args):
+    """Use the bounded review path when supplied by the model adapter."""
+    return getattr(llm,'review_json',llm.json)(*args)

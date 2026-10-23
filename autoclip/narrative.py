@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from .budget import spoken_characters
 from .util import digest, write_json
+from .llm import review_json
 
 NARRATIVE_POLICY = 'connected-commentary-1'
 DEPTH_RULES = (
@@ -109,7 +110,7 @@ def review_commentary(clip, lines, cfg, llm, root):
     folder=root/'narrative-review'/digest({'policy':NARRATIVE_POLICY,'clip':clip.model_dump(),'rows':rows})
     feedback=''
     for attempt in range(cfg.repair_attempts+1):
-        raw=llm.json('你是影视深度解说的整稿编辑，检查连贯性与分析质量。',prompt+feedback)
+        raw=review_json(llm,'你是影视深度解说的整稿编辑，检查连贯性与分析质量。',prompt+feedback)
         write_json(folder/f'attempt-{attempt}.json',raw)
         try:
             result=NarrativeReview.model_validate(raw)

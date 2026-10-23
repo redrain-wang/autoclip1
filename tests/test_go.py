@@ -93,6 +93,30 @@ def test_reasoning_switch_is_scoped_to_go_deepseek(tmp_path,monkeypatch,endpoint
     finally:m.client.close()
 
 
+def test_disputed_review_uses_same_model_and_budget_with_distinct_reasoning_cache(tmp_path,monkeypatch):
+    monkeypatch.setenv('OPENCODE_API_KEY','go-test-key')
+    client=httpx.Client;requests=[]
+    def respond(request):
+        body=json.loads(request.content);requests.append((str(request.url),body))
+        return httpx.Response(200,json={'choices':[{'finish_reason':'stop','message':
+            {'content':'{"ok":true}','reasoning_content':'internal reasoning must not be stored'}}]})
+    monkeypatch.setattr('autoclip.llm.httpx.Client',lambda **kwargs:client(transport=httpx.MockTransport(respond),**kwargs))
+    m=LLM(go().model_copy(update={'max_api_calls':2}),tmp_path)
+    try:
+        m.json('reviewer','same source')
+        m.review_json('reviewer','same source')
+        m.review_json('reviewer','same source')
+        assert len(requests)==m.calls==2
+        assert requests[0][1]['reasoning_effort']=='none'
+        assert requests[1][1]['reasoning_effort']=='low'
+        assert requests[1][1]['thinking']=={'type':'enabled'} and 'temperature' not in requests[1][1]
+        assert requests[0][0]==requests[1][0] and requests[0][1]['model']==requests[1][1]['model']
+        with pytest.raises(RuntimeError,match='次数上限'):m.review_json('reviewer','new source')
+        caches=list((tmp_path/'llm').glob('*.json'))
+        assert len(caches)==2 and all('internal reasoning' not in p.read_text() for p in caches)
+    finally:m.client.close()
+
+
 @pytest.mark.parametrize('always_truncated', [False, True])
 def test_truncated_response_uses_bounded_larger_budget_without_caching_partial_json(tmp_path, monkeypatch, always_truncated):
     monkeypatch.setenv('OPENCODE_API_KEY', 'go-test-key')
