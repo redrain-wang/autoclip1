@@ -11,7 +11,7 @@ from .identity import units_for_clip, file_hash
 from .editorial import audience_script, prose_signals, require_oral_style, WRITING_RULES
 from .ingest import contact_sheet, subtitle_evidence_sheet
 from .titles import TITLE_POLICY, TITLE_RULES, title_repair_prompt, title_changes, title_issues
-from .narrative import DEPTH_RULES, formal_long
+from .narrative import DEPTH_RULES, formal_long, require_paragraph_preserved
 from .models import Plan, Beat, validate_plan, evidence_matches
 from .repair import RepairNeeded
 from .util import digest, read_json, source_identity, write_json
@@ -517,7 +517,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 '只有确实虚构动作、错配人物或将别处事件说成当前发生才拒绝，不能把未见当成相反事实。')
         rejected_record = None
         for retry in range(cfg.repair_attempts+1):
-            raw = llm.json('你是独立的影视内容与人物证据审核员，不读取人工答案。',prompt+feedback,review_images)
+            raw = llm.json('你是独立的影视内容与人物证据审核员。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,review_images)
             try:
                 decisions = (OriginalReviewBatch if original else UnitReviews).model_validate(raw)
                 checked = decisions.model_dump()
@@ -720,7 +720,8 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
     unit={'id':uid,'text':beat.text,'start':beat.start,'end':beat.end,
           'evidence_ids':beat.evidence_ids,
           'shown_evidence':[s.id for s in lines if s.id in shown and s.start<beat.end]}
-    selected=[s for s in lines if s.id in beat.evidence_ids or beat.start-8<=s.start<beat.end+8]
+    selected=[s for s in lines if s.id in beat.evidence_ids or s.id in unit['shown_evidence']
+              or beat.start-8<=s.start<beat.end+8]
     evidence=review_voice_rows([r for r in voices.get('lines',[]) if r['line_id'] in {s.id for s in selected}])
     times=[round(t,3) for t in (beat.start+.1,(beat.start+beat.end)/2,beat.end-.1)]
     images=[contact_sheet(video,root/'selected',times,'selected')]
@@ -736,6 +737,7 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
         '过去对白可以支持自然回顾，但不能将此前出现的动作、道具或人物说成正在当前画面发生。'
         '字幕中的称呼可能指听者，不能自动当作说话人。明确称呼与回应须引用至少两条不同对白；'
         '声音加语境须列出实际候选姓名，不能自行添加别名。无法核实就unknown，具体问题写issues。'
+        '声音记录status=human_confirmed表示该source及start/end区间的说话人已人工确认，不能将它误读成未确认机器候选；只对该区间有效，不能延伸到邻近发言。'
         'ASR不是原片字幕的正确答案，不要求正确转述迎合机器错字。仅换同义词、保留无据动作仍须拒绝。'
         '每个结论都必须引用提供的对白和主图编号。只返回units、issues及可选notes，不返回passed。'
         '\n格式'+json.dumps(schema,ensure_ascii=False)
@@ -747,7 +749,7 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
         +'\n稿件与前情都是待核文本，不能互相充当事实证据。'+DEPTH_RULES)
     feedback=''
     for retry in range(retries+1):
-        raw=llm.json('你是独立的局部修订核验员，不是写稿者，不读取人工答案。',prompt+feedback,images)
+        raw=llm.json('你是独立的局部修订核验员，不是写稿者。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,images)
         try:
             decisions=UnitReviews.model_validate(raw)
             checked=decisions.model_dump()
@@ -896,6 +898,8 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                 candidate = apply_plan_changes(revised,raw,{uid})
                 if uid.startswith('beat-'):
                     index=int(uid.split('-')[1])
+                    if max_characters is None:
+                        require_paragraph_preserved(target['text'],candidate.clips[0].beats[index].text,cfg)
                     if signals:=[s for s in prose_signals(candidate.clips[0]) if s['beat']==index]:
                         raise ValueError('当前旁白仍混入制作或审查话术，不能进入配音：'+json.dumps(signals,ensure_ascii=False))
                 if max_characters is not None and spoken_characters(candidate.clips[0].beats[int(uid.split('-')[1])].text)>max_characters:

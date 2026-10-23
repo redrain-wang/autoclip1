@@ -152,6 +152,23 @@ def test_invalid_empty_repair_is_retried_transactionally(tmp_path):
     for i in (0,2,3):assert revised.clips[0].beats[i]==plan.clips[0].beats[i]
 
 
+def test_factual_repair_retries_when_it_reduces_a_developed_paragraph_to_a_bridge(tmp_path):
+    plan=sample_plan()
+    plan.clips[0].beats[1].text='他先前答应的条件限制了现在的选择。'*8
+    before=plan.model_dump()
+    cfg=Settings(duration_profile='long',target_seconds=1200,min_seconds=1080,max_seconds=1320)
+    prompts=[]
+    class Model:
+        def json(self,system,prompt):
+            prompts.append(prompt)
+            text='他又拒绝了。' if len(prompts)==1 else '对方把条件重新摆出，这次拒绝也就意味着先前的约定无法落实。'*4
+            return {'changes':[{'id':'beat-1','text':text}]}
+    revised=repair_plan(plan,[{'id':'beat-1','message':'修正行动归属'}],[],{},tmp_path,cfg,Model(),0)
+    assert len(prompts)==2 and '主要解说段缩成了短过场' in prompts[1]
+    assert revised.clips[0].beats[1].text!='他又拒绝了。'
+    assert plan.model_dump()==before
+
+
 def test_single_unit_repairs_preserve_successful_edits_and_exclude_future_evidence(tmp_path):
     import json
     plan=sample_plan();before=plan.model_dump();targets=[];prompts=[]
@@ -890,6 +907,28 @@ def test_review_rechecks_rejection_that_itself_says_supported():
     units=[{'id':'beat-0','text':'有人请客人进屋。'}]
     assert review_recheck_reason([{'id':'beat-0','message':'旁白基本有据，判 supported 更妥。'}],units)
     assert not review_recheck_reason([{'id':'beat-0','message':'当前画面没有提灯者，旁白动作无据。'}],units)
+
+
+def test_patch_verifier_receives_actual_past_evidence_without_future_leakage(tmp_path,monkeypatch):
+    import json
+    import autoclip.automatic as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'frame')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    plan=sample_plan()
+    plan.clips[0].beats[1].start=100;plan.clips[0].beats[1].end=110
+    lines=[Line(id=0,start=1,end=3,text='先前已经明确的承诺'),
+           Line(id=1,start=101,end=104,text='当前回应'),
+           Line(id=2,start=200,end=204,text='未来结果')]
+    class Model:
+        def json(self,system,prompt,images):
+            evidence=json.JSONDecoder().raw_decode(prompt.split('\n字幕=',1)[1])[0]
+            assert {s['id'] for s in evidence}=={0,1}
+            assert '不能将它误读成未确认机器候选' in prompt
+            return {'issues':[],'units':[{'id':'beat-1','verdict':'supported','reason':'承接此前承诺',
+                'evidence_ids':[0,1],'frame_ids':[0],'identity_basis':'no_identity_claim','subjects':[]}]}
+    module.verify_narration_patch(video,plan,'beat-1',[],lines,{'lines':[]},tmp_path,Model())
 
 
 def test_review_context_keeps_complete_past_and_two_following_cuts():

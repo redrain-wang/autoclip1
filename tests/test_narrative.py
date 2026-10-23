@@ -106,3 +106,10 @@ def test_short_transitions_do_not_trigger_formal_long_quantity_rule(tmp_path):
     from autoclip.narrative import review_commentary
     clip=Clip(title='短片',angle='',hook='',beats=[Beat(mode='narration',start=i*10,end=(i+1)*10,text='他拒绝了。',evidence_ids=[i],reason='') for i in range(4)])
     assert review_commentary(clip,[],Settings(),None,tmp_path) is None
+
+
+def test_paragraph_guard_does_not_force_short_transitions_or_short_films_to_expand():
+    from autoclip.narrative import require_paragraph_preserved
+    cfg=Settings(duration_profile='long',target_seconds=1200,min_seconds=1080,max_seconds=1320)
+    require_paragraph_preserved('与此同时，另一边的人还在等消息。','另一边还在等待。',cfg)
+    require_paragraph_preserved('已经展开的有据分析'*12,'简洁短片。',Settings())
