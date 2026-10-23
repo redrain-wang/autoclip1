@@ -32,6 +32,23 @@ def test_protocol_failure_retires_legacy_stale_voice_task(tmp_path,monkeypatch):
     assert len(calls)==1 and read_json(library)==bank
 
 
+@pytest.mark.parametrize('error,checkpoint_only',[
+    ('已达到本次 API 调用次数上限；可续跑',False),
+    ('已达到本次 API 调用次数上限；可续跑',True),
+    ('模型调用失败，已重试：Connection refused',False)])
+def test_service_interruption_resumes_review_instead_of_requesting_human_voice_confirmation(tmp_path,monkeypatch,error,checkpoint_only):
+    video,library,bank,cfg,base,lines,voices,root,report,calls=failed_run(tmp_path,monkeypatch)
+    assert series.failed_episode_voice_followup(video,base,lines,voices,cfg,library)
+    status={'status':'waiting_voice_confirmation','run':str(root)}
+    if checkpoint_only:write_json(root/'stages/approval.json',{'status':'failed','error':error})
+    else:status['error']=error
+    write_json(base/'status.json',status)
+    assert series.failed_episode_voice_followup(video,base,lines,voices,cfg,library) is None
+    assert read_json(base/'voice-followup.json')['status']=='superseded'
+    assert len(calls)==1 and read_json(library)==bank
+    assert not (root/'plan-approved.json').exists()
+
+
 @pytest.mark.parametrize('state,matching',[('running',True),('completed',False),('completed',True)])
 def test_followup_requires_latest_review_to_finish(tmp_path,monkeypatch,state,matching):
     video,library,bank,cfg,base,lines,voices,root,report,calls=failed_run(tmp_path,monkeypatch)

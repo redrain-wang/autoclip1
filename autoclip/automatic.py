@@ -68,6 +68,14 @@ def link_voice_evidence(video, lines, library, manifest):
             'policy':'声音相似仅为候选；不得单独认定角色或把说话人当成行为者。机器结论不回写人工库。'}
 
 
+class SubjectIdentity(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    subject: str = Field(min_length=2)
+    basis: Literal['voice_and_context','explicit_address_response','explicit_reference']
+    evidence_ids: list[int] = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
 class UnitDecision(BaseModel):
     model_config = ConfigDict(extra='forbid')
     id: str
@@ -75,9 +83,10 @@ class UnitDecision(BaseModel):
     reason: str = Field(min_length=1)
     evidence_ids: list[int] = Field(min_length=1)
     frame_ids: list[int] = Field(min_length=1)
-    identity_basis: Literal['no_identity_claim','voice_and_context','explicit_address_response','explicit_reference','insufficient'] = Field(
-        description='explicit_reference仅用于转述中明确被提及的人，不能指认谁在说话、行动或画面人物；实际发言者或行为者须用声纹加语境或明确称呼回应核实。')
+    identity_basis: Literal['no_identity_claim','voice_and_context','explicit_address_response','explicit_reference','mixed','insufficient'] = Field(
+        description='explicit_reference仅用于被提及者，不能指认发言者或行为者。不同人物使用不同依据时必须用mixed，在subject_evidence逐人列明依据和引用。')
     subjects: list[str] = Field(default_factory=list)
+    subject_evidence: list[SubjectIdentity] = Field(default_factory=list)
 
 
 class UnitIssue(BaseModel):
@@ -264,6 +273,14 @@ def assess_batch(raw, units, lines, frame_count, voice_rows):
         if issue['id'] not in expected:raise ValueError('审核备注要求修订本批次以外的单位')
         issues.append(issue)
     for unit in parsed.units:
+        if unit.subject_evidence:
+            # Per-person evidence is the more precise representation. Normalize
+            # its redundant summary label/list, then validate every citation
+            # below (including unknown IDs and future evidence). No verdict or
+            # rejection is changed by this normalization.
+            unit.identity_basis='mixed'
+            unit.evidence_ids=sorted(set(unit.evidence_ids).union(
+                i for proof in unit.subject_evidence for i in proof.evidence_ids))
         if not set(unit.evidence_ids).issubset(lookup):
             raise ValueError(f'{unit.id} 引用了未提供的字幕编号：{sorted(set(unit.evidence_ids)-set(lookup))}')
         if any(i<0 or i>=frame_count for i in unit.frame_ids):
@@ -287,25 +304,30 @@ def assess_batch(raw, units, lines, frame_count, voice_rows):
             if named:
                 issues.append({'id':unit.id,'message':'列出了人物归属却声明没有身份主张，正文明确出现：'
                     +'、'.join(sorted(named))+'；须核实实际称呼、说话人及被提及者，不能省略subjects绕过人物审核'})
-        if unit.identity_basis == 'explicit_address_response' and len(set(unit.evidence_ids))<2:
-            issues.append({'id':unit.id,'message':'明确称呼与回应需至少两条不同证据'})
-        if unit.identity_basis == 'explicit_reference':
-            # Referencing someone in a quoted report does not identify the
-            # speaker. Keep this distinct from assigning an on-screen action.
-            cited_text=' '.join(lookup[i].text for i in unit.evidence_ids)
-            missing=[name for name in unit.subjects if len(name)<2 or name not in cited_text or name not in target['text']]
-            if not unit.subjects or missing:
-                issues.append({'id':unit.id,'message':'被提及人物须在所引对白及当前稿中明确出现，不能靠未引用的声音候选补出身份；'
-                    '本次未满足的subjects='+json.dumps(missing or unit.subjects,ensure_ascii=False)
-                    +'。如人物需通过称呼、回应或声音认定，须重核实际依据，不能将认人标成仅被提及。'})
-        if unit.identity_basis == 'voice_and_context':
-            associated = [voices.get(i, {}) for i in unit.evidence_ids]
-            candidate_names = {name for r in associated for s in r.get('samples',[])
-                               for name in reference_names(s.get('name'))}
-            if not any(r.get('status') == 'candidate' for r in associated) or any(r.get('status') == 'conflict' for r in associated):
-                issues.append({'id':unit.id,'message':'声音候选缺失或冲突，须用明确称呼与回应核实或删除不确定归属'})
-            if not unit.subjects or not set(unit.subjects).issubset(candidate_names):
-                issues.append({'id':unit.id,'message':'声音依据未支持本条主张中的人物，不能借其他人的候选放行'})
+        proofs=[(unit.identity_basis,unit.subjects,unit.evidence_ids)]
+        if unit.identity_basis=='mixed':
+            named=[p.subject for p in unit.subject_evidence]
+            if not unit.subjects or len(named)!=len(set(named)) or set(named)!=set(unit.subjects):
+                raise ValueError('混合身份依据必须逐人完整覆盖subjects且不得重复')
+            proofs=[(p.basis,[p.subject],p.evidence_ids) for p in unit.subject_evidence]
+        for basis,subjects,cited_ids in proofs:
+            if basis == 'explicit_address_response' and len(set(cited_ids))<2:
+                issues.append({'id':unit.id,'message':'明确称呼与回应需至少两条不同证据'})
+            if basis == 'explicit_reference':
+                cited_text=' '.join(lookup[i].text for i in cited_ids)
+                missing=[name for name in subjects if len(name)<2 or name not in cited_text or name not in target['text']]
+                if not subjects or missing:
+                    issues.append({'id':unit.id,'message':'被提及人物须在所引对白及当前稿中明确出现，不能靠未引用的声音候选补出身份；'
+                        '本次未满足的subjects='+json.dumps(missing or subjects,ensure_ascii=False)
+                        +'。如人物需通过称呼、回应或声音认定，须重核实际依据，不能将认人标成仅被提及。'})
+            if basis == 'voice_and_context':
+                associated = [voices.get(i, {}) for i in cited_ids]
+                candidate_names = {name for r in associated for s in r.get('samples',[])
+                                   for name in reference_names(s.get('name'))}
+                if not any(r.get('status') == 'candidate' for r in associated) or any(r.get('status') == 'conflict' for r in associated):
+                    issues.append({'id':unit.id,'message':'声音候选缺失或冲突，须用明确称呼与回应核实或删除不确定归属'})
+                if not subjects or not set(subjects).issubset(candidate_names):
+                    issues.append({'id':unit.id,'message':'声音依据未支持本条主张中的人物，不能借其他人的候选放行'})
     if not parsed.passed and not issues:
         raise ValueError('自动审核声称未通过但未指出任何具体单位问题')
     return issues
@@ -444,6 +466,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                   '声纹有冲突时只能以明确叫名与连续问答核实，否则unknown；不能凭剧名记忆认人。'
                   '身份依据分为无身份主张、声纹加语境、明确称呼回应、依据不足。泛称仍可能有身份主张。'
                   'subjects列出涉及身份归属的实际人物名；声纹加语境必须列出与当前候选一致的名字。'
+                  '同段不同人物可有不同依据：此时identity_basis=mixed，并在subject_evidence按subjects逐人列subject、basis、evidence_ids、reason。每人的引用只能来自本单位evidence_ids，不能把甲的声音借给乙；例如甲由确认声音核实，乙由明确称呼及回应核实，不必强迫乙也有声音候选。'
                   '区分说话人、被称呼者和被提及者。“四爷和十三爷被叫住”没有指认喊话人，不能因喊话人声纹未知否定被称呼者。用清楚称呼/回应核实相应角色，不能混淆主客体。'
                   '若只转述对白提到的人，例如“有人认为八爷有五成胜算”，没有把八爷当作这句发言者或给画面人物冠名，可用explicit_reference；subjects列被提及者，必须在引用的原对白中明确出现。不能用此依据认定谁在说话或行动，相关观点仍须注明归属，不能把传言当成事实。'
                   '没有姓名、关系或特定人物暗示的中性叙述（例如当前确实有人说“记住”），若字幕及画面支持，可用no_identity_claim；不要求查出这位说话人的姓名。仍禁止用泛称掩盖错误的特定人物行为。'
@@ -759,6 +782,7 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
         '过去对白可以支持自然回顾，但不能将此前出现的动作、道具或人物说成正在当前画面发生。'
         '字幕中的称呼可能指听者，不能自动当作说话人。明确称呼与回应须引用至少两条不同对白；'
         '声音加语境须列出实际候选姓名，不能自行添加别名。无法核实就unknown，具体问题写issues。'
+        '同段不同人物依据不同时用mixed，并在subject_evidence逐人列subject、basis、evidence_ids、reason；每人的证据均须在本单位总引用中。不能强迫所有人物共用声纹依据，也不能借用另一人的声纹。'
         '只转述对白中明确提及的人、未认定说话人或画面人物时，可用explicit_reference，subjects列原对白明确出现的被提及者；不能凭此指认动作或发言者，也不能把转述的观点当成既成事实。'
         '声音记录status=human_confirmed表示该source及start/end区间的说话人已人工确认，不能将它误读成未确认机器候选；只对该区间有效，不能延伸到邻近发言。'
         'ASR不是原片字幕的正确答案，不要求正确转述迎合机器错字。仅换同义词、保留无据动作仍须拒绝。'

@@ -67,6 +67,33 @@ def test_reported_name_does_not_require_identifying_the_unknown_speaker(invalid)
     assert bool(issues) is invalid
 
 
+@pytest.mark.parametrize('case',['valid','borrowed_voice','missing_person','outside_scope','one_sided_address','summary_label','missing_summary_id','future_id'])
+def test_each_person_can_use_distinct_identity_evidence_without_borrowing_anothers_voice(case):
+    raw,units,lines,count,voices=review_fixture()
+    units[0]['text']='甲先生安排乙先生办事。'
+    lines=[Line(id=1,start=1,end=2,text='我来安排'),Line(id=2,start=3,end=4,text='乙先生请说'),
+           Line(id=3,start=5,end=6,text='我来办')]
+    voices=[{'line_id':1,'status':'candidate','samples':[{'name':'甲先生','status':'human_confirmed'}]}]
+    unit=raw['units'][0]
+    unit.update(identity_basis='mixed',subjects=['甲先生','乙先生'],evidence_ids=[1,2,3],subject_evidence=[
+        {'subject':'甲先生','basis':'voice_and_context','evidence_ids':[1],'reason':'该发言区间有确认声音'},
+        {'subject':'乙先生','basis':'explicit_address_response','evidence_ids':[2,3],'reason':'明确叫名后连续回应'}])
+    if case=='borrowed_voice':unit['subject_evidence'][1].update(basis='voice_and_context',evidence_ids=[1])
+    if case=='missing_person':unit['subject_evidence'].pop()
+    if case=='outside_scope':unit['subject_evidence'][1]['evidence_ids']=[2,99]
+    if case=='one_sided_address':unit['subject_evidence'][1]['evidence_ids']=[2]
+    if case=='summary_label':unit['identity_basis']='voice_and_context'
+    if case=='missing_summary_id':unit['evidence_ids']=[1]
+    if case=='future_id':
+        unit['evidence_ids']=[1]
+        lines[2].start=11;lines[2].end=12
+    if case in {'missing_person','outside_scope','future_id'}:
+        with pytest.raises(ValueError):assess_batch(raw,units,lines,count,voices)
+    else:
+        issues=assess_batch(raw,units,lines,count,voices)
+        assert bool(issues) is (case in {'borrowed_voice','one_sided_address'})
+
+
 @pytest.mark.parametrize('bad',['missing','duplicate','unknown_id','unknown_frame','string_passed'])
 def test_malformed_automatic_review_never_passes(bad):
     args = review_fixture(); raw = args[0]

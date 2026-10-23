@@ -451,14 +451,22 @@ def failed_episode_voice_followup(video, base, lines, voices, cfg, library, mode
     """Resume only a current, source-bound failed review into human enrollment."""
     from .short_voices import pending_voice_followup, prepare_voice_followup
     status=read_json(base/'status.json') if (base/'status.json').exists() else {}
-    if str(status.get('error','')).startswith('自动审核批次') and '格式或引用校验失败' in status['error']:
+    error=str(status.get('error',''))
+    # A legacy waiting status may have dropped the actual service error.
+    # Read only this episode's bound approval checkpoint, never another path.
+    previous=Path(status['run']).resolve() if status.get('run') else None
+    if previous and previous.parent==(base/'runs').resolve() and (previous/'stages/approval.json').is_file():
+        approval=read_json(previous/'stages/approval.json')
+        if approval.get('status')=='failed' and not error:error=str(approval.get('error',''))
+    interrupted=error.startswith(('已达到本次 API 调用次数上限','模型调用失败','模型接口 HTTP','配音服务失败'))
+    if interrupted or (error.startswith('自动审核批次') and '格式或引用校验失败' in error):
         # Older versions could create a voice task from a stale report after a
         # protocol failure. Such a task has no completed current identity audit.
         pointer=base/'voice-followup.json'
         if pointer.exists():
             task=read_json(pointer)
             if task.get('status')=='waiting_voice_confirmation':
-                write_json(pointer,{**task,'status':'superseded','reason':'审核响应校验失败，先继续自动核对'})
+                write_json(pointer,{**task,'status':'superseded','reason':'服务中断或审核响应校验失败，先继续自动核对'})
         return None
     pending=pending_voice_followup(video,lines,voices,base,cfg,library)
     if pending:return pending
