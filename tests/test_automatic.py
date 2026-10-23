@@ -123,6 +123,24 @@ def test_valid_review_is_accepted():
     assert assess_batch(*review_fixture()) == []
 
 
+@pytest.mark.parametrize('verdict',['unknown','contradicted'])
+def test_rejected_unit_can_keep_partial_person_evidence_without_protocol_retry(verdict):
+    raw,units,lines,count,voices=review_fixture()
+    raw['units'][0].update(verdict=verdict,identity_basis='insufficient',subjects=['人物甲','人物乙'],
+        reason='人物甲可由称呼回应确认，人物乙仍无依据',subject_evidence=[{
+            'subject':'人物甲','basis':'explicit_address_response','evidence_ids':[1,2],
+            'reason':'称呼和回应对应人物甲'}])
+    issues=assess_batch(raw,units,lines,count,voices)
+    assert any('人物乙仍无依据' in i['message'] for i in issues)
+    raw['units'][0]['verdict']='supported'
+    with pytest.raises(ValueError,match='逐人完整覆盖'):
+        assess_batch(raw,units,lines,count,voices)
+    raw['units'][0]['verdict']=verdict
+    raw['units'][0]['subject_evidence'][0]['evidence_ids']=[1,99]
+    with pytest.raises(ValueError,match='未提供'):
+        assess_batch(raw,units,lines,count,voices)
+
+
 @pytest.mark.parametrize('passed',[False,True])
 def test_new_unit_response_never_accepts_a_model_aggregation_switch(passed):
     from autoclip.automatic import UnitReviews

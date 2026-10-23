@@ -316,8 +316,12 @@ def assess_batch(raw, units, lines, frame_count, voice_rows):
         proofs=[(unit.identity_basis,unit.subjects,unit.evidence_ids)]
         if unit.identity_basis=='mixed':
             named=[p.subject for p in unit.subject_evidence]
-            if not unit.subjects or len(named)!=len(set(named)) or set(named)!=set(unit.subjects):
+            if (not unit.subjects or len(named)!=len(set(named)) or not set(named).issubset(unit.subjects)
+                    or (unit.verdict=='supported' and set(named)!=set(unit.subjects))):
                 raise ValueError('混合身份依据必须逐人完整覆盖subjects且不得重复')
+            # A rejected unit may explain only the people it could identify.
+            # Missing proof is the content defect, not a malformed rejection.
+            # Its unknown/contradicted verdict remains in issues above.
             proofs=[(p.basis,[p.subject],p.evidence_ids) for p in unit.subject_evidence]
         for basis,subjects,cited_ids in proofs:
             if basis == 'explicit_address_response' and len(set(cited_ids))<2:
