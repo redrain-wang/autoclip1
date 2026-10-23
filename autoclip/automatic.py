@@ -11,7 +11,7 @@ from .identity import units_for_clip, file_hash
 from .editorial import audience_script, prose_signals, require_oral_style, WRITING_RULES
 from .ingest import contact_sheet, subtitle_evidence_sheet
 from .titles import TITLE_POLICY, TITLE_RULES, title_repair_prompt, title_changes, title_issues
-from .narrative import DEPTH_RULES, formal_long, require_paragraph_preserved
+from .narrative import DEPTH_RULES, formal_long, require_paragraph_preserved, editorial_repair, require_commentary
 from .models import Plan, Beat, validate_plan, evidence_matches
 from .repair import RepairNeeded
 from .util import digest, read_json, source_identity, write_json
@@ -21,6 +21,14 @@ from .llm import review_json
 VERSION = 'automatic-review-10'
 METADATA_CAPTION_POLICY = 'metadata-captions-2'
 SCENE_OBSERVATION_POLICY = 'blind-selected-frames-4-boundary-context'
+IDENTITY_DIALOGUE_RULES = (
+    '声音候选未知不等于对白身份未知。explicit_address_response也可用明确自称与他人回应核实称谓级身份；'
+    '例如自称朕并与称臣者连续问答可核实皇帝这一角色，但不能因此补出某位皇帝的姓名；'
+    '侄儿、臣等自称只能证明相应关系，不能单凭它们补姓名。'
+    '称呼与回应不要求固定先后：下一位说话人回应前一人的话并明确称呼对方，也可构成依据；'
+    '须引用至少两条对白并说明对应关系，核对说话人、听者和连续对话，不能拿任意两条含姓名对白凑证据。'
+    '这些属于对白依据，不是voice_and_context，不要求捏造声音候选。'
+)
 
 
 def validate_voice_library(library, series):
@@ -455,7 +463,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
         sheet = contact_sheet(video,folder/f'batch-{offset}-images',times,f'batch-{offset}')
         evidence = review_voice_rows([r for r in voices['lines'] if r['line_id'] in {s.id for s in selected}]) if not original else []
         timeline=review_timeline(clip,group)
-        prompt = ('逐项核对文本事实、人物行为归属、画面相关性、连续原声切点、场景承接和重复解释。'
+        prompt = (IDENTITY_DIALOGUE_RULES+'逐项核对文本事实、人物行为归属、画面相关性、连续原声切点、场景承接和重复解释。'
                   '旁白必须面向观众讲剧情，不能出现字幕里说、根据字幕、镜头里有人等制作核对话术；'
                   '不能只因与转写字面一致就放行，不成句的残片或明显同音错词须按原片核实并指出问题。'
                   '字幕字段中的asr_text只是机器转写，不是原片实际字幕，可能有错字和错断句。'
@@ -777,7 +785,7 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
     schema=UnitReviews.model_json_schema()
     for name in ('UnitDecision','UnitIssue'):
         schema['$defs'][name]['properties']['id']={'type':'string','const':uid}
-    prompt=(f'只核验当前单位{uid}，units、issues、notes内的id只能原样写{uid}，不得添加子项编号。'
+    prompt=(IDENTITY_DIALOGUE_RULES+f'只核验当前单位{uid}，units、issues、notes内的id只能原样写{uid}，不得添加子项编号。'
         '独立核验units中当前这一段口播的事实、人物归属和画面，不改稿。'
         '只核对实际text中的断言，不猜测旧稿写过什么；逐句核对，不能用其中一句有据替整段放行。'
         '第一张图是当前实际剪入区间的首中尾画面，frame_ids只能是0、1、2；其后是引用对白字幕图。'
@@ -889,8 +897,14 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
               f'\n问题{json.dumps([i for i in issues if i["id"]==uid],ensure_ascii=False)}\n完整稿件（仅供衔接）{revised.model_dump_json()}'
               f'\n可用字幕（asr_text为未核实机器转写，实际字词以附图为准）{json.dumps(review_transcript_rows([s for s in lines if s.id in eligible]),ensure_ascii=False)}'
               f'\n人物候选{json.dumps(review_voice_rows([r for r in voices.get("lines",[]) if r["line_id"] in eligible]),ensure_ascii=False)}')
-        prompt+='\n面向观众的写作要求：'+WRITING_RULES
-        if uid.startswith('beat-') and formal_long(cfg) and max_characters is None:
+        prompt+='\n面向观众的写作要求：'+WRITING_RULES+'\n人物依据：'+IDENTITY_DIALOGUE_RULES
+        target_issues=[i for i in issues if i['id']==uid]
+        condense=editorial_repair(target_issues,target.get('text',''))
+        if condense:
+            prompt+=('\n本次是整稿编辑提出的衔接、分析或重复问题，不是仅做事实纠错。必须落实具体修订方向。'
+                '允许删除重复问答并将冗余段缩为必要的短转场，不必保住原字数；不能换词复述或填空话。'
+                '主要冲突的有据分析在整片中仍须充分展开，修后仍接受全片分量、事实与整稿质量检查。')
+        elif uid.startswith('beat-') and formal_long(cfg) and max_characters is None:
             prompt+=('\n这是正式长解说的事实或整稿质量修复。只纠正无据断言，保留正确的解释与完整思路。'
                 '主要段落不能修成两句转场或换词复述；用当前允许的事实解释处境、行动约束或眼前代价。'
                 '不要预支后文，不为凑字编造。若某一细节需删，重写它与前后段的连接，而不是删掉整段的分析。')
@@ -948,7 +962,8 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                 if uid.startswith('beat-'):
                     index=int(uid.split('-')[1])
                     if max_characters is None:
-                        require_paragraph_preserved(target['text'],candidate.clips[0].beats[index].text,cfg)
+                        require_paragraph_preserved(target['text'],candidate.clips[0].beats[index].text,cfg,issues=target_issues)
+                        if condense:require_commentary(candidate.clips[0],cfg)
                     if signals:=[s for s in prose_signals(candidate.clips[0]) if s['beat']==index]:
                         raise ValueError('当前旁白仍混入制作或审查话术，不能进入配音：'+json.dumps(signals,ensure_ascii=False))
                 if max_characters is not None and spoken_characters(candidate.clips[0].beats[int(uid.split('-')[1])].text)>max_characters:

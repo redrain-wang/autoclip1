@@ -233,7 +233,9 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
                 narrative=review_commentary(plan.clips[0],lines,cfg,llm,root)
                 if narrative is not None:
                     report={**report,'narrative_review':narrative}
-                    issues=[{'id':f'beat-{i["beat"]}','message':'整稿解说质量：'+i['problem']+'；修订方向：'+i['direction']}
+                    issues=[{'id':f'beat-{i["beat"]}','stage':'narrative_review',
+                             'text_digest':digest(plan.clips[0].beats[i['beat']].text),
+                             'message':'整稿解说质量：'+i['problem']+'；修订方向：'+i['direction']}
                             for i in narrative['issues']]
                     report['passed']=narrative['passed']
                     report['issues']=issues

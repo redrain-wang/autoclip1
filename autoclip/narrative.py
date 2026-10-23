@@ -30,13 +30,20 @@ def narration_minimum(slot, cfg, story_first):
     return 5 if story_first else round(slot['target_chars']*.45)
 
 
-def require_paragraph_preserved(before, after, cfg):
+def editorial_repair(issues, text):
+    """Only a whole-script finding bound to this exact paragraph may condense it."""
+    return bool(issues) and all(i.get('stage')=='narrative_review'
+        and i.get('text_digest')==digest(text) for i in issues)
+
+
+def require_paragraph_preserved(before, after, cfg, *, issues=()):
     """Local factual edits cannot silently turn developed commentary into a bridge.
 
     Timing compression has its own measured limits and final whole-script gate.
     This guard is for content edits only, and does not certify analytical quality.
     """
-    if formal_long(cfg) and spoken_characters(before)>=80 and spoken_characters(after)<80:
+    if (formal_long(cfg) and not editorial_repair(issues,before)
+            and spoken_characters(before)>=80 and spoken_characters(after)<80):
         raise ValueError('内容修复把主要解说段缩成了短过场：须保留有据的解释与衔接，'
                          '至少80个有效字；不能用复述或空话补足，改后仍须整稿质量核验')
 

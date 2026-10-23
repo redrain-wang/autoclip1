@@ -113,3 +113,31 @@ def test_paragraph_guard_does_not_force_short_transitions_or_short_films_to_expa
     cfg=Settings(duration_profile='long',target_seconds=1200,min_seconds=1080,max_seconds=1320)
     require_paragraph_preserved('与此同时，另一边的人还在等消息。','另一边还在等待。',cfg)
     require_paragraph_preserved('已经展开的有据分析'*12,'简洁短片。',Settings())
+
+
+def test_whole_script_editor_can_remove_redundancy_without_weakening_fact_repair_guard():
+    from autoclip.narrative import require_paragraph_preserved, editorial_repair
+    from autoclip.util import digest
+    cfg=Settings(duration_profile='long',target_seconds=1200,min_seconds=1080,max_seconds=1320)
+    before='旁白逐句预告随后原声的问答。'*10
+    after='府门前，求见的人还在等候。'
+    issue={'stage':'narrative_review','text_digest':digest(before),'message':'删除与随后原声重复的问答'}
+    require_paragraph_preserved(before,after,cfg,issues=[issue])
+    assert editorial_repair([issue],before)
+    # Factual repairs, stale reviews and mixed repair requests retain the guard.
+    for issues in [[],[{'message':'删去错误归属'}],[{**issue,'text_digest':'old'}],
+                   [issue,{'message':'还有事实问题'}]]:
+        with pytest.raises(ValueError,match='短过场'):
+            require_paragraph_preserved(before,after,cfg,issues=issues)
+
+
+def test_editorial_condensation_still_cannot_turn_whole_film_into_bridges():
+    from autoclip.narrative import require_paragraph_preserved
+    from autoclip.util import digest
+    cfg=Settings(duration_profile='long',target_seconds=1200,min_seconds=1080,max_seconds=1320)
+    before='这是被整稿编辑要求删除的重复对白。'*10
+    after='来人仍在等候。'
+    require_paragraph_preserved(before,after,cfg,issues=[{'stage':'narrative_review','text_digest':digest(before)}])
+    clip=Clip(title='标题',angle='',hook='',beats=[Beat(mode='narration',start=i*40,end=(i+1)*40,
+        text=after,evidence_ids=[i],reason='') for i in range(20)])
+    with pytest.raises(ValueError,match='碎片过场'):require_commentary(clip,cfg)
