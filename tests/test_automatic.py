@@ -56,6 +56,17 @@ def review_fixture():
     return raw,units,lines,1,[]
 
 
+@pytest.mark.parametrize('invalid',[False,True])
+def test_reported_name_does_not_require_identifying_the_unknown_speaker(invalid):
+    raw,units,lines,count,voices=review_fixture()
+    units[0]['text']='有人认为八爷眼下只有五成胜算。'
+    lines[0].text='我看眼下只有五成胜算' if invalid else '我看眼下八爷只有五成胜算'
+    voices=[{'line_id':1,'status':'candidate','samples':[{'name':'八爷'}]}]
+    raw['units'][0].update(identity_basis='explicit_reference',subjects=['八爷'],evidence_ids=[1])
+    issues=assess_batch(raw,units,lines,count,voices)
+    assert bool(issues) is invalid
+
+
 @pytest.mark.parametrize('bad',['missing','duplicate','unknown_id','unknown_frame','string_passed'])
 def test_malformed_automatic_review_never_passes(bad):
     args = review_fixture(); raw = args[0]
@@ -433,6 +444,46 @@ def test_caption_dispute_samples_named_middle_ids_before_generic_endpoints():
     lines=[Line(id=i,start=i,end=i+1,text='原字幕') for i in range(590,615)]
     selected=caption_lines_for_issues([{'message':'字幕600-602中的称呼有误，核查字幕612。'}],lines,[590,614])
     assert [s.id for s in selected]==[600,601,602,612,590,614]
+
+
+@pytest.mark.parametrize('resolved',[True,False])
+def test_quoted_asr_dispute_fetches_missing_caption_then_requires_a_new_verdict(tmp_path,monkeypatch,resolved):
+    import json
+    import autoclip.automatic as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'video')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'frame')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
+    captured=[]
+    def sheet(video,root,selected,name):
+        captured.append((name,[s.id for s in selected]));return frame
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',sheet)
+    def read_captions(llm,image,ids):
+        assert 13 in ids
+        return [{'line_id':i,'text':'侄儿给您请安来了' if i==13 else '其他可见对白'} for i in ids]
+    monkeypatch.setattr(module,'read_caption_observations',read_captions)
+    plan=sample_plan();plan.clips[0].beats=plan.clips[0].beats[:1]
+    beat=plan.clips[0].beats[0];beat.text='晚辈来求见，自称侄儿。';beat.evidence_ids=[10,11,13]
+    lines=[Line(id=10,start=1,end=2,text='晚辈登门'),Line(id=11,start=3,end=4,text='六叔'),
+           Line(id=13,start=5,end=6,text='这人给您请安来了')]
+    class Model:
+        checks=0
+        def json(self,system,prompt,images):
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+            disputed=any(u['id']=='beat-0' for u in group)
+            if disputed:self.checks+=1
+            fixed=not disputed or (resolved and self.checks>1)
+            if disputed and self.checks>1:assert '侄儿给您请安来了' in prompt
+            reason='原片核对后有据' if fixed else '给定字幕只有“这人给您请安来了”，没有“侄儿”的自称'
+            return {'units':[{'id':u['id'],'verdict':'supported' if fixed else 'unknown','reason':reason,
+                'evidence_ids':[13],'frame_ids':[0],'identity_basis':'no_identity_claim','subjects':[]} for u in group],
+                'issues':[] if fixed else [{'id':'beat-0','message':reason}]}
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':[]}
+    model=Model();before=plan.model_dump()
+    report=module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=1),model)
+    assert model.checks==2 and report['passed'] is resolved
+    assert ('disputed',[13,10,11]) in captured
+    assert plan.model_dump()==before
 
 
 def test_local_writer_receives_actual_caption_evidence_not_only_reviewer_claim(tmp_path,monkeypatch):

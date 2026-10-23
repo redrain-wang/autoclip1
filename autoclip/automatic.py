@@ -75,7 +75,8 @@ class UnitDecision(BaseModel):
     reason: str = Field(min_length=1)
     evidence_ids: list[int] = Field(min_length=1)
     frame_ids: list[int] = Field(min_length=1)
-    identity_basis: Literal['no_identity_claim','voice_and_context','explicit_address_response','insufficient']
+    identity_basis: Literal['no_identity_claim','voice_and_context','explicit_address_response','explicit_reference','insufficient'] = Field(
+        description='explicit_reference仅用于转述中明确被提及的人，不能指认谁在说话、行动或画面人物；实际发言者或行为者须用声纹加语境或明确称呼回应核实。')
     subjects: list[str] = Field(default_factory=list)
 
 
@@ -186,9 +187,15 @@ def caption_lines_for_issues(issues, lines, fallback_ids):
     lookup = {s.id:s for s in lines}
     ids = []
     for issue in issues:
-        for first,last in re.findall(r'(?:字幕|line|ID)\s*(\d+)(?:\s*[-–/、]\s*(\d+))?',issue['message']):
+        for first,last in re.findall(r'(?:字幕|对白|line|ID)\s*(\d+)(?:\s*[-–/、]\s*(\d+))?',issue['message']):
             a,b = int(first),int(last or first)
             ids.extend(range(min(a,b),max(a,b)+1) if abs(b-a)<=6 else [a,b])
+    # A reviewer may quote a disputed ASR phrase without citing its numeric ID.
+    # Show that actual caption before accepting its interpretation of the words.
+    quotes=[word for issue in issues for word in re.findall(r'[“「"]([^”」"]{2,80})[”」"]',issue['message'])]
+    if quotes:
+        ranked=metadata_caption_lines([{'text':'，'.join(quotes)}],lines)
+        ids.extend(s.id for s in ranked if any(re.sub(r'\W','',word) in re.sub(r'\W','',s.text) for word in quotes))
     ids.extend(fallback_ids)
     chosen = list(dict.fromkeys(i for i in ids if i in lookup))[:6]
     if not chosen and lines:
@@ -282,6 +289,15 @@ def assess_batch(raw, units, lines, frame_count, voice_rows):
                     +'、'.join(sorted(named))+'；须核实实际称呼、说话人及被提及者，不能省略subjects绕过人物审核'})
         if unit.identity_basis == 'explicit_address_response' and len(set(unit.evidence_ids))<2:
             issues.append({'id':unit.id,'message':'明确称呼与回应需至少两条不同证据'})
+        if unit.identity_basis == 'explicit_reference':
+            # Referencing someone in a quoted report does not identify the
+            # speaker. Keep this distinct from assigning an on-screen action.
+            cited_text=' '.join(lookup[i].text for i in unit.evidence_ids)
+            missing=[name for name in unit.subjects if len(name)<2 or name not in cited_text or name not in target['text']]
+            if not unit.subjects or missing:
+                issues.append({'id':unit.id,'message':'被提及人物须在所引对白及当前稿中明确出现，不能靠未引用的声音候选补出身份；'
+                    '本次未满足的subjects='+json.dumps(missing or unit.subjects,ensure_ascii=False)
+                    +'。如人物需通过称呼、回应或声音认定，须重核实际依据，不能将认人标成仅被提及。'})
         if unit.identity_basis == 'voice_and_context':
             associated = [voices.get(i, {}) for i in unit.evidence_ids]
             candidate_names = {name for r in associated for s in r.get('samples',[])
@@ -429,6 +445,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                   '身份依据分为无身份主张、声纹加语境、明确称呼回应、依据不足。泛称仍可能有身份主张。'
                   'subjects列出涉及身份归属的实际人物名；声纹加语境必须列出与当前候选一致的名字。'
                   '区分说话人、被称呼者和被提及者。“四爷和十三爷被叫住”没有指认喊话人，不能因喊话人声纹未知否定被称呼者。用清楚称呼/回应核实相应角色，不能混淆主客体。'
+                  '若只转述对白提到的人，例如“有人认为八爷有五成胜算”，没有把八爷当作这句发言者或给画面人物冠名，可用explicit_reference；subjects列被提及者，必须在引用的原对白中明确出现。不能用此依据认定谁在说话或行动，相关观点仍须注明归属，不能把传言当成事实。'
                   '没有姓名、关系或特定人物暗示的中性叙述（例如当前确实有人说“记住”），若字幕及画面支持，可用no_identity_claim；不要求查出这位说话人的姓名。仍禁止用泛称掩盖错误的特定人物行为。'
                   '不得把承诺写成结果，不能预支当前镜头后文；shown_evidence是此单位之前观众已看到的对白，可支持承接与回顾。分析须与事实分开。'
                   'original单位只有原片本身的连续声音与画面，没有新增旁白或人物标签；只核对切点是否破坏完整对白、伪造问答因果。'
@@ -551,12 +568,17 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                     continue
                 if (not original and retry<cfg.repair_attempts and caption_sheet is not None
                         and caption_observations is None
-                        and any(re.search(r'ASR|转写|同音|错字|错词|残句',i['message']) for i in issues)):
+                        and any(re.search(r'ASR|转写|同音|错字|错词|残句|(?:给定|提供的)字幕|字幕[^。]{0,35}没有|自称',i['message']) for i in issues)):
+                    disputed=caption_lines_for_issues(issues,selected,[s.id for s in caption_lines])
+                    if [s.id for s in disputed]!=[s.id for s in caption_lines]:
+                        caption_lines=disputed
+                        caption_sheet=subtitle_evidence_sheet(video,folder/f'batch-{offset}-disputed-captions',caption_lines,'disputed')
+                        review_images.append(caption_sheet)
                     caption_observations=read_caption_observations(llm,caption_sheet,[s.id for s in caption_lines])
                     write_json(folder/f'batch-{offset}-caption-readings.json',{'readings':caption_observations,
                         'image':str(caption_sheet.resolve()),'image_sha256':file_hash(caption_sheet)})
                     write_json(folder/f'batch-{offset}-source-recheck-{retry}.json',{'raw':raw,'issues':issues})
-                    feedback=('\n上一轮混淆原片与机器转写，先重核审核自身，不先改稿。'
+                    feedback=('\n上一轮存在需要核实的对白疑点，先重核原片及审核自身，不先改稿。'
                         '这是另一个只看原片图、未看到转写和稿件的字幕辨读结果，仍须对图复核：'
                         +json.dumps(caption_observations,ensure_ascii=False)
                         +'。原片图与旁白相符时应supported；不得因原始ASR有错而拒绝正确旁白。'
@@ -569,7 +591,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 # asking the writer to "fix" an otherwise unchanged sentence.
                 supported = {u.id for u in decisions.units if u.verdict=='supported'}
                 inconsistent = [i for i in issues if i['id'] in supported and i['message'].startswith((
-                    '声音候选缺失或冲突','声音依据未支持','列出了人物归属却声明','明确称呼与回应需至少'))]
+                    '声音候选缺失或冲突','声音依据未支持','列出了人物归属却声明','明确称呼与回应需至少','被提及人物须在'))]
                 caption_dispute = any(re.search(r'ASR|同音|错字|转写|字形|拆字|文字|看不清|字幕.*(?:不一致|不符|错误|不足|不完整)',i['message']) for i in issues)
                 if retry<cfg.repair_attempts and caption_sheet is None and (inconsistent or caption_dispute):
                     zoom_ids = set()
@@ -737,6 +759,7 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
         '过去对白可以支持自然回顾，但不能将此前出现的动作、道具或人物说成正在当前画面发生。'
         '字幕中的称呼可能指听者，不能自动当作说话人。明确称呼与回应须引用至少两条不同对白；'
         '声音加语境须列出实际候选姓名，不能自行添加别名。无法核实就unknown，具体问题写issues。'
+        '只转述对白中明确提及的人、未认定说话人或画面人物时，可用explicit_reference，subjects列原对白明确出现的被提及者；不能凭此指认动作或发言者，也不能把转述的观点当成既成事实。'
         '声音记录status=human_confirmed表示该source及start/end区间的说话人已人工确认，不能将它误读成未确认机器候选；只对该区间有效，不能延伸到邻近发言。'
         'ASR不是原片字幕的正确答案，不要求正确转述迎合机器错字。仅换同义词、保留无据动作仍须拒绝。'
         '每个结论都必须引用提供的对白和主图编号。只返回units、issues及可选notes，不返回passed。'
@@ -757,7 +780,7 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
             issues=assess_batch(checked,[unit],selected,len(times),evidence)
             supported={u.id for u in decisions.units if u.verdict=='supported'}
             inconsistent=[i for i in issues if i['id'] in supported and i['message'].startswith((
-                '声音候选缺失或冲突','声音依据未支持','列出了人物归属却声明','明确称呼与回应需至少'))]
+                '声音候选缺失或冲突','声音依据未支持','列出了人物归属却声明','明确称呼与回应需至少','被提及人物须在'))]
             recheck=review_recheck_reason(issues,[unit])
             if inconsistent or recheck:
                 raise ValueError('先重核核验结论自身，稿件尚未修改：'+json.dumps(inconsistent+recheck,ensure_ascii=False))
