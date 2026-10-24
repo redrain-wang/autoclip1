@@ -38,7 +38,7 @@ def test_notes_keep_raw_evidence_and_cannot_self_certify_identity():
 def test_unknown_evidence_is_rejected_instead_of_silently_discarded():
     lines, raw = fixture_data()
     raw["events"][0]["evidence_ids"].append(99)
-    with pytest.raises(ValueError, match="不存在"):
+    with pytest.raises(ValueError, match=r"不存在的字幕\[99\].*可用编号为\[4, 5\]"):
         ground_window(raw, lines)
     with pytest.raises(ValueError, match="说明原因"):
         ground_window({"events": [], "omitted_reason": ""}, lines)
@@ -105,6 +105,35 @@ def test_research_cache_seed_requires_matching_source(tmp_path):
     seed_research(history, identity, root)
     assert (root / "research" / "same.json").exists()
     assert not (root / "research" / "other.json").exists()
+
+
+@pytest.mark.parametrize('repair_succeeds',[True,False])
+def test_oversized_event_research_repairs_within_budget_without_dropping_evidence(tmp_path,repair_succeeds):
+    import copy
+    from autoclip.util import read_json
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    lines=[Line(id=i,start=i*2,end=i*2+1,text='本区间实际对白') for i in range(30)]
+    _,valid=fixture_data()
+    invalid=copy.deepcopy(valid);invalid['events'][0]['evidence_ids']=list(range(26))
+    class Model:
+        calls=0
+        def json(self,system,prompt):
+            self.calls+=1
+            if self.calls>1:
+                assert '1–24条' in prompt and '上次未通过的数据' in prompt
+            return valid if repair_succeeds and self.calls==3 else invalid
+    model=Model();root=tmp_path/'research-run';cfg=Settings(repair_attempts=2)
+    if repair_succeeds:
+        result=prepare_research(video,root,lines,60,cfg,model)
+        assert result['windows'][0]['events'][0]['evidence_ids']==[5,4]
+        assert prepare_research(video,root,lines,60,cfg,model)==result
+    else:
+        with pytest.raises(ValueError,match='at most 24'):prepare_research(video,root,lines,60,cfg,model)
+        assert not (root/'research.json').exists()
+    assert model.calls==3
+    rejected=list((root/'research-attempts').rglob('*.json'))
+    assert len(rejected)==(2 if repair_succeeds else 3)
+    assert all(len(read_json(p)['response']['events'][0]['evidence_ids'])==26 for p in rejected)
 
 
 @pytest.mark.parametrize("verdict", [{"passed": True, "issues": ["主语归属错误"]}, {"passed": True}])

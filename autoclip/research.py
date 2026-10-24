@@ -55,9 +55,11 @@ def ground_window(raw: dict, lines) -> list[dict]:
         raise ValueError("空研究区间必须说明原因")
     lookup = {s.id: s for s in lines}
     events = []
-    for event in data.events:
-        if any(i not in lookup for i in event.evidence_ids):
-            raise ValueError("研究引用了当前区间以外或不存在的字幕")
+    for index,event in enumerate(data.events):
+        unknown=sorted({i for i in event.evidence_ids if i not in lookup})
+        if unknown:
+            raise ValueError(f"研究事件{index}引用了当前区间以外或不存在的字幕{unknown}；"
+                             f"本区间可用编号为{sorted(lookup)}")
         evidence = [lookup[i] for i in sorted(set(event.evidence_ids), key=lambda i: lookup[i].start)]
         row = event.model_dump()
         row.update(start=min(s.start for s in evidence), end=max(s.end for s in evidence),
@@ -98,15 +100,21 @@ def prepare_research(video, root, lines, seconds, cfg, llm, previous=None):
                 f"\n格式：{json.dumps(StudyWindow.model_json_schema(), ensure_ascii=False)}"
                 + background_context(cfg.series) + "\n本区间ASR：\n" + compact(evidence))
             error = ""
-            for attempt in range(2):
+            for attempt in range(cfg.repair_attempts+1):
                 raw = llm.json("你是影视资料整理员。只处理提供的数据，逐项保留不确定性，不能把自己的推断标为已核实。", prompt+error)
                 try:
                     events = ground_window(raw, evidence)
                     break
                 except ValueError as ex:
-                    if attempt:
+                    write_json(root/'research-attempts'/signature/f'{start}-{attempt}.json',
+                               {'response':raw,'error':str(ex),'status':'rejected'})
+                    if attempt==cfg.repair_attempts:
                         raise
-                    error = "\n上次输出校验失败，请修复：" + str(ex)[:1200]
+                    error = ("\n上次输出校验失败，请重核后完整返回：" + str(ex)[:1200]
+                             + "。每个事件evidence_ids须为1–24条当前区间真实编号，只选直接支持该事件的关键对白。"
+                             "事件过大时拆成多个事件；不能连续枚举整个区间、伪造编号或用文字声称已修复。"
+                             "仍须遵守events最多15项及各字段长度约束。"
+                             + "\n上次未通过的数据：" + json.dumps(raw,ensure_ascii=False))
             windows.append({"start": start, "end": end, "events": events, "omitted_reason": raw["omitted_reason"]})
         result = {**inputs, "signature": signature, "status": "model_notes_not_fact_checked", "windows": windows}
         write_json(cache, result)
