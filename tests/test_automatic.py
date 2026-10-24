@@ -1265,3 +1265,29 @@ def test_scoped_finding_suffix_keeps_rejection_without_accepting_other_beats():
     assert issues==[{'id':'beat-1','message':'人物归属有误'}]
     raw['issues'][0]['id']='beat-10-identity'
     with pytest.raises(ValueError,match='本批次以外'):assess_batch(raw,units,lines,count,voices)
+
+
+@pytest.mark.parametrize('case',['complete','trimmed_sentence','neighbor_overlap','too_little_commentary'])
+def test_failed_long_narration_can_keep_source_only_with_safe_cuts_and_enough_remaining_commentary(case):
+    from autoclip.automatic import retain_short_source_audio
+    cfg=Settings(duration_profile='long',target_seconds=1200,min_seconds=1080,max_seconds=1320,opening='original')
+    text='已经明确的处境和选择'*10
+    if case=='too_little_commentary':text='事'*90
+    beats=[Beat(mode='original' if i%2==0 else 'narration',start=i*40,end=(i+1)*40,
+        text='' if i%2==0 else text,evidence_ids=[i],reason='完整剧情') for i in range(40)]
+    beats[0].end=20
+    plan=Plan(episode_summary='',genre='',style='',clips=[Clip(title='具体冲突',angle='',hook='',beats=beats)])
+    lines=[Line(id=i,start=i*40+.5,end=(i+1)*40-.5 if i else 19.5,text='连续完整对白') for i in range(40)]
+    if case=='trimmed_sentence':plan.clips[0].beats[3].start=123
+    if case=='neighbor_overlap':lines[3].start=119
+    before=plan.model_dump()
+    result=retain_short_source_audio(plan,'beat-3',lines,cfg,1600)
+    assert (result is None)==(case in ('neighbor_overlap','too_little_commentary'))
+    if result is not None:
+        changed=result.clips[0].beats[3]
+        assert changed.mode=='original' and changed.text=='' and changed.evidence_ids==[3]
+        assert changed.start==(120.5 if case=='trimmed_sentence' else 120)
+        assert changed.end==160
+        assert '仍须重新测时' in changed.reason
+        assert all(a==b for i,(a,b) in enumerate(zip(result.clips[0].beats,plan.clips[0].beats)) if i!=3)
+    assert plan.model_dump()==before

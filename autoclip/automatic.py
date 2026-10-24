@@ -753,22 +753,37 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
 
 
 def retain_short_source_audio(plan, uid, lines, cfg, source_seconds):
-    """A failed short bridge may keep real audio, never invented replacement speech."""
+    """Keep real dialogue after bounded prose repairs, with whole-film safeguards."""
     if source_seconds is None or not uid.startswith('beat-'):
         return None
     index = int(uid.split('-')[1])
     before = plan.clips[0].beats[index]
-    if before.mode!='narration' or not 1<=before.end-before.start<=8:
+    limit=40 if formal_long(cfg) else 8
+    if before.mode!='narration' or not 1<=before.end-before.start<=limit:
         return None
-    if any(s.start+.001<cut<s.end-.001 for s in lines for cut in (before.start,before.end)):
+    start,end=before.start,before.end
+    if formal_long(cfg):
+        # TTS measurement may have trimmed the narration picture mid-sentence.
+        # Restore only intersecting complete utterances, never another shot.
+        while True:
+            crossing=[s for s in lines if s.start<end-.001 and s.end>start+.001]
+            expanded=(min([start,*[s.start for s in crossing]]),max([end,*[s.end for s in crossing]]))
+            if expanded==(start,end):break
+            start,end=expanded
+            if end-start>limit:return None
+        left=plan.clips[0].beats[index-1].end if index else 0
+        right=plan.clips[0].beats[index+1].start if index+1<len(plan.clips[0].beats) else source_seconds
+        if start<left-.001 or end>right+.001:return None
+    if any(s.start+.001<cut<s.end-.001 for s in lines for cut in (start,end)):
         return None
-    ids = [s.id for s in lines if s.start>=before.start-.001 and s.end<=before.end+.001]
+    ids = [s.id for s in lines if s.start>=start-.001 and s.end<=end+.001]
     if not ids:
         return None
     revised = plan.model_copy(deep=True)
-    revised.clips[0].beats[index] = Beat(mode='original',start=before.start,end=before.end,
-        text='',evidence_ids=ids,reason='短承接修稿失败，保留当前区间完整真实对白；仍须重新核对剪辑和全稿')
+    revised.clips[0].beats[index] = Beat(mode='original',start=start,end=end,
+        text='',evidence_ids=ids,reason='局部口播修稿未通过，保留本区间完整真实对白；仍须重新测时及核对剪辑和全稿')
     try:
+        require_commentary(revised.clips[0],cfg)
         validate_plan(revised,lines,source_seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
     except ValueError:
         return None
