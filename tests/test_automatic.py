@@ -173,6 +173,37 @@ def test_caption_rechecks_can_resolve_a_second_name_without_losing_the_first(tmp
     assert model.calls==3 and read_ids==[[0],[1]]
 
 
+@pytest.mark.parametrize('semantic_pass',[True,False])
+def test_local_asr_fact_dispute_reads_source_even_without_reference_annotation(tmp_path,monkeypatch,semantic_pass):
+    import autoclip.automatic as module
+    from autoclip.util import read_json
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'actual source captions')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'read_caption_observations',lambda llm,image,ids:[{'line_id':1,'text':'田文镜，请坐。'}])
+    plan=sample_plan();plan.clips[0].beats[0].text='田文镜被叫到名字。'
+    lines=[Line(id=1,start=1,end=2,text='田文静，请坐。')]
+    class Model:
+        calls=0
+        def json(self,system,prompt,images):
+            self.calls+=1
+            if self.calls==2:assert '田文镜，请坐。' in prompt and '仍有未知或错误则明确拒绝' in prompt
+            passed=self.calls==2 and semantic_pass
+            message='字幕1的转写是田文静，不能直接定字田文镜' if self.calls==1 else '人物的实际动作仍未核实'
+            return {'units':[{'id':'beat-0','verdict':'supported' if passed else 'contradicted',
+                'reason':'原片已核实' if passed else message,'evidence_ids':[1],'frame_ids':[0],
+                'identity_basis':'no_identity_claim','subjects':[]}],
+                'issues':[] if passed else [{'id':'beat-0','message':message}]}
+    model=Model();args=(video,plan,'beat-0',[],lines,{'lines':[]},tmp_path,model)
+    if semantic_pass:module.verify_narration_patch(*args,retries=1)
+    else:
+        with pytest.raises(ValueError,match='局部修订仍未解决'):module.verify_narration_patch(*args,retries=1)
+    assert model.calls==2 and lines[0].text=='田文静，请坐。'
+    assert read_json(tmp_path/'disputed-captions/readings.json')['image_sha256']
+    assert read_json(tmp_path/'verification.json')['passed'] is semantic_pass
+
+
 @pytest.mark.parametrize('case',['valid','borrowed_voice','missing_person','outside_scope','one_sided_address','summary_label','missing_summary_id','future_id'])
 def test_each_person_can_use_distinct_identity_evidence_without_borrowing_anothers_voice(case):
     raw,units,lines,count,voices=review_fixture()
@@ -1129,6 +1160,19 @@ def test_review_rechecks_rejection_that_itself_says_supported():
     units=[{'id':'beat-0','text':'有人请客人进屋。'}]
     assert review_recheck_reason([{'id':'beat-0','message':'旁白基本有据，判 supported 更妥。'}],units)
     assert not review_recheck_reason([{'id':'beat-0','message':'当前画面没有提灯者，旁白动作无据。'}],units)
+
+
+@pytest.mark.parametrize('message,recheck',[
+    ('八爷只是机器候选，未见human_confirmed；虽有八哥回应，口播应说明是候选。',True),
+    ('声纹为candidate并非人工确认，因此不能直接认定八爷。',True),
+    ('声音候选与对白中受话者冲突，无法核实发言者。',False),
+    ('human_confirmed仅覆盖10–12秒，不能延伸到邻近发言。',False),
+])
+def test_candidate_review_rechecks_wrong_human_stamp_requirement_without_dismissing_real_conflicts(message,recheck):
+    from autoclip.automatic import review_recheck_reason
+    reasons=review_recheck_reason([{'id':'beat-0','message':message}],[{'id':'beat-0','text':'八爷问灾民如何过冬。'}])
+    assert bool(reasons) is recheck
+    if recheck:assert '真正的声音冲突' in reasons[0] and '不要求把声纹候选' in reasons[0]
 
 
 def test_patch_verifier_receives_actual_past_evidence_without_future_leakage(tmp_path,monkeypatch):

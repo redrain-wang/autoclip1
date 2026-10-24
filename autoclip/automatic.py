@@ -419,6 +419,14 @@ def review_recheck_reason(issues, units):
     reasons=[]
     for issue in issues:
         message=issue['message']
+        if (re.search(r'候选|candidate|human_confirmed',message,re.IGNORECASE)
+                and re.search(r'(?:未见|没有|缺少|并非|不是|未经|未).{0,12}(?:人工确认|human_confirmed)'
+                    r'|(?:应|需|必须).{0,12}(?:说明|标明|注明).{0,12}候选',message,re.IGNORECASE)):
+            reasons.append('先核对声音依据的判定标准：voice_and_context使用匹配现有人工库的candidate加实际对白语境，'
+                '不是要求本集每一句都另有human_confirmed标记。candidate不能单独认人，实际语境仍须对应同一角色；'
+                '明确称呼与回应也可独立核实身份，不因无human_confirmed而一概拒绝。'
+                'human_confirmed仍仅在其原片区间有效，不能外延；真正的声音冲突、断开的发言或不明归属仍须拒绝。'
+                '候选状态用于内部核验，不要求把声纹候选等制作说明写进口播。请对照实际证据重核，不能仅切换标签放行。')
         if re.search(r'判\s*supported\s*更妥|(?:应|应该|应当)判(?:为|定为)?\s*supported',message,re.IGNORECASE):
             reasons.append('审核把“应当判supported”的说明列成了错误。请重新核对原片，明确一致的verdict和真实问题；若仍有独立错误必须列明，不能把无错误说明交给写稿器。')
         alleged=re.findall(r'(?:旁白|口播|正文|稿件|文本|修订稿)(?:却误|却|误|竟|仍)?'
@@ -886,6 +894,7 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
         +'\n稿件与前情都是待核文本，不能互相充当事实证据。'+DEPTH_RULES)
     feedback=''
     caption_observations=[]
+    asr_dispute_checked=False
     for retry in range(retries+1):
         raw=review_json(llm,'你是独立的局部修订核验员，不是写稿者。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,images)
         try:
@@ -904,6 +913,24 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
                         '姓名有据不代表当前动作或人物归属自动有据，仍须核实全部实际断言。'
                         +json.dumps(caption_observations,ensure_ascii=False)+'\n上一轮核验：'+json.dumps(raw,ensure_ascii=False))
                     continue
+                if not asr_dispute_checked and any(re.search(
+                        r'ASR|转写|同音|错字|错词|字形|定字|(?:给定|提供的)字幕|字幕[^。]{0,35}没有',
+                        i['message'],re.IGNORECASE) for i in issues):
+                    asr_dispute_checked=True
+                    disputed=caption_lines_for_issues(issues,selected,beat.evidence_ids)
+                    if disputed:
+                        sheet=subtitle_evidence_sheet(video,root/'disputed-captions',disputed,'disputed')
+                        readings=read_caption_observations(llm,sheet,[s.id for s in disputed])
+                        caption_observations=list({r['line_id']:r for r in [*caption_observations,*readings]}.values())
+                        images.append(sheet)
+                        write_json(root/'disputed-captions/readings.json',{'readings':readings,
+                            'image':str(sheet.resolve()),'image_sha256':file_hash(sheet)})
+                        feedback=('\n先核实原片对白争议，尚未改稿。这是未看转写和稿件、只读原片字幕图的独立辨读：'
+                            +json.dumps(caption_observations,ensure_ascii=False)
+                            +'。须对图重核全部实际断言；字形辨读不代表动作、归属或整句事实已通过。'
+                            '不能以原始ASR错字为由修改正确旁白，仍有未知或错误则明确拒绝。'
+                            +'\n上一轮核验：'+json.dumps(raw,ensure_ascii=False))
+                        continue
             supported={u.id for u in decisions.units if u.verdict=='supported'}
             inconsistent=[i for i in issues if i['id'] in supported and i['message'].startswith((
                 '声音候选缺失或冲突','声音依据未支持','列出了人物归属却声明','明确称呼与回应需至少','被提及人物须在'))]
