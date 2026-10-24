@@ -12,7 +12,7 @@ from .repair import voice_fits
 from .util import digest, duration, probe, run, timestamp, write_json, source_identity
 
 console = Console()
-VERSION = "render-9"
+VERSION = "render-10"
 
 
 def synthesize(text: str, folder: Path, cfg: Settings):
@@ -75,11 +75,28 @@ def ass_time(t):
 
 
 def subtitle_chunks(text: str, limit=14):
+    """Keep phrase pauses, balance long lines, and join short enumeration items."""
+    if limit < 2:
+        raise ValueError("字幕行宽至少为2")
     parts = re.findall(r"[^，。！？；：、,.!?;:]+[，。！？；：、,.!?;:]?", text)
     result = []
     for part in parts:
         part = part.strip()
-        result.extend(part[i:i+limit] for i in range(0,len(part),limit))
+        count = max(1, (len(part) + limit - 1) // limit)
+        width, extra = divmod(len(part), count)
+        cursor = 0
+        for index in range(count):
+            size = width + (index < extra)
+            piece = part[cursor:cursor + size]
+            cursor += size
+            # Do not leave list items such as “八、大、王” flashing separately.
+            # Full sentence stops retain their own pause.
+            if (result and not re.search(r"[。！？；.!?;]$", result[-1])
+                    and min(len(subtitle_display(result[-1])), len(subtitle_display(piece))) <= 3
+                    and len(result[-1]) + len(piece) <= limit):
+                result[-1] += piece
+            else:
+                result.append(piece)
     return result or [text]
 
 

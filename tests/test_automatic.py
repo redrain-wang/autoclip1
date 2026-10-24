@@ -141,6 +141,26 @@ def test_rejected_unit_can_keep_partial_person_evidence_without_protocol_retry(v
         assess_batch(raw,units,lines,count,voices)
 
 
+def test_original_cut_review_can_cite_next_line_without_claiming_it_was_played():
+    from autoclip.automatic import review_citation_limits
+    raw,units,lines,count,voices=review_fixture()
+    units[0].update(id='original-1',mode='original',start=1,end=4)
+    lines[1].start=4;lines[1].end=5
+    raw['units'][0].update(id='original-1',identity_basis='no_identity_claim',subjects=[],
+        reason='下一句从end开始；当前完整句之后的独立应答未剪入，不是半句切断')
+    assert assess_batch(raw,units,lines,count,voices)==[]
+    limits=review_citation_limits(units,lines,voices)[0]
+    assert limits['boundary_context_ids']==[2] and 2 in limits['allowed_evidence_ids']
+    # A real cut defect remains rejected, and distant/future narration stays forbidden.
+    raw['units'][0]['verdict']='contradicted'
+    assert assess_batch(raw,units,lines,count,voices)
+    raw['units'][0]['verdict']='supported'
+    lines[1].start=20;lines[1].end=21
+    with pytest.raises(ValueError,match='未来'):assess_batch(raw,units,lines,count,voices)
+    lines[1].start=4;lines[1].end=5;units[0]['mode']='narration'
+    with pytest.raises(ValueError,match='未来'):assess_batch(raw,units,lines,count,voices)
+
+
 @pytest.mark.parametrize('passed',[False,True])
 def test_new_unit_response_never_accepts_a_model_aggregation_switch(passed):
     from autoclip.automatic import UnitReviews

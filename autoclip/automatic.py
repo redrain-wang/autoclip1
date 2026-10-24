@@ -298,7 +298,9 @@ def assess_batch(raw, units, lines, frame_count, voice_rows):
         target = expected[unit.id]
         if target.get('mode')=='original' and (unit.identity_basis!='no_identity_claim' or unit.subjects):
             raise ValueError(f'{unit.id} 是没有新增身份主张的原声；只核对剪辑，不能因说话人姓名未知改写原声')
-        if 'end' in target and any(lookup[i].start >= target['end'] and i not in target.get('shown_evidence',[]) for i in unit.evidence_ids):
+        if 'end' in target and any(lookup[i].start >= target['end'] and i not in target.get('shown_evidence',[])
+                and not (target.get('mode')=='original' and lookup[i].start<target['end']+8)
+                for i in unit.evidence_ids):
             if unit.verdict == 'supported':
                 raise ValueError(f'{unit.id} 声称有据但引用未来对白；请重核引用与结论，不能据此直接改稿')
             issues.append({'id':unit.id,'message':'审核依据预支了本镜头之后的剧情'})
@@ -351,8 +353,11 @@ def review_citation_limits(units, lines, voice_rows):
     result=[]
     for unit in units:
         allowed={s.id for s in lines if 'end' not in unit or s.start<unit['end']
+                 or (unit.get('mode')=='original' and s.start<unit['end']+8)
                  or s.id in unit.get('shown_evidence',[])}
         result.append({'id':unit['id'],'end_exclusive':unit.get('end'),
+            **({'boundary_context_ids':[s.id for s in lines if unit['end']<=s.start<unit['end']+8]}
+               if unit.get('mode')=='original' else {}),
             'allowed_evidence_ids':sorted(allowed),
             'future_evidence_ids':[s.id for s in lines if s.id not in allowed],
             'voice_candidates':[] if unit.get('mode')=='original' else [
@@ -510,6 +515,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 'source_continuity=single_uncut_interval是渲染约束：start到end内保留原片全部连续音画，没有本系统内部删剪；字幕空白间隔内的声音及画面也完整保留，不能仅因字幕间有停顿就怀疑本系统剪掉了对白。只检查本系统选取的边界与跨单位承接，不重审原剧导演本身的剪接。'
                 '若切点、问答或承接本身不清楚仍须unknown；实质剪辑问题须拒绝，不能因没有身份主张就默认支持。'
                 'ASR同音字形不等于实际对白错误；区间含start、不含end，end等于下条字幕start没有剪入下条对白。'
+                '原声切点可引用结束后8秒以内的对白作边界对照，判断是否剪断；这不表示该对白已剪入，不能据此新增剧情或人物标签。'
                 'issues仅列实际待修问题，已排除的疑点与解释放notes。每项结论必须引用提供的字幕与图片编号，图片从0编号。'
                 '先对照viewer_timeline中的实际相邻原声和旁白，再判断缺失承接；当前单位evidence_ids不是全部所提供的上下文。原声听到字幕内容，旁白听到text，不能混为一谈。'
                 '不要返回passed总开关；程序按每个单位的verdict及issues汇总。未知或实际错误仍须逐项拒绝。'
