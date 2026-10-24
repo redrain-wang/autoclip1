@@ -8,8 +8,19 @@ from .budget import spoken_characters
 from .util import digest, write_json
 from .llm import review_json
 
-NARRATIVE_POLICY = 'connected-commentary-1'
-NARRATIVE_REVIEW_POLICY = 'source-timeline-2'
+NARRATIVE_POLICY = 'connected-commentary-2'
+NARRATIVE_REVIEW_POLICY = 'natural-oral-3'
+NARRATIVE_CRITERIA = {'continuity', 'analysis', 'non_repetition', 'naturalness'}
+NATURAL_ORAL_RULES = (
+    '口播像一个熟悉剧情的人把事情讲给别人听，先说具体的人做了什么、卡在哪里，再解释关键交锋。'
+    '不用论文或工作汇报的口气替人物贴标签；把“拆掉怀才不遇的叙事”“收回道义解释权”等抽象概括，'
+    '改成谁拿什么理由说服谁、对方怎样回应、眼前谁承担后果。抽象词没有解释清楚时直接删去，不能只换近义词。'
+    '每段不必固定按“复述动作、上升意义、总结一句”展开；普通请安、落座、走路不硬说掌握节奏或争夺主动权。'
+    '旁白说完一个意思就往下讲，删除意思相同的段尾总结；“一个……一个……”“从……到……再到……”等整齐句式适量，不能连续套用。'
+    '分析只放在真正影响人物选择或对话胜负的地方，指出具体依据，允许一句把问题讲透，不为了显得深刻反复解释。'
+    '段落长短随内容变化；主要讲述可以连续展开，短转场保持简洁，不能为满足字数把已讲明的动作扩成空分析。'
+    '自然不等于堆网络梗、替角色喊话、编内心独白、乱用反问或故意口吃；仍用准确、平实的第三人称。'
+)
 DEPTH_RULES = (
     '剧情优先不是只复述动作或用两句过场话串原声。先按章节构成连贯讲述，再分配到镜头。'
     '主要冲突必须讲清处境、行动依据、可选择的做法与约束、眼前后果；不要求每个短转场分析。'
@@ -18,7 +29,7 @@ DEPTH_RULES = (
     '分析从已展示的行为与明确说法推导，区分事实和解读：可以解释利益约束、话语作用和行动代价，'
     '不要求角色亲口说出旁白的每一步推理；但不得虚构动机、关系、结果或后集事实。'
     '避免空泛权谋金句、动作流水账和逐镜头报幕；深度来自可理解的推理链，不来自字数或长句本身。'
-)
+) + NATURAL_ORAL_RULES
 
 
 def formal_long(cfg):
@@ -82,7 +93,7 @@ class NarrativeFinding(BaseModel):
 
 class NarrativeCheck(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    criterion: Literal['continuity','analysis','non_repetition']
+    criterion: Literal['continuity','analysis','non_repetition','naturalness']
     passed: StrictBool
     reason: str = Field(min_length=1)
 
@@ -138,7 +149,7 @@ def verify_editorial_patch(clip, index, issues, lines, llm, root):
         +'\neditorial_findings='+json.dumps(issues,ensure_ascii=False)
         +'\naudience='+json.dumps(context,ensure_ascii=False)
         +'\nsource_context='+json.dumps([r for r in source if r['beat']==index],ensure_ascii=False))
-    raw=review_json(llm,'你是局部整稿编辑，核对修订是否真正解决重复、衔接或分析问题。',prompt)
+    raw=review_json(llm,'你是局部整稿编辑，核对修订是否真正解决重复、衔接、分析或口播自然度问题。',prompt)
     result=EditorialPatchReview.model_validate(raw)
     if ((result.resolved and result.remaining_quote) or
             (not result.resolved and (not result.remaining_quote or result.remaining_quote not in clip.beats[index].text))):
@@ -155,11 +166,14 @@ def review_commentary(clip, lines, cfg, llm, root):
         return None
     rows,source=narrative_context(clip,lines)
     prompt=(DEPTH_RULES+SOURCE_TIMELINE_RULES+'\n审核整片最终听感，不写稿，不重新认人，不替代原片事实核对。'
-        '按continuity、analysis、non_repetition三个维度分别给结论，每项恰好一次。'
+        '按continuity、analysis、non_repetition、naturalness四个维度分别给结论，每项恰好一次。'
         'continuity检查主线是否连贯、相邻段是否真正推进，而非每两句重起话头。'
         'analysis检查主要冲突是否解释处境、行动依据、约束或代价，而非把动作复述包装成分析；'
         '允许简短转场，不要求每段凑齐所有分析要素，不强求角色未表露的内心或额外历史知识。'
         'non_repetition检查旁白之间、旁白与相邻原声之间是否长篇重复同一信息；必要提示与回顾可以保留。'
+        'naturalness检查读出来是否像自然讲述：抽象术语代替具体解释、普通动作硬拔高、连续套用整齐句式、'
+        '每段都补一句没有信息增量的总结，均须指出实际原句。不能因没有“字幕里说”等禁词就认定自然。'
+        '这是表达检查，不判断作者是否使用AI，不给检测概率；不要求删掉所有分析，也不把必要的官名和事实术语当问题。'
         '字数多、解说占比高不等于合格，空话填字、换词重复、逐镜头报幕仍需指出。'
         '只把必须修的问题列issues，绑定实际narration段号并逐字引用该段quote；不能修改original。'
         'direction说明如何利用已展示内容改好，不直接给新稿或编造新事实。'
@@ -172,13 +186,13 @@ def review_commentary(clip, lines, cfg, llm, root):
         'clip':clip.model_dump(),'rows':rows,'source':source})
     feedback=''
     for attempt in range(cfg.repair_attempts+1):
-        raw=review_json(llm,'你是影视深度解说的整稿编辑，检查连贯性与分析质量。',prompt+feedback)
+        raw=review_json(llm,'你是影视解说的整稿编辑，检查连贯性、分析质量和自然口播。',prompt+feedback)
         write_json(folder/f'attempt-{attempt}.json',raw)
         try:
             result=NarrativeReview.model_validate(raw)
-            if (len(result.checks)!=3 or {c.criterion for c in result.checks}
-                    != {'continuity','analysis','non_repetition'}):
-                raise ValueError('整稿检查须精确覆盖三个维度')
+            if (len(result.checks)!=len(NARRATIVE_CRITERIA) or {c.criterion for c in result.checks}
+                    != NARRATIVE_CRITERIA):
+                raise ValueError('整稿检查须精确覆盖四个维度，包括口播自然度')
             if any(not c.passed for c in result.checks) and not result.issues:
                 raise ValueError('未通过的整稿检查必须指出具体段落问题')
             for issue in result.issues:
@@ -204,5 +218,6 @@ def require_commentary_review(report, clip):
             or report.get('passed') is not True or report.get('issues')!=[]):
         raise ValueError('缺少当前完整稿件的连贯解说核定，不能交付')
     checks=NarrativeReview.model_validate({'checks':report.get('checks'),'issues':report['issues']}).checks
-    if len(checks)!=3 or {c.criterion for c in checks}!={'continuity','analysis','non_repetition'} or not all(c.passed for c in checks):
-        raise ValueError('整稿连贯性、分析与重复检查未完整通过')
+    if (len(checks)!=len(NARRATIVE_CRITERIA) or {c.criterion for c in checks}!=NARRATIVE_CRITERIA
+            or not all(c.passed for c in checks)):
+        raise ValueError('整稿连贯性、分析、重复与口播自然度检查未完整通过')

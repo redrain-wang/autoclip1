@@ -15,7 +15,7 @@ from .director import compact
 from .models import Beat, Clip, Plan, validate_plan
 from .util import digest, read_json, source_identity, write_json
 
-VERSION = 'planning-10'
+VERSION = 'planning-11'
 
 
 class Chapter(BaseModel):

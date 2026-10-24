@@ -88,7 +88,7 @@ def test_long_enough_but_repetitive_script_is_rejected_and_bound_to_actual_text(
         def json(self,system,prompt):
             assert '内部说明不是正文' not in prompt
             return {'checks':[{'criterion':c,'passed':c=='continuity','reason':'有顺序，但只在重复原声'}
-                for c in ['continuity','analysis','non_repetition']],
+                for c in ['continuity','analysis','non_repetition','naturalness']],
                 'issues':[{'beat':0,'quote':'他答应之后又答应','problem':'换词复述，没有解释行动的约束',
                            'direction':'用已展示的条件解释为什么答应，删除重复复述'}]}
     result=review_commentary(clip,[],cfg,Model(),tmp_path)
@@ -188,3 +188,35 @@ def test_old_narrative_approval_cannot_skip_source_timeline_review():
     report={'policy':NARRATIVE_POLICY,'passed':True,'clip_digest':digest(clip.model_dump()),'issues':[],
             'checks':[{'criterion':c,'passed':True,'reason':'旧核定'} for c in ['continuity','analysis','non_repetition']]}
     with pytest.raises(ValueError,match='不能交付'):require_commentary_review(report,clip)
+
+
+def test_naturalness_failure_blocks_otherwise_approved_long_script(tmp_path):
+    from autoclip.narrative import review_commentary, require_commentary_review, NARRATIVE_CRITERIA
+    cfg=Settings(duration_profile='long',target_seconds=1200,min_seconds=1080,max_seconds=1320)
+    clip=Clip(title='标题',angle='',hook='',beats=[Beat(mode='narration',start=i*30,end=(i+1)*30,
+        text='来意尚未说开，一个等着开口，一个掌握着谈话的节奏。',evidence_ids=[i],reason='') for i in range(4)])
+    class Model:
+        def json(self,system,prompt):
+            assert 'naturalness' in prompt and '普通动作硬拔高' in prompt
+            assert '不能因没有“字幕里说”等禁词就认定自然' in prompt
+            return {'checks':[{'criterion':c,'passed':c!='naturalness','reason':'普通请安被硬加意义' if c=='naturalness' else '通过'}
+                for c in sorted(NARRATIVE_CRITERIA)],'issues':[{'beat':0,'quote':'一个掌握着谈话的节奏',
+                    'problem':'没有具体交锋支撑这句判断','direction':'直接交代请安与来意，删除空分析'}]}
+    report=review_commentary(clip,[],cfg,Model(),tmp_path)
+    assert not report['passed']
+    with pytest.raises(ValueError,match='不能交付'):require_commentary_review(report,clip)
+
+
+@pytest.mark.parametrize('criteria',[
+    ['continuity','analysis','non_repetition'],
+    ['continuity','analysis','non_repetition','continuity'],
+])
+def test_current_approval_cannot_omit_or_replace_naturalness(criteria):
+    from autoclip.narrative import require_commentary_review,NARRATIVE_POLICY,NARRATIVE_REVIEW_POLICY
+    from autoclip.util import digest
+    clip=Clip(title='标题',angle='',hook='',beats=[Beat(mode='narration',start=i*10,end=(i+1)*10,
+        text='具体讲清已发生的事情。',evidence_ids=[i],reason='') for i in range(4)])
+    report={'policy':NARRATIVE_POLICY,'review_policy':NARRATIVE_REVIEW_POLICY,'passed':True,
+        'clip_digest':digest(clip.model_dump()),'issues':[],
+        'checks':[{'criterion':c,'passed':True,'reason':'通过'} for c in criteria]}
+    with pytest.raises(ValueError,match='未完整通过'):require_commentary_review(report,clip)

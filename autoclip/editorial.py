@@ -10,8 +10,8 @@ from .repair import RepairNeeded
 from .budget import spoken_characters
 from .util import digest, write_json
 
-VERSION = "oral-edit-18"
-AUDIENCE_STYLE_POLICY = 'audience-narration-7'
+VERSION = "oral-edit-19"
+AUDIENCE_STYLE_POLICY = 'audience-narration-8'
 WRITING_RULES = """
 剧情优先是所有新稿始终遵循的规则，优先于风格参考中的观点或分析要求。
 先讲清谁在何处、事件起因、行动、结果以及场景之间的承接，再在必要转折解释选择、压力或代价。
