@@ -129,6 +129,17 @@ def test_natural_reporting_verbs_frame_quoted_role_speech_without_allowing_bare_
     assert unframed_role_speech('他往外看了看：你先出去。')
 
 
+def test_factual_repairs_cannot_replace_natural_narration_with_audit_summary():
+    from autoclip.editorial import require_audience_timeline
+    with pytest.raises(RepairNeeded,match='制作或审查措辞'):
+        require_audience_timeline([{'mode':'narration','text':'眼下能确认的只是他当众道谢。'}])
+
+
+def test_meaningful_unknown_facts_can_still_be_said_directly():
+    from autoclip.editorial import require_audience_timeline
+    require_audience_timeline([{'mode':'narration','text':'这笔钱还没有到账，去向也没有交代。'}])
+
+
 @pytest.mark.parametrize('enabled',[False,True])
 def test_packaging_does_not_bypass_narration_policy_when_disabled(tmp_path,enabled):
     from autoclip.branding import BrandSettings,package_clip

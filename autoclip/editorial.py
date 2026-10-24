@@ -11,7 +11,7 @@ from .budget import spoken_characters
 from .util import digest, write_json
 
 VERSION = "oral-edit-20"
-AUDIENCE_STYLE_POLICY = 'audience-narration-9'
+AUDIENCE_STYLE_POLICY = 'audience-narration-10'
 WRITING_RULES = """
 剧情优先是所有新稿始终遵循的规则，优先于风格参考中的观点或分析要求。
 先讲清谁在何处、事件起因、行动、结果以及场景之间的承接，再在必要转折解释选择、压力或代价。
@@ -41,7 +41,7 @@ WRITING_RULES += DEPTH_RULES
 
 # These signals flag prose for rewriting. They are never automatically removed.
 _CLINICAL = re.compile(r"客观定论|人格结论|控诉方的推论|证据只到|证据局限|不能顺势坐实|"
-                       r"单凭[^。！？]{0,35}(?:不能|无法)断定|需进一步核实")
+                       r"单凭[^。！？]{0,35}(?:不能|无法)断定|需进一步核实|能确认的(?:只是|只有)")
 _PRODUCTION_LANGUAGE = re.compile(
     r'字幕(?:里|中|上|所|显示|写|说|提|表明|证明|明确|告诉|交代|说明|给出)|(?:根据|依据|从)(?:这段|本段|上述|这些)?字幕|'
     r'(?:镜头|画面)(?:里|中)(?:有人|有个|一个|能|可|我们|显示|出现|看到|看见|只)|'
