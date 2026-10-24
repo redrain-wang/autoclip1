@@ -200,7 +200,9 @@ def test_short_voice_gate_real_export_cache_and_reference_change(tmp_path,monkey
     count=len(reviews)
     assert produce()['clips']==2 and len(reviews)==count and len(plans)==2
     effective_cfg=cfg.model_copy(update={'identity_gate':False,'identity_registry':None,'narrative_mode':'story_first'})
+    from autoclip.automatic import IDENTITY_NAME_POLICY
     write_json(root/'voice-followup.json',{'status':'waiting_voice_confirmation','source':source,
+        'identity_name_policy':IDENTITY_NAME_POLICY,
         'library':str(library.resolve()),'library_digest':digest(bank),
         'voice_digest':digest(read_json(root/'voice-evidence.json')),
         'transcript_digest':digest([s.model_dump() for s in lines]),
@@ -285,6 +287,22 @@ def test_reference_annotation_error_never_becomes_a_human_voice_task(tmp_path,mo
     write_json(story/'automatic-review.json',report)
     assert short_voices.prepare_voice_followup(*args) is None
     assert len(calls)==1 and read_json(library)==bank
+
+
+def test_old_role_name_policy_rechecks_waiting_task_without_confirming_unknown_voice(tmp_path,monkeypatch):
+    from autoclip.automatic import IDENTITY_NAME_POLICY
+    video,library,bank,cfg,root,lines,voices,story,report,calls=followup_fixture(tmp_path,monkeypatch)
+    args=(video,lines,voices,root,cfg,library,[story])
+    task=short_voices.prepare_voice_followup(*args)
+    assert task['identity_name_policy']==IDENTITY_NAME_POLICY
+    old={k:v for k,v in task.items() if k!='identity_name_policy'}
+    write_json(root/'voice-followup.json',old)
+    assert short_voices.pending_voice_followup(video,lines,voices,root,cfg,library) is None
+    assert read_json(root/'voice-followup.json')['status']=='superseded'
+    # A fresh, genuinely unresolved task still needs the human after rechecking.
+    fresh=short_voices.prepare_voice_followup(*args)
+    assert short_voices.pending_voice_followup(video,lines,voices,root,cfg,library)==fresh
+    assert read_json(library)==bank and len(calls)==1
 
 
 @pytest.mark.parametrize('binding',['source','transcript_digest','plan_digest','voice_digest'])

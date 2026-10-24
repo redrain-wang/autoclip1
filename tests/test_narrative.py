@@ -231,6 +231,21 @@ def test_naturalness_failure_blocks_otherwise_approved_long_script(tmp_path):
     with pytest.raises(ValueError,match='不能交付'):require_commentary_review(report,clip)
 
 
+def test_listening_review_only_receives_actual_audio_not_covered_source_dialogue(tmp_path):
+    from autoclip.narrative import review_commentary,require_commentary_review,NARRATIVE_CRITERIA
+    cfg=Settings(duration_profile='long',target_seconds=1200,min_seconds=1080,max_seconds=1320)
+    clip=Clip(title='标题',angle='',hook='',beats=[Beat(mode='narration' if i==0 else 'original',
+        start=i*20,end=(i+1)*20,text='这段用自然讲述代替原片对白。' if i==0 else '',evidence_ids=[i],reason='') for i in range(4)])
+    lines=[Line(id=i,start=i*20+1,end=i*20+10,text='这句话只在被配音覆盖的素材里' if i==0 else '这是观众实际听到的原声') for i in range(4)]
+    class Model:
+        def json(self,system,prompt):
+            assert '这句话只在被配音覆盖的素材里' not in prompt
+            assert '这段用自然讲述代替原片对白。' in prompt and '这是观众实际听到的原声' in prompt
+            return {'checks':[{'criterion':c,'passed':True,'reason':'实际音轨没有重复'} for c in sorted(NARRATIVE_CRITERIA)],'issues':[]}
+    report=review_commentary(clip,lines,cfg,Model(),tmp_path)
+    require_commentary_review(report,clip)
+
+
 @pytest.mark.parametrize('criteria',[
     ['continuity','analysis','non_repetition'],
     ['continuity','analysis','non_repetition','continuity'],

@@ -113,6 +113,7 @@ def prepare_voice_followup(video, lines, voices, root, cfg, library, story_roots
     import re
     from .series import prepare_audio_candidates
     from .voice_review import ReviewStore
+    from .automatic import IDENTITY_NAME_POLICY
     from .voices import candidate_spans
     selected,requests = {},[]
     lookup = {s.id:s for s in lines}
@@ -177,6 +178,7 @@ def prepare_voice_followup(video, lines, voices, root, cfg, library, story_roots
     if manifest['baseline_library_digest']!=digest(bank):raise ValueError('新增声音批次基础库不一致')
     ReviewStore(folder)  # exports an empty local bank; only the human may name a sample
     task={'status':'waiting_voice_confirmation','review_root':str(folder.resolve()),
+          'identity_name_policy':IDENTITY_NAME_POLICY,
           'library':str(library.resolve()),'source':source_identity(video),'sample_lines':[s.id for s in chosen],
           'library_digest':digest(bank),'voice_digest':digest(voices),'transcript_digest':transcript_digest,
           'settings_digest':digest(cfg.model_dump(mode='json')),
@@ -186,9 +188,13 @@ def prepare_voice_followup(video, lines, voices, root, cfg, library, story_roots
 
 
 def pending_voice_followup(video, lines, voices, root, cfg, library):
+    from .automatic import IDENTITY_NAME_POLICY
     pointer=root/'voice-followup.json'
     if not pointer.exists():return None
     task=read_json(pointer)
+    if task.get('status')=='waiting_voice_confirmation' and task.get('identity_name_policy')!=IDENTITY_NAME_POLICY:
+        write_json(pointer,{**task,'status':'superseded','reason':'人物称谓规范策略已更新，先重新自动核验旧问题'})
+        return None
     if task.get('status')=='waiting_voice_confirmation' and task.get('review_root'):
         manifest_path=Path(task['review_root'])/'manifest.json'
         requests=read_json(manifest_path).get('automatic_gap_requests',[]) if manifest_path.is_file() else []

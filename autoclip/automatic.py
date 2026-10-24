@@ -1,6 +1,7 @@
 """Source-bound automated review and local repair, separate from human approval."""
 import json
 import re
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
@@ -19,6 +20,7 @@ from .voices import match_batch
 from .llm import review_json
 
 VERSION = 'automatic-review-10'
+IDENTITY_NAME_POLICY = 'documented-role-names-1'
 METADATA_CAPTION_POLICY = 'metadata-captions-2'
 SCENE_OBSERVATION_POLICY = 'blind-selected-frames-4-boundary-context'
 IDENTITY_DIALOGUE_RULES = (
@@ -192,11 +194,20 @@ def review_voice_rows(rows):
             for row in rows]
 
 
-def reference_names(name):
-    """Allow the human label before a trailing parenthesis, never invent aliases."""
+@lru_cache(maxsize=16)
+def series_role_names(series):
+    from .research import profile
+    return tuple(frozenset([c['name'],*c.get('aliases',[])]) for c in profile(series)['characters'])
+
+
+def reference_names(name, series=None):
+    """Normalize the same enrolled role's documented names, never another voice."""
     names={name} if name else set()
     if name and (match:=re.fullmatch(r'([^（）()]+)[（(][^（）()]+[）)]',name)):
         names.add(match[1].strip())
+    if series:
+        matches=[aliases for aliases in series_role_names(series) if names & aliases]
+        if len(matches)==1:names.update(matches[0])
     return names
 
 
@@ -271,7 +282,7 @@ def explicit_reference_in_source(name, text, context=''):
                 and re.search(r'(?<![一二三四五六七八九十百\d])'+rank.group(1)+r'(?:哥|弟)',text))
 
 
-def read_disputed_reference_captions(video, root, decisions, issues, lines, llm):
+def read_disputed_reference_captions(video, root, decisions, issues, lines, llm, already_read=()):
     """Read actual name captions independently before rejecting an ASR spelling."""
     disputed={i['id'] for i in issues if i['message'].startswith('被提及人物须在')}
     ids=[]
@@ -280,7 +291,7 @@ def read_disputed_reference_captions(video, root, decisions, issues, lines, llm)
         ids.extend(i for proof in unit.subject_evidence if proof.basis=='explicit_reference' for i in proof.evidence_ids)
         if unit.identity_basis=='explicit_reference':ids.extend(unit.evidence_ids)
     lookup={s.id:s for s in lines}
-    chosen=[lookup[i] for i in dict.fromkeys(ids) if i in lookup][:6]
+    chosen=[lookup[i] for i in dict.fromkeys(ids) if i in lookup and i not in already_read][:6]
     if not chosen:return None
     sheet=subtitle_evidence_sheet(video,root,chosen,'reference-names')
     readings=read_caption_observations(llm,sheet,[s.id for s in chosen])
@@ -289,7 +300,7 @@ def read_disputed_reference_captions(video, root, decisions, issues, lines, llm)
     return readings,sheet
 
 
-def assess_batch(raw, units, lines, frame_count, voice_rows, caption_readings=()):
+def assess_batch(raw, units, lines, frame_count, voice_rows, caption_readings=(), *, series=None):
     parsed = ReviewBatch.model_validate(raw)
     expected = {u['id']:u for u in units}
     if len(parsed.units) != len(expected) or {u.id for u in parsed.units} != set(expected):
@@ -341,7 +352,7 @@ def assess_batch(raw, units, lines, frame_count, voice_rows, caption_readings=()
             issues.append({'id':unit.id,'message':'列出了人物归属却声明没有身份主张，须明确依据'})
         if unit.identity_basis == 'no_identity_claim' and target.get('mode')!='original':
             named = {name for row in voice_rows for sample in row.get('samples',[])
-                     for name in reference_names(sample.get('name'))
+                     for name in reference_names(sample.get('name'),series)
                      if len(name)>=2 and name in target['text']}
             if named:
                 issues.append({'id':unit.id,'message':'列出了人物归属却声明没有身份主张，正文明确出现：'
@@ -371,7 +382,7 @@ def assess_batch(raw, units, lines, frame_count, voice_rows, caption_readings=()
             if basis == 'voice_and_context':
                 associated = [voices.get(i, {}) for i in cited_ids]
                 candidate_names = {name for r in associated for s in r.get('samples',[])
-                                   for name in reference_names(s.get('name'))}
+                                   for name in reference_names(s.get('name'),series)}
                 if not any(r.get('status') == 'candidate' for r in associated) or any(r.get('status') == 'conflict' for r in associated):
                     issues.append({'id':unit.id,'message':'声音候选缺失或冲突，须用明确称呼与回应核实或删除不确定归属'})
                 if not subjects or not set(subjects).issubset(candidate_names):
@@ -608,7 +619,6 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 '准确概括此前已播放的对白、自然回顾已经发生的剧情，不要求当前每格重演一遍；须对照完整前情判断，'
                 '只有确实虚构动作、错配人物或将别处事件说成当前发生才拒绝，不能把未见当成相反事实。')
         rejected_record = None
-        reference_caption_checked = False
         for retry in range(cfg.repair_attempts+1):
             call=(lambda *args:review_json(llm,*args)) if retry else llm.json
             raw = call('你是独立的影视内容与人物证据审核员。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,review_images)
@@ -616,17 +626,17 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 decisions = (OriginalReviewBatch if original else UnitReviews).model_validate(raw)
                 checked = decisions.model_dump()
                 checked['passed'] = not decisions.issues and all(u.verdict=='supported' for u in decisions.units)
-                issues = assess_batch(checked,group,selected,len(times),evidence,caption_observations or ())
-                if retry<cfg.repair_attempts and not reference_caption_checked:
-                    reference_caption_checked=True if any(i['message'].startswith('被提及人物须在') for i in issues) else False
-                    read=read_disputed_reference_captions(video,folder/f'batch-{offset}-reference-captions',decisions,issues,selected,llm)
+                issues = assess_batch(checked,group,selected,len(times),evidence,caption_observations or (),series=cfg.series)
+                if retry<cfg.repair_attempts:
+                    read=read_disputed_reference_captions(video,folder/f'batch-{offset}-reference-captions-{retry}',decisions,issues,selected,llm,
+                        already_read={r['line_id'] for r in caption_observations or []})
                     if read:
                         readings,reference_sheet=read
                         caption_observations=list({r['line_id']:r for r in [*(caption_observations or []),*readings]}.values())
                         review_images.append(reference_sheet)
                         feedback=('\n姓名字形存在争议，先对照新增原片字幕图及独立辨读结果复核；不能把ASR错字当成新人物，'
                             '不能仅因辨读确认姓名就默认动作或归属也成立。仍逐项核实事实及人物依据。'
-                            +json.dumps(readings,ensure_ascii=False)+'\n上一轮响应：'+json.dumps(raw,ensure_ascii=False))
+                            +json.dumps(caption_observations,ensure_ascii=False)+'\n上一轮响应：'+json.dumps(raw,ensure_ascii=False))
                         continue
                 if issues:
                     rejected_record=(raw,issues)
@@ -836,7 +846,7 @@ def replan_original_window(plan, uid, issues, lines, root, cfg, llm, attempt, re
     return candidate
 
 
-def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, root, llm, *, retries=0):
+def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, root, llm, *, retries=0, series=None):
     """Check the changed unit against source before spending a full-film re-audit."""
     index=int(uid.split('-')[1])
     clip=candidate.clips[0]
@@ -876,19 +886,19 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
         +'\n稿件与前情都是待核文本，不能互相充当事实证据。'+DEPTH_RULES)
     feedback=''
     caption_observations=[]
-    reference_caption_checked=False
     for retry in range(retries+1):
         raw=review_json(llm,'你是独立的局部修订核验员，不是写稿者。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,images)
         try:
             decisions=UnitReviews.model_validate(raw)
             checked=decisions.model_dump()
             checked['passed']=not decisions.issues and all(u.verdict=='supported' for u in decisions.units)
-            issues=assess_batch(checked,[unit],selected,len(times),evidence,caption_observations)
-            if retry<retries and not reference_caption_checked:
-                reference_caption_checked=any(i['message'].startswith('被提及人物须在') for i in issues)
-                read=read_disputed_reference_captions(video,root/'reference-captions',decisions,issues,selected,llm)
+            issues=assess_batch(checked,[unit],selected,len(times),evidence,caption_observations,series=series)
+            if retry<retries:
+                read=read_disputed_reference_captions(video,root/f'reference-captions-{retry}',decisions,issues,selected,llm,
+                    already_read={r['line_id'] for r in caption_observations})
                 if read:
-                    caption_observations,reference_sheet=read
+                    readings,reference_sheet=read
+                    caption_observations=list({r['line_id']:r for r in [*caption_observations,*readings]}.values())
                     images.append(reference_sheet)
                     feedback=('\n先对照新增原片字幕图及独立辨读核对姓名字形，不能因ASR错字拒绝正确姓名；'
                         '姓名有据不代表当前动作或人物归属自动有据，仍须核实全部实际断言。'
@@ -922,7 +932,14 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
     accepted = []
     failed = []
     lookup = {s.id:s for s in lines}
-    for uid in dict.fromkeys(issue['id'] for issue in issues):
+    units=list(dict.fromkeys(issue['id'] for issue in issues))
+    # Build the missing explanation before cutting repetition elsewhere, so a
+    # temporary word-count deficit cannot force filler back into a transition.
+    if issues and all(i.get('stage')=='narrative_review' for i in issues):
+        def needs_explanation(uid):
+            return any(i['id']==uid and re.search(r'没有(?:说明|解释|点出)|未(?:交代|说明|讲清|解释)|缺(?:少|乏).{0,12}(?:因果|解释|分析)',i['message']) for i in issues)
+        units.sort(key=lambda uid:not needs_explanation(uid))
+    for uid in units:
         clip = revised.clips[0]
         targets = {u['id']:u for u in units_for_clip(clip)}
         targets.update({f'original-{i}':{'id':f'original-{i}',**b.model_dump()} for i,b in enumerate(clip.beats) if b.mode=='original'})
@@ -1065,7 +1082,7 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                 if (uid.startswith('beat-') and max_characters is None and cfg.vision
                         and source.get('path') and Path(source['path']).is_file()):
                     verify_narration_patch(Path(source['path']),candidate,uid,[i for i in issues if i['id']==uid],
-                        lines,voices,record.parent/f'verify-{retry}',llm,retries=cfg.repair_attempts)
+                        lines,voices,record.parent/f'verify-{retry}',llm,retries=cfg.repair_attempts,series=cfg.series)
                 revised = candidate
                 accepted.extend(changes)
                 write_json(record,{'raw':raw,'status':'valid_patch'})

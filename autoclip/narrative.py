@@ -9,7 +9,7 @@ from .util import digest, write_json
 from .llm import review_json
 
 NARRATIVE_POLICY = 'connected-commentary-2'
-NARRATIVE_REVIEW_POLICY = 'natural-oral-3'
+NARRATIVE_REVIEW_POLICY = 'listening-only-4'
 NARRATIVE_CRITERIA = {'continuity', 'analysis', 'non_repetition', 'naturalness'}
 NATURAL_ORAL_RULES = (
     '口播像一个熟悉剧情的人把事情讲给别人听，先说具体的人做了什么、卡在哪里，再解释关键交锋。'
@@ -19,6 +19,7 @@ NATURAL_ORAL_RULES = (
     '旁白说完一个意思就往下讲，删除意思相同的段尾总结；“一个……一个……”“从……到……再到……”等整齐句式适量，不能连续套用。'
     '分析只放在真正影响人物选择或对话胜负的地方，指出具体依据，允许一句把问题讲透，不为了显得深刻反复解释。'
     '段落长短随内容变化；主要讲述可以连续展开，短转场保持简洁，不能为满足字数把已讲明的动作扩成空分析。'
+    '次要人物的短转场不必强行附会主线；原声已交代的称呼和主从关系可以自然承接，不必重复介绍背景，更不能把“叫过去”补成尚未交代的办差目的。'
     '自然不等于堆网络梗、替角色喊话、编内心独白、乱用反问或故意口吃；仍用准确、平实的第三人称。'
 )
 DEPTH_RULES = (
@@ -125,6 +126,15 @@ SOURCE_TIMELINE_RULES = (
     '不能凭记忆纠正原片顺序；方向只处理有依据的表达问题，不增加未提供的动机、人物关系或后文事实。'
 )
 
+LISTENING_RULES = (
+    'audience只包含观众实际听到的文字：original.text是保留的原声，narration.text是配音。'
+    '只按这份实际音轨检查重复，不能凭原剧记忆、画面上原有字幕或被配音覆盖的对白，声称观众已听过。'
+    '旁白转述未保留原声的剧情不是重复播放；应检查讲述是否清楚、有没有必要分析，不要求每段都作分析。'
+    '声称与原声重复时，必须在问题说明中指出audience里哪一段原声及其实际原句，不能拿旁白自己的素材依据充当原声。'
+    '同类命令或相似话语可能多次发生，结合source_start/source_end区分，不凭记忆要求调换剧情次序；'
+    '这里只编辑观众听感，事实和身份仍由独立原片核验负责。'
+)
+
 
 class EditorialPatchReview(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -165,7 +175,7 @@ def review_commentary(clip, lines, cfg, llm, root):
     if not formal_long(cfg):
         return None
     rows,source=narrative_context(clip,lines)
-    prompt=(DEPTH_RULES+SOURCE_TIMELINE_RULES+'\n审核整片最终听感，不写稿，不重新认人，不替代原片事实核对。'
+    prompt=(DEPTH_RULES+LISTENING_RULES+'\n审核整片最终听感，不写稿，不重新认人，不替代原片事实核对。'
         '按continuity、analysis、non_repetition、naturalness四个维度分别给结论，每项恰好一次。'
         'continuity检查主线是否连贯、相邻段是否真正推进，而非每两句重起话头。'
         'analysis检查主要冲突是否解释处境、行动依据、约束或代价，而非把动作复述包装成分析；'
@@ -180,8 +190,7 @@ def review_commentary(clip, lines, cfg, llm, root):
         '没有问题则issues为空；任一维度未通过，必须给出具体问题，不能只给泛泛评价。'
         '\n原声text为机器转写，仅用于理解节目结构；疑似同音字不在这里当作事实错误。'
         '\n格式'+json.dumps(NarrativeReview.model_json_schema(),ensure_ascii=False)
-        +'\naudience='+json.dumps(rows,ensure_ascii=False)
-        +'\nsource_context='+json.dumps(source,ensure_ascii=False))
+        +'\naudience='+json.dumps(rows,ensure_ascii=False))
     folder=root/'narrative-review'/digest({'policy':NARRATIVE_POLICY,'review_policy':NARRATIVE_REVIEW_POLICY,
         'clip':clip.model_dump(),'rows':rows,'source':source})
     feedback=''

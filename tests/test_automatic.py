@@ -89,6 +89,20 @@ def test_imperial_family_context_can_come_from_other_cited_dialogue_but_rank_can
     assert not explicit_reference_in_source('胤禩','户部是八哥奉旨该管','回皇阿玛，儿臣查了库存')
 
 
+@pytest.mark.parametrize('series,candidate,supported',[
+    ('雍正王朝','四爷（雍正）',True),
+    ('其他电视剧','四爷（雍正）',False),
+    (None,'四爷（雍正）',False),
+    ('雍正王朝','八爷（八阿哥）',False),
+])
+def test_documented_role_names_match_only_the_same_enrolled_voice_in_the_same_series(series,candidate,supported):
+    raw,units,lines,count,voices=review_fixture()
+    units[0]['text']='四阿哥把查到的情况禀报上来。'
+    raw['units'][0].update(identity_basis='voice_and_context',subjects=['四阿哥'],evidence_ids=[1])
+    voices=[{'line_id':1,'status':'candidate','samples':[{'name':candidate}]}]
+    assert bool(assess_batch(raw,units,lines,count,voices,series=series)) is not supported
+
+
 @pytest.mark.parametrize('reading,supported',[('田文镜，请穿官服。',True),('田文静，请穿官服。',False),('',False)])
 def test_independent_caption_spelling_checks_reference_without_changing_asr(reading,supported):
     raw,units,lines,count,voices=review_fixture()
@@ -129,7 +143,34 @@ def test_patch_verifier_reads_actual_name_caption_then_still_requires_semantic_a
         with pytest.raises(ValueError,match='局部修订仍未解决'):module.verify_narration_patch(*args,retries=1)
     assert model.calls==2 and lines[0].text=='田文静，请穿官服。'
     assert read_json(tmp_path/'verification.json')['passed'] is resolved
-    assert read_json(tmp_path/'reference-captions/readings.json')['image_sha256']
+    assert read_json(tmp_path/'reference-captions-0/readings.json')['image_sha256']
+
+
+def test_caption_rechecks_can_resolve_a_second_name_without_losing_the_first(tmp_path,monkeypatch):
+    import autoclip.automatic as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'actual source captions')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    read_ids=[]
+    def read(llm,image,ids):
+        read_ids.append(ids)
+        return [{'line_id':i,'text':('甲先生，请坐。' if i==0 else '乙先生，请坐。')} for i in ids]
+    monkeypatch.setattr(module,'read_caption_observations',read)
+    plan=sample_plan();plan.clips[0].beats[0].text='甲先生和乙先生都被叫到名字。'
+    lines=[Line(id=0,start=1,end=2,text='甲先森，请坐。'),Line(id=1,start=3,end=4,text='乙先森，请坐。')]
+    class Model:
+        calls=0
+        def json(self,system,prompt,images):
+            self.calls+=1
+            names=['甲先生'] if self.calls==1 else ['甲先生','乙先生']
+            if self.calls==3:assert '甲先生，请坐。' in prompt and '乙先生，请坐。' in prompt
+            return {'issues':[],'units':[{'id':'beat-0','verdict':'supported','reason':'字形与提及相符',
+                'evidence_ids':list(range(len(names))),'frame_ids':[0],'identity_basis':'mixed','subjects':names,
+                'subject_evidence':[{'subject':n,'basis':'explicit_reference','evidence_ids':[i],'reason':'原片点名'} for i,n in enumerate(names)]}]}
+    model=Model()
+    module.verify_narration_patch(video,plan,'beat-0',[],lines,{'lines':[]},tmp_path,model,retries=2)
+    assert model.calls==3 and read_ids==[[0],[1]]
 
 
 @pytest.mark.parametrize('case',['valid','borrowed_voice','missing_person','outside_scope','one_sided_address','summary_label','missing_summary_id','future_id'])
@@ -1291,3 +1332,24 @@ def test_failed_long_narration_can_keep_source_only_with_safe_cuts_and_enough_re
         assert '仍须重新测时' in changed.reason
         assert all(a==b for i,(a,b) in enumerate(zip(result.clips[0].beats,plan.clips[0].beats)) if i!=3)
     assert plan.model_dump()==before
+
+
+def test_editor_fills_missing_explanation_before_removing_repetition_near_global_minimum(tmp_path,monkeypatch):
+    import json
+    import autoclip.automatic as module
+    cfg=Settings(duration_profile='long',target_seconds=1200,min_seconds=1080,max_seconds=1320,vision=False)
+    beats=[Beat(mode='original' if i%2==0 else 'narration',start=i*40,end=(i+1)*40,
+        text='' if i%2==0 else '事'*90,evidence_ids=[i],reason='') for i in range(40)]
+    plan=Plan(episode_summary='',genre='',style='',clips=[Clip(title='具体冲突',angle='',hook='',beats=beats)])
+    issues=[{'id':f'beat-{i}','stage':'narrative_review','text_digest':digest(beats[i].text),'message':message}
+        for i,message in [(1,'删去重复复述'),(3,'没有说明行动依据，需要用已有事实解释选择')]]
+    monkeypatch.setattr(module,'verify_editorial_patch',lambda *a:None)
+    order=[]
+    class Model:
+        def json(self,system,prompt):
+            target=json.JSONDecoder().raw_decode(prompt.split('\ntarget=',1)[1])[0]
+            order.append(target['id'])
+            return {'changes':[{'id':target['id'],'text':'事'*(110 if target['id']=='beat-3' else 80)}]}
+    revised=module.repair_plan(plan,issues,[],{},tmp_path,cfg,Model(),0)
+    assert order==['beat-3','beat-1']
+    assert module.require_commentary(revised.clips[0],cfg)['narration_chars']==1810
