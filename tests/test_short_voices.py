@@ -266,13 +266,17 @@ def test_automatic_voice_followup_is_anonymous_cached_and_only_selects_identity_
     assert short_voices.pending_voice_followup(video,lines,voices,root,cfg.model_copy(update={'target_seconds':180}),library) is None
 
 
-def test_reference_annotation_error_never_becomes_a_human_voice_task(tmp_path,monkeypatch):
+@pytest.mark.parametrize('message',[
+    '被提及人物须在所引对白及当前稿中明确出现，不能靠未引用的声音候选补出身份',
+    '“他们看到的是乱子不是机会”是替人物编造的内心判断，实际对白没有这些内容。',
+    '旁白超出本段区间，替人物编造尚未说出的判断，应删除或后移超前推断。',
+])
+def test_reference_annotation_error_never_becomes_a_human_voice_task(tmp_path,monkeypatch,message):
     video,library,bank,cfg,root,lines,voices,story,report,calls=followup_fixture(tmp_path,monkeypatch)
     args=(video,lines,voices,root,cfg,library,[story])
     task=short_voices.prepare_voice_followup(*args)
     manifest_path=Path(task['review_root'])/'manifest.json'
     manifest=read_json(manifest_path)
-    message='被提及人物须在所引对白及当前稿中明确出现，不能靠未引用的声音候选补出身份'
     manifest['automatic_gap_requests']=[{'unit':'beat-1','reason':message,'line_ids':[1]}]
     write_json(manifest_path,manifest)
     assert short_voices.pending_voice_followup(video,lines,voices,root,cfg,library) is None

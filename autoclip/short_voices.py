@@ -98,6 +98,15 @@ def apply_confirmed_followups(output, library, series):
                             'library_digest':digest(combined)})
 
 
+def needs_voice_confirmation(message):
+    """A claim about a character's motives is not missing speaker evidence."""
+    import re
+    if message.startswith('被提及人物须在'):
+        return False
+    return bool(re.search(r'声纹|声音(?:候选|依据|缺失|冲突|匹配|不足)|身份|说话人|'
+                          r'人物(?:归属|依据|不明|不清|无法|不能)|主语(?:身份|归属|指向|不明)',message))
+
+
 def prepare_voice_followup(video, lines, voices, root, cfg, library, story_roots,
                            model_path=None, voice_python=None):
     """Collect only unresolved identity evidence; never prefill character names."""
@@ -133,10 +142,8 @@ def prepare_voice_followup(video, lines, voices, root, cfg, library, story_roots
                 or report.get('plan_digest')!=digest(plan.model_dump()) or report.get('voice_digest')!=digest(voices)):
             continue
         for issue in report.get('issues',[]):
-            if issue['message'].startswith('被提及人物须在'):
-                continue  # A reference/citation annotation cannot be fixed by enrolling a voice.
             match = re.fullmatch(r'beat-(\d+)',issue['id'])
-            if not match or not re.search(r'声音|身份|人物|主语|说话人',issue['message']):continue
+            if not match or not needs_voice_confirmation(issue['message']):continue
             index=int(match[1])
             if index>=len(plan.clips[0].beats):continue
             beat=plan.clips[0].beats[index]
@@ -185,8 +192,8 @@ def pending_voice_followup(video, lines, voices, root, cfg, library):
     if task.get('status')=='waiting_voice_confirmation' and task.get('review_root'):
         manifest_path=Path(task['review_root'])/'manifest.json'
         requests=read_json(manifest_path).get('automatic_gap_requests',[]) if manifest_path.is_file() else []
-        if requests and all(r.get('reason','').startswith('被提及人物须在') for r in requests):
-            write_json(pointer,{**task,'status':'superseded','reason':'仅被提及者的引用校验问题，先继续自动核验，不要求新增声纹'})
+        if requests and all(not needs_voice_confirmation(r.get('reason','')) for r in requests):
+            write_json(pointer,{**task,'status':'superseded','reason':'事实、表达或被提及者引用问题，先继续自动核验，不要求新增声纹'})
             return None
     if (task.get('status')=='waiting_voice_confirmation' and task.get('source')==source_identity(video)
             and task.get('library')==str(library.resolve()) and task.get('library_digest')==digest(read_json(library))
