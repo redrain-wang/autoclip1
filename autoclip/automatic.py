@@ -11,7 +11,7 @@ from .identity import units_for_clip, file_hash
 from .editorial import audience_script, prose_signals, require_oral_style, WRITING_RULES
 from .ingest import contact_sheet, subtitle_evidence_sheet
 from .titles import TITLE_POLICY, TITLE_RULES, title_repair_prompt, title_changes, title_issues
-from .narrative import DEPTH_RULES, formal_long, require_paragraph_preserved, editorial_repair, require_commentary
+from .narrative import DEPTH_RULES, formal_long, require_paragraph_preserved, editorial_repair, require_commentary, verify_editorial_patch
 from .models import Plan, Beat, validate_plan, evidence_matches
 from .repair import RepairNeeded
 from .util import digest, read_json, source_identity, write_json
@@ -972,6 +972,8 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                         raise ValueError('当前旁白仍混入制作或审查话术，不能进入配音：'+json.dumps(signals,ensure_ascii=False))
                 if max_characters is not None and spoken_characters(candidate.clips[0].beats[int(uid.split('-')[1])].text)>max_characters:
                     raise ValueError(f'实测时长修复没有落实缩写：当前口播必须不超过{max_characters}个有效字')
+                if condense and uid.startswith('beat-'):
+                    verify_editorial_patch(candidate.clips[0],int(uid.split('-')[1]),target_issues,lines,llm,record.parent/f'verify-{retry}')
                 if source_seconds is not None:
                     validate_plan(candidate,lines,source_seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
                     for index,b in enumerate(candidate.clips[0].beats):

@@ -9,6 +9,7 @@ from .util import digest, write_json
 from .llm import review_json
 
 NARRATIVE_POLICY = 'connected-commentary-1'
+NARRATIVE_REVIEW_POLICY = 'source-timeline-2'
 DEPTH_RULES = (
     '剧情优先不是只复述动作或用两句过场话串原声。先按章节构成连贯讲述，再分配到镜头。'
     '主要冲突必须讲清处境、行动依据、可选择的做法与约束、眼前后果；不要求每个短转场分析。'
@@ -92,16 +93,68 @@ class NarrativeReview(BaseModel):
     issues: list[NarrativeFinding]
 
 
+def narrative_context(clip, lines):
+    audience=[]
+    source=[]
+    for index,beat in enumerate(clip.beats):
+        selected=[s for s in lines if s.start<beat.end and s.end>beat.start]
+        audience.append({'beat':index,'mode':beat.mode,'source_start':beat.start,'source_end':beat.end,
+            'text':beat.text if beat.mode=='narration' else ' '.join(s.text for s in selected)})
+        if beat.mode=='narration':
+            source.append({'beat':index,'dialogue':[{'id':s.id,'start':s.start,'end':s.end,'asr_text':s.text}
+                for s in lines if s in selected or s.id in beat.evidence_ids]})
+    return audience,source
+
+
+SOURCE_TIMELINE_RULES = (
+    'audience是观众实际听到的内容；source_context是旁白区间对应的原片对白，仅供核对事件顺序，'
+    '不代表观众又听了一遍这些对白，不能把source_context本身当作旁白重复原声。'
+    '旁白可以讲述其覆盖的原片事件，再接后面的原声；不是所有事件都必须先放原声才可解说。'
+    '同类台词或命令可能多次出现，必须按原片时间分别识别，不能把第二次误当成唯一一次。'
+    '不能凭记忆纠正原片顺序；方向只处理有依据的表达问题，不增加未提供的动机、人物关系或后文事实。'
+)
+
+
+class EditorialPatchReview(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    resolved: StrictBool
+    reason: str = Field(min_length=1)
+    remaining_quote: str
+
+
+def verify_editorial_patch(clip, index, issues, lines, llm, root):
+    """A factually valid edit must also address its whole-script editorial finding."""
+    audience,source=narrative_context(clip,lines)
+    context=[r for r in audience if abs(r['beat']-index)<=3]
+    prompt=(DEPTH_RULES+SOURCE_TIMELINE_RULES+
+        '只核对本次target段是否解决给定整稿编辑问题，不重新认人、不宣布全片合格。'
+        '若要求去重，换词缩写但仍逐句预告或复述相邻原声，仍未解决；保留必要一句提示可以。'
+        '若要求衔接，必须实际交代切换关系；字数长短不能代替判断。'
+        '编辑意见也可能误读原片顺序，须对照source_context；不能为迎合错误意见而重排真实事件。'
+        'resolved=false时remaining_quote必须逐字引用当前target仍有问题的原句；'
+        'resolved=true时remaining_quote必须为空。只核当前修订，不复制已被删除的旧句。'
+        '\n格式'+json.dumps(EditorialPatchReview.model_json_schema(),ensure_ascii=False)
+        +'\ntarget='+json.dumps(audience[index],ensure_ascii=False)
+        +'\neditorial_findings='+json.dumps(issues,ensure_ascii=False)
+        +'\naudience='+json.dumps(context,ensure_ascii=False)
+        +'\nsource_context='+json.dumps([r for r in source if r['beat']==index],ensure_ascii=False))
+    raw=review_json(llm,'你是局部整稿编辑，核对修订是否真正解决重复、衔接或分析问题。',prompt)
+    result=EditorialPatchReview.model_validate(raw)
+    if ((result.resolved and result.remaining_quote) or
+            (not result.resolved and (not result.remaining_quote or result.remaining_quote not in clip.beats[index].text))):
+        raise ValueError('整稿修订核验须引用当前问题原句，不能沿用旧稿或虚构引用')
+    write_json(root/'editorial-verification.json',{'policy':NARRATIVE_REVIEW_POLICY,
+        'clip_digest':digest(clip.model_dump()),'beat':index,**result.model_dump()})
+    if not result.resolved:
+        raise ValueError('整稿修订仍未落实：'+result.reason+'；当前原句：'+result.remaining_quote)
+
+
 def review_commentary(clip, lines, cfg, llm, root):
     """Check the final listening experience, including all factual/timing repairs."""
     if not formal_long(cfg):
         return None
-    rows=[]
-    for index,beat in enumerate(clip.beats):
-        text=(beat.text if beat.mode=='narration' else
-              ' '.join(s.text for s in lines if s.start<beat.end and s.end>beat.start))
-        rows.append({'beat':index,'mode':beat.mode,'text':text})
-    prompt=(DEPTH_RULES+'\n审核整片最终听感，不写稿，不重新认人，不替代原片事实核对。'
+    rows,source=narrative_context(clip,lines)
+    prompt=(DEPTH_RULES+SOURCE_TIMELINE_RULES+'\n审核整片最终听感，不写稿，不重新认人，不替代原片事实核对。'
         '按continuity、analysis、non_repetition三个维度分别给结论，每项恰好一次。'
         'continuity检查主线是否连贯、相邻段是否真正推进，而非每两句重起话头。'
         'analysis检查主要冲突是否解释处境、行动依据、约束或代价，而非把动作复述包装成分析；'
@@ -113,8 +166,10 @@ def review_commentary(clip, lines, cfg, llm, root):
         '没有问题则issues为空；任一维度未通过，必须给出具体问题，不能只给泛泛评价。'
         '\n原声text为机器转写，仅用于理解节目结构；疑似同音字不在这里当作事实错误。'
         '\n格式'+json.dumps(NarrativeReview.model_json_schema(),ensure_ascii=False)
-        +'\n观众实际听到的顺序='+json.dumps(rows,ensure_ascii=False))
-    folder=root/'narrative-review'/digest({'policy':NARRATIVE_POLICY,'clip':clip.model_dump(),'rows':rows})
+        +'\naudience='+json.dumps(rows,ensure_ascii=False)
+        +'\nsource_context='+json.dumps(source,ensure_ascii=False))
+    folder=root/'narrative-review'/digest({'policy':NARRATIVE_POLICY,'review_policy':NARRATIVE_REVIEW_POLICY,
+        'clip':clip.model_dump(),'rows':rows,'source':source})
     feedback=''
     for attempt in range(cfg.repair_attempts+1):
         raw=review_json(llm,'你是影视深度解说的整稿编辑，检查连贯性与分析质量。',prompt+feedback)
@@ -134,7 +189,7 @@ def review_commentary(clip, lines, cfg, llm, root):
         except ValueError as exc:
             if attempt==cfg.repair_attempts:raise
             feedback='\n上轮格式或引用无效：'+str(exc)+'。重核实际稿件，不修改或放行存疑内容。'
-    report={'policy':NARRATIVE_POLICY,'clip_digest':digest(clip.model_dump()),
+    report={'policy':NARRATIVE_POLICY,'review_policy':NARRATIVE_REVIEW_POLICY,'clip_digest':digest(clip.model_dump()),
             'passed':not result.issues and all(c.passed for c in result.checks),
             **result.model_dump()}
     write_json(folder/'report.json',report)
@@ -144,6 +199,7 @@ def review_commentary(clip, lines, cfg, llm, root):
 
 def require_commentary_review(report, clip):
     if (not isinstance(report,dict) or report.get('policy')!=NARRATIVE_POLICY
+            or report.get('review_policy')!=NARRATIVE_REVIEW_POLICY
             or report.get('clip_digest')!=digest(clip.model_dump())
             or report.get('passed') is not True or report.get('issues')!=[]):
         raise ValueError('缺少当前完整稿件的连贯解说核定，不能交付')

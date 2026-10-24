@@ -141,3 +141,50 @@ def test_editorial_condensation_still_cannot_turn_whole_film_into_bridges():
     clip=Clip(title='标题',angle='',hook='',beats=[Beat(mode='narration',start=i*40,end=(i+1)*40,
         text=after,evidence_ids=[i],reason='') for i in range(20)])
     with pytest.raises(ValueError,match='碎片过场'):require_commentary(clip,cfg)
+
+
+def test_narrative_context_distinguishes_two_commands_and_dubbed_dialogue():
+    from autoclip.narrative import narrative_context
+    clip=Clip(title='标题',angle='',hook='',beats=[
+        Beat(mode='narration',start=0,end=20,text='第一次命令被拦住，随后开始追问。',evidence_ids=[1,2],reason='不展示内部说明'),
+        Beat(mode='original',start=20,end=30,text='',evidence_ids=[3],reason=''),
+        *[Beat(mode='original',start=i*10,end=(i+1)*10,text='',evidence_ids=[i+1],reason='') for i in (3,4)]])
+    lines=[Line(id=1,start=1,end=3,text='拿下'),Line(id=2,start=10,end=15,text='请回答从何得知'),
+           Line(id=3,start=22,end=25,text='还不拿下')]
+    heard,source=narrative_context(clip,lines)
+    assert heard[0]['text']==clip.beats[0].text and heard[1]['text']=='还不拿下'
+    assert [r['id'] for r in source[0]['dialogue']]==[1,2]
+    assert source[0]['dialogue'][0]['start']<heard[1]['source_start']
+    assert len(source)==1 and 'reason' not in heard[0]
+
+
+@pytest.mark.parametrize('resolved',[False,True])
+def test_editorial_patch_cannot_pass_by_merely_rephrasing_repeated_dialogue(tmp_path,resolved):
+    import json
+    from autoclip.narrative import verify_editorial_patch
+    clip=Clip(title='标题',angle='',hook='',beats=[
+        Beat(mode='narration',start=0,end=10,text='他命人赶快拿下。',evidence_ids=[1],reason=''),
+        Beat(mode='original',start=10,end=20,text='',evidence_ids=[2],reason=''),
+        *[Beat(mode='original',start=i*10,end=(i+1)*10,text='',evidence_ids=[i+1],reason='') for i in (2,3)]])
+    lines=[Line(id=1,start=1,end=3,text='拿下'),Line(id=2,start=11,end=13,text='还不拿下')]
+    class Model:
+        def json(self,system,prompt):
+            actual=json.JSONDecoder().raw_decode(prompt.split('\naudience=',1)[1])[0]
+            source=json.JSONDecoder().raw_decode(prompt.split('\nsource_context=',1)[1])[0]
+            assert actual[1]['text']=='还不拿下' and source[0]['dialogue'][0]['asr_text']=='拿下'
+            return {'resolved':resolved,'reason':'已区分两次命令' if resolved else '仍然逐句预告原声',
+                    'remaining_quote':'' if resolved else '他命人赶快拿下'}
+    args=(clip,0,[{'message':'删去重复'}],lines,Model(),tmp_path)
+    if resolved:verify_editorial_patch(*args)
+    else:
+        with pytest.raises(ValueError,match='仍未落实'):verify_editorial_patch(*args)
+    assert json.loads((tmp_path/'editorial-verification.json').read_text())['resolved'] is resolved
+
+
+def test_old_narrative_approval_cannot_skip_source_timeline_review():
+    from autoclip.narrative import require_commentary_review,NARRATIVE_POLICY
+    from autoclip.util import digest
+    clip=Clip(title='标题',angle='',hook='',beats=[Beat(mode='narration',start=i*10,end=(i+1)*10,text='讲述',evidence_ids=[i+1],reason='') for i in range(4)])
+    report={'policy':NARRATIVE_POLICY,'passed':True,'clip_digest':digest(clip.model_dump()),'issues':[],
+            'checks':[{'criterion':c,'passed':True,'reason':'旧核定'} for c in ['continuity','analysis','non_repetition']]}
+    with pytest.raises(ValueError,match='不能交付'):require_commentary_review(report,clip)

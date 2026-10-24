@@ -21,7 +21,7 @@ from .models import Line, Plan, validate_plan
 from .outline import compose_outline
 from .planning import VERSION as PLANNING_VERSION, plan_outline
 from .render import render_clip, VERSION as RENDER_VERSION
-from .narrative import NARRATIVE_POLICY, require_commentary, review_commentary, require_commentary_review, formal_long
+from .narrative import NARRATIVE_POLICY, NARRATIVE_REVIEW_POLICY, require_commentary, review_commentary, require_commentary_review, formal_long
 from .report import build_report
 from .research import prepare_research
 from .sample import measure_sample_plan
@@ -401,7 +401,7 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
             return {'plan':plan.model_dump(),'report':report},[root/'plan-approved.json',root/'automatic-review.json',*[Path(f['path']) for f in report['frames']]]
         approved = checkpoint(root,'approval',{'inputs':inputs,'draft':draft,'voices':voices,'review_version':REVIEW_VERSION,
             'scene_observation_policy':SCENE_OBSERVATION_POLICY,'title_policy':TITLE_POLICY,'narrative_policy':NARRATIVE_POLICY,
-            'whole_script_review':'whole-script-1',
+            'whole_script_review':NARRATIVE_REVIEW_POLICY,
             'audience_style_policy':AUDIENCE_STYLE_POLICY},approve_action)
         plan = Plan.model_validate(approved['plan'])
         assert_approval(approved['report'],video,plan,lines,voices)
