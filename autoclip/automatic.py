@@ -374,7 +374,7 @@ def assess_batch(raw, units, lines, frame_count, voice_rows, caption_readings=()
                 cited_text=' '.join(caption_text.get(i,lookup[i].text) for i in cited_ids)
                 context=' '.join(caption_text.get(i,lookup[i].text) for i in unit.evidence_ids)
                 missing=[name for name in subjects if len(name)<2 or not explicit_reference_in_source(name,cited_text,context)
-                         or name not in target['text']]
+                         or not explicit_reference_in_source(name,target['text'],context)]
                 if not subjects or missing:
                     issues.append({'id':unit.id,'message':'被提及人物须在所引对白及当前稿中明确出现，不能靠未引用的声音候选补出身份；'
                         '本次未满足的subjects='+json.dumps(missing or subjects,ensure_ascii=False)

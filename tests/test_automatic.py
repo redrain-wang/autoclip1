@@ -89,6 +89,20 @@ def test_imperial_family_context_can_come_from_other_cited_dialogue_but_rank_can
     assert not explicit_reference_in_source('胤禩','户部是八哥奉旨该管','回皇阿玛，儿臣查了库存')
 
 
+@pytest.mark.parametrize('target,name,supported',[
+    ('十阿哥说户部是八哥管，四阿哥承认是八弟管。','八阿哥',True),
+    ('有人说户部由八哥管。','八爷',True),
+    ('有人说户部由十八哥管。','八阿哥',False),
+    ('有人说户部由别人管。','八阿哥',False),
+    ('有人说户部由八哥管。','胤禩',False),
+])
+def test_canonical_referenced_title_can_match_the_same_rank_in_narration_without_renaming_it(target,name,supported):
+    raw,units,lines,count,voices=review_fixture()
+    units[0]['text']=target;lines[0].text='皇阿玛，户部是八哥奉旨该管。'
+    raw['units'][0].update(identity_basis='explicit_reference',subjects=[name],evidence_ids=[1])
+    assert bool(assess_batch(raw,units,lines,count,voices)) is not supported
+
+
 @pytest.mark.parametrize('series,candidate,supported',[
     ('雍正王朝','四爷（雍正）',True),
     ('其他电视剧','四爷（雍正）',False),
