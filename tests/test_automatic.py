@@ -67,6 +67,28 @@ def test_reported_name_does_not_require_identifying_the_unknown_speaker(invalid)
     assert bool(issues) is invalid
 
 
+@pytest.mark.parametrize('spoken,name,supported',[
+    ('皇阿玛，户部是八哥奉旨该管。','八阿哥',True),
+    ('皇阿玛，户部是八弟该管。','八爷',True),
+    ('户部是八哥管。','八阿哥',False),
+    ('皇阿玛，是十八哥管。','八阿哥',False),
+    ('皇阿玛，户部是八哥管。','胤禩',False),
+    ('皇阿玛，户部由别人管。','八阿哥',False),
+])
+def test_imperial_sibling_reference_requires_actual_rank_and_family_context(spoken,name,supported):
+    raw,units,lines,count,voices=review_fixture()
+    units[0]['text']=name+'奉旨管户部。';lines[0].text=spoken
+    raw['units'][0].update(identity_basis='explicit_reference',subjects=[name],evidence_ids=[1])
+    assert bool(assess_batch(raw,units,lines,count,voices)) is not supported
+
+
+def test_imperial_family_context_can_come_from_other_cited_dialogue_but_rank_cannot():
+    from autoclip.automatic import explicit_reference_in_source
+    assert explicit_reference_in_source('八阿哥','户部是八哥奉旨该管','回皇阿玛，儿臣查了库存')
+    assert not explicit_reference_in_source('八阿哥','户部由别人管','皇阿玛，八哥说过此事')
+    assert not explicit_reference_in_source('胤禩','户部是八哥奉旨该管','回皇阿玛，儿臣查了库存')
+
+
 @pytest.mark.parametrize('case',['valid','borrowed_voice','missing_person','outside_scope','one_sided_address','summary_label','missing_summary_id','future_id'])
 def test_each_person_can_use_distinct_identity_evidence_without_borrowing_anothers_voice(case):
     raw,units,lines,count,voices=review_fixture()

@@ -261,6 +261,16 @@ def required_note_repairs(notes, units):
     return issues
 
 
+def explicit_reference_in_source(name, text, context=''):
+    if name in text:
+        return True
+    # Imperial siblings call the same ranked prince “八哥/八弟”. This only
+    # recognizes the title; it cannot infer a personal name or a speaker.
+    rank=re.fullmatch(r'([一二三四五六七八九十]+)(?:阿哥|爷)',name)
+    return bool(rank and re.search(r'皇阿玛|皇父|皇额娘',text+' '+context)
+                and re.search(r'(?<![一二三四五六七八九十百\d])'+rank.group(1)+r'(?:哥|弟)',text))
+
+
 def assess_batch(raw, units, lines, frame_count, voice_rows):
     parsed = ReviewBatch.model_validate(raw)
     expected = {u['id']:u for u in units}
@@ -330,7 +340,9 @@ def assess_batch(raw, units, lines, frame_count, voice_rows):
                 issues.append({'id':unit.id,'message':'明确称呼与回应需至少两条不同证据'})
             if basis == 'explicit_reference':
                 cited_text=' '.join(lookup[i].text for i in cited_ids)
-                missing=[name for name in subjects if len(name)<2 or name not in cited_text or name not in target['text']]
+                context=' '.join(lookup[i].text for i in unit.evidence_ids)
+                missing=[name for name in subjects if len(name)<2 or not explicit_reference_in_source(name,cited_text,context)
+                         or name not in target['text']]
                 if not subjects or missing:
                     issues.append({'id':unit.id,'message':'被提及人物须在所引对白及当前稿中明确出现，不能靠未引用的声音候选补出身份；'
                         '本次未满足的subjects='+json.dumps(missing or subjects,ensure_ascii=False)
