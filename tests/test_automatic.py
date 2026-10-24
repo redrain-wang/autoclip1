@@ -89,6 +89,49 @@ def test_imperial_family_context_can_come_from_other_cited_dialogue_but_rank_can
     assert not explicit_reference_in_source('胤禩','户部是八哥奉旨该管','回皇阿玛，儿臣查了库存')
 
 
+@pytest.mark.parametrize('reading,supported',[('田文镜，请穿官服。',True),('田文静，请穿官服。',False),('',False)])
+def test_independent_caption_spelling_checks_reference_without_changing_asr(reading,supported):
+    raw,units,lines,count,voices=review_fixture()
+    units[0]['text']='对方叫出田文镜的名字。';lines[0].text='田文静，请穿官服。'
+    raw['units'][0].update(identity_basis='explicit_reference',subjects=['田文镜'],evidence_ids=[1])
+    assert assess_batch(raw,units,lines,count,voices)
+    assert bool(assess_batch(raw,units,lines,count,voices,[{'line_id':1,'text':reading}])) is not supported
+    assert lines[0].text=='田文静，请穿官服。'
+    with pytest.raises(ValueError,match='未提供的编号'):
+        assess_batch(raw,units,lines,count,voices,[{'line_id':99,'text':'田文镜'}])
+
+
+@pytest.mark.parametrize('resolved',[True,False])
+def test_patch_verifier_reads_actual_name_caption_then_still_requires_semantic_approval(tmp_path,monkeypatch,resolved):
+    import autoclip.automatic as module
+    from autoclip.util import read_json
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'actual pixels')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    def read(llm,image,ids):
+        assert ids==[0] and image==frame
+        return [{'line_id':0,'text':'田文镜，请穿官服。'}]
+    monkeypatch.setattr(module,'read_caption_observations',read)
+    plan=sample_plan();plan.clips[0].beats[0].text='对方叫出田文镜的名字。'
+    lines=[Line(id=0,start=1,end=3,text='田文静，请穿官服。')]
+    class Model:
+        calls=0
+        def json(self,system,prompt,images):
+            self.calls+=1
+            if self.calls>1:assert '独立辨读' in prompt and '田文镜，请穿官服。' in prompt
+            return {'units':[{'id':'beat-0','verdict':'supported' if self.calls==1 or resolved else 'contradicted',
+                'reason':'字形已辨读' if resolved else '姓名有据但其他动作无据','evidence_ids':[0],'frame_ids':[0],
+                'identity_basis':'explicit_reference','subjects':['田文镜']}],'issues':[]}
+    model=Model();args=(video,plan,'beat-0',[],lines,{'lines':[]},tmp_path,model)
+    if resolved:module.verify_narration_patch(*args,retries=1)
+    else:
+        with pytest.raises(ValueError,match='局部修订仍未解决'):module.verify_narration_patch(*args,retries=1)
+    assert model.calls==2 and lines[0].text=='田文静，请穿官服。'
+    assert read_json(tmp_path/'verification.json')['passed'] is resolved
+    assert read_json(tmp_path/'reference-captions/readings.json')['image_sha256']
+
+
 @pytest.mark.parametrize('case',['valid','borrowed_voice','missing_person','outside_scope','one_sided_address','summary_label','missing_summary_id','future_id'])
 def test_each_person_can_use_distinct_identity_evidence_without_borrowing_anothers_voice(case):
     raw,units,lines,count,voices=review_fixture()

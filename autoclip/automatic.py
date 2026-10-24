@@ -271,12 +271,33 @@ def explicit_reference_in_source(name, text, context=''):
                 and re.search(r'(?<![一二三四五六七八九十百\d])'+rank.group(1)+r'(?:哥|弟)',text))
 
 
-def assess_batch(raw, units, lines, frame_count, voice_rows):
+def read_disputed_reference_captions(video, root, decisions, issues, lines, llm):
+    """Read actual name captions independently before rejecting an ASR spelling."""
+    disputed={i['id'] for i in issues if i['message'].startswith('被提及人物须在')}
+    ids=[]
+    for unit in decisions.units:
+        if unit.id not in disputed:continue
+        ids.extend(i for proof in unit.subject_evidence if proof.basis=='explicit_reference' for i in proof.evidence_ids)
+        if unit.identity_basis=='explicit_reference':ids.extend(unit.evidence_ids)
+    lookup={s.id:s for s in lines}
+    chosen=[lookup[i] for i in dict.fromkeys(ids) if i in lookup][:6]
+    if not chosen:return None
+    sheet=subtitle_evidence_sheet(video,root,chosen,'reference-names')
+    readings=read_caption_observations(llm,sheet,[s.id for s in chosen])
+    write_json(root/'readings.json',{'policy':'independent-reference-caption-1','readings':readings,
+        'image':str(sheet.resolve()),'image_sha256':file_hash(sheet)})
+    return readings,sheet
+
+
+def assess_batch(raw, units, lines, frame_count, voice_rows, caption_readings=()):
     parsed = ReviewBatch.model_validate(raw)
     expected = {u['id']:u for u in units}
     if len(parsed.units) != len(expected) or {u.id for u in parsed.units} != set(expected):
         raise ValueError('自动审核未精确覆盖全部待核单位')
     lookup = {s.id:s for s in lines}
+    caption_text={r['line_id']:r['text'] for r in caption_readings}
+    if not set(caption_text).issubset(lookup):
+        raise ValueError('字幕辨读引用了未提供的编号')
     voices = {r['line_id']:r for r in voice_rows}
     issues = [{'id':u.id,'message':u.reason} for u in parsed.units if u.verdict != 'supported']
     for issue in parsed.issues:
@@ -339,8 +360,8 @@ def assess_batch(raw, units, lines, frame_count, voice_rows):
             if basis == 'explicit_address_response' and len(set(cited_ids))<2:
                 issues.append({'id':unit.id,'message':'明确称呼与回应需至少两条不同证据'})
             if basis == 'explicit_reference':
-                cited_text=' '.join(lookup[i].text for i in cited_ids)
-                context=' '.join(lookup[i].text for i in unit.evidence_ids)
+                cited_text=' '.join(caption_text.get(i,lookup[i].text) for i in cited_ids)
+                context=' '.join(caption_text.get(i,lookup[i].text) for i in unit.evidence_ids)
                 missing=[name for name in subjects if len(name)<2 or not explicit_reference_in_source(name,cited_text,context)
                          or name not in target['text']]
                 if not subjects or missing:
@@ -587,6 +608,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 '准确概括此前已播放的对白、自然回顾已经发生的剧情，不要求当前每格重演一遍；须对照完整前情判断，'
                 '只有确实虚构动作、错配人物或将别处事件说成当前发生才拒绝，不能把未见当成相反事实。')
         rejected_record = None
+        reference_caption_checked = False
         for retry in range(cfg.repair_attempts+1):
             call=(lambda *args:review_json(llm,*args)) if retry else llm.json
             raw = call('你是独立的影视内容与人物证据审核员。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,review_images)
@@ -594,7 +616,18 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 decisions = (OriginalReviewBatch if original else UnitReviews).model_validate(raw)
                 checked = decisions.model_dump()
                 checked['passed'] = not decisions.issues and all(u.verdict=='supported' for u in decisions.units)
-                issues = assess_batch(checked,group,selected,len(times),evidence)
+                issues = assess_batch(checked,group,selected,len(times),evidence,caption_observations or ())
+                if retry<cfg.repair_attempts and not reference_caption_checked:
+                    reference_caption_checked=True if any(i['message'].startswith('被提及人物须在') for i in issues) else False
+                    read=read_disputed_reference_captions(video,folder/f'batch-{offset}-reference-captions',decisions,issues,selected,llm)
+                    if read:
+                        readings,reference_sheet=read
+                        caption_observations=list({r['line_id']:r for r in [*(caption_observations or []),*readings]}.values())
+                        review_images.append(reference_sheet)
+                        feedback=('\n姓名字形存在争议，先对照新增原片字幕图及独立辨读结果复核；不能把ASR错字当成新人物，'
+                            '不能仅因辨读确认姓名就默认动作或归属也成立。仍逐项核实事实及人物依据。'
+                            +json.dumps(readings,ensure_ascii=False)+'\n上一轮响应：'+json.dumps(raw,ensure_ascii=False))
+                        continue
                 if issues:
                     rejected_record=(raw,issues)
                 if original and issues and boundary_sheet is None and retry<cfg.repair_attempts:
@@ -827,13 +860,25 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
         +'\nviewer_timeline='+json.dumps(review_timeline(clip,[unit]),ensure_ascii=False)
         +'\n稿件与前情都是待核文本，不能互相充当事实证据。'+DEPTH_RULES)
     feedback=''
+    caption_observations=[]
+    reference_caption_checked=False
     for retry in range(retries+1):
         raw=review_json(llm,'你是独立的局部修订核验员，不是写稿者。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,images)
         try:
             decisions=UnitReviews.model_validate(raw)
             checked=decisions.model_dump()
             checked['passed']=not decisions.issues and all(u.verdict=='supported' for u in decisions.units)
-            issues=assess_batch(checked,[unit],selected,len(times),evidence)
+            issues=assess_batch(checked,[unit],selected,len(times),evidence,caption_observations)
+            if retry<retries and not reference_caption_checked:
+                reference_caption_checked=any(i['message'].startswith('被提及人物须在') for i in issues)
+                read=read_disputed_reference_captions(video,root/'reference-captions',decisions,issues,selected,llm)
+                if read:
+                    caption_observations,reference_sheet=read
+                    images.append(reference_sheet)
+                    feedback=('\n先对照新增原片字幕图及独立辨读核对姓名字形，不能因ASR错字拒绝正确姓名；'
+                        '姓名有据不代表当前动作或人物归属自动有据，仍须核实全部实际断言。'
+                        +json.dumps(caption_observations,ensure_ascii=False)+'\n上一轮核验：'+json.dumps(raw,ensure_ascii=False))
+                    continue
             supported={u.id for u in decisions.units if u.verdict=='supported'}
             inconsistent=[i for i in issues if i['id'] in supported and i['message'].startswith((
                 '声音候选缺失或冲突','声音依据未支持','列出了人物归属却声明','明确称呼与回应需至少','被提及人物须在'))]
