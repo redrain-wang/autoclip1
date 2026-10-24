@@ -54,6 +54,30 @@ def test_narration_can_refer_back_to_all_retained_original_dialogue():
     assert result['beats'][1]['evidence_ids']==[2,3]
 
 
+def test_first_narration_can_recall_actual_opening_without_borrowing_unshown_dialogue():
+    windows=[{'window':0,'start':30,'end':60,'evidence_ids':[3,4],
+              'original_allowed':True,'target_chars':120}]
+    raw={'beats':[{'window':0,'mode':'narration','instruction':'接上开场的提问', 'evidence_ids':[1,3]}]}
+    with pytest.raises(ValueError,match=r'未来的证据\[1\]'):compile_window_choices(raw,windows)
+    assert compile_window_choices(raw,windows,shown_evidence=[1,2])['beats'][0]['evidence_ids']==[1,3]
+    raw['beats'][0]['evidence_ids']=[1,5]
+    with pytest.raises(ValueError,match=r'未来的证据\[5\]'):compile_window_choices(raw,windows,shown_evidence=[1,2])
+
+
+def test_brief_scene_can_use_a_short_bridge_but_whole_film_cannot_be_only_bridges():
+    from autoclip.planning import Structure,validate_chapter
+    cfg=Settings(duration_profile='long',opening='original',target_seconds=1200,min_seconds=1080,max_seconds=1320)
+    structure=Structure(title='标题',angle='',hook='',opening_start=80,opening_end=100,opening_reason='开场',
+        chapters=[{'title':'承接场景','start':100,'end':220,'purpose':'交代已发生的结果'}])
+    lines=[Line(id=i,start=101+i*30,end=129+i*30,text='原片中的完整对白') for i in range(4)]
+    raw={'beats':[{'mode':'narration' if i==0 else 'original','start':100+i*30,'end':130+i*30,
+        'instruction':'交代承接','evidence_ids':[i],'target_chars':20 if i==0 else 0} for i in range(4)]}
+    validate_chapter(raw,structure.chapters[0],structure,lines,0,150,cfg,max_slots=10)
+    clip=Clip(title='标题',angle='',hook='',beats=[Beat(**{k:v for k,v in b.items() if k not in ('instruction','target_chars')},
+        text='简洁交代当前处境。' if b['mode']=='narration' else '',reason='') for b in raw['beats']])
+    with pytest.raises(ValueError,match='碎片过场'):require_commentary(clip,cfg)
+
+
 def test_title_and_caption_styles_keep_text_and_do_not_overlay_original_dialogue(tmp_path):
     from autoclip.render import write_ass
     path=tmp_path/'style.ass'

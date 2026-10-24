@@ -84,19 +84,21 @@ def chapter_windows(chapter, lines):
     return windows
 
 
-def compile_window_choices(raw, windows):
+def compile_window_choices(raw, windows, shown_evidence=()):
     selected=WindowChoices.model_validate(raw).beats
     numbers=[b.window for b in selected]
     if numbers!=sorted(set(numbers)) or any(i>=len(windows) for i in numbers):
         raise ValueError(f'窗口编号必须递增且每个最多一次；收到{numbers}，合法编号0–{len(windows)-1}。同一窗口不能同时做original和narration，只能二选一；不要求凑镜头数量')
-    output=[];seen=set()
+    output=[];seen=set(shown_evidence)
     for choice in selected:
         w=windows[choice.window]
         if choice.mode=='original' and not w['original_allowed']:
             raise ValueError(f'窗口{choice.window}没有完整原声边界，只能用于解说画面')
         allowed=set(w['evidence_ids']) | seen
         if choice.mode=='narration' and not set(choice.evidence_ids).issubset(allowed):
-            raise ValueError(f'窗口{choice.window}引用了未选用或未来的证据')
+            unknown=sorted(set(choice.evidence_ids)-allowed)
+            raise ValueError(f'窗口{choice.window}引用了未选用或未来的证据{unknown}；'
+                             f'本窗口及已播前文可用编号{sorted(allowed)}，须据实际对白改instruction及引用')
         # An original window retains every utterance, including lines the
         # planner did not list. Bind its actual dialogue rather than its gloss.
         evidence=w['evidence_ids'] if choice.mode=='original' else choice.evidence_ids
@@ -401,6 +403,7 @@ def plan_outline(video, root, lines, seconds, cfg, llm, start=0, end=None, notes
             prompt += (DEPTH_RULES+'本章预计旁白占45%–60%，至少35%；优先安排90–170字的完整讲述段。'
                 '90秒以上的主要章节至少两段target_chars>=90的解说，保留关键原声，其余问答合并转述。')
         windows=chapter_windows(chapter,lines) if formal_long(cfg) else None
+        opening_evidence = [s for s in lines if s.start<structure.opening_end and s.end>structure.opening_start] if index==0 else []
         if windows is not None:
             prompt=(f'为《{chapter.title}》选择连贯讲述与关键原声。章节任务：{chapter.purpose}。'+DEPTH_RULES+
                 '下面的窗口已由程序确定起止时间，禁止另写时间戳。仅按编号选择窗口并指定mode、instruction、evidence_ids。'
@@ -408,13 +411,15 @@ def plan_outline(video, root, lines, seconds, cfg, llm, start=0, end=None, notes
                 '例如只有两个窗口时，可返回window=0的narration和window=1的original，共两项即可，不必凑四项。'
                 '窗口编号就是唯一镜头，一个长窗口就是一个完整讲述段，不要把同一编号拆成多项。'
                 '相邻解说组成连贯段落，instruction交代本段处境、推理与后果的推进，不重复观点。'
-                '解说字数预算已给定；优先选长窗口承载完整解释。预计旁白占45%–60%，至少35%。'
-                '主要章节至少两段90字以上的解说；原声选能展示冲突或关键决定的完整对白，不照放整章。'
+                '解说字数预算已给定；优先选长窗口承载完整解释，全片预计旁白占45%–60%。'
+                '核心交锋可用多段完整讲述展开；短转场不强制长解说，不要求每章凑两段90字。原声选能展示冲突或关键决定的完整对白，不照放整章。'
                 '第一章第一项必须narration承接原声开场。允许不选窗口，但不能让问答或剧情断裂。'
                 '证据只能引用当前窗口或已选择的前文，original_allowed=false不能选original。人物候选不是确定身份。'
                 f'本章最多{limit}个窗口、预计成片最多{budget:.1f}秒；要保留完整事件。'
                 f'\n窗口{json.dumps(windows,ensure_ascii=False)}\n本章对白{compact(evidence)}'
                 f'\n人物候选{chapter_voice_notes(notes,evidence)}\n格式{json.dumps(WindowChoices.model_json_schema(),ensure_ascii=False)}')
+            if opening_evidence:
+                prompt += '\n开场已经实际播放，可作首段承接依据：'+compact(opening_evidence)
         feedback = ''
         if enforce_duration:
             prompt += (f'\n本章参考时长{budgets[index]:.1f}秒，最多{budget:.1f}秒；全片统一验收{cfg.min_seconds:.0f}–{cfg.max_seconds:.0f}秒。'
@@ -430,7 +435,7 @@ def plan_outline(video, root, lines, seconds, cfg, llm, start=0, end=None, notes
             prefix = f'chapter-{index}' + (f'-balance-{round_number}' if previous is not None else '')
             write_json(folder/f'{prefix}-attempt-{attempt}.json', draft)
             try:
-                if windows is not None:draft=compile_window_choices(draft,windows)
+                if windows is not None:draft=compile_window_choices(draft,windows,[s.id for s in opening_evidence])
                 draft = merge_continuous_originals(draft,lines)
                 draft = split_long_originals(draft,lines)
                 write_json(folder/f'{prefix}-normalized-{attempt}.json',draft)
@@ -610,12 +615,8 @@ def validate_chapter(raw, chapter, structure, lines, index, budget, cfg,minimum=
         estimate += slot.end-slot.start if slot.mode == 'original' else slot.target_chars/4.5
         last = slot.end
     costs = [round(s.end-s.start if s.mode=='original' else s.target_chars/4.5,2) for s in slots]
-    if formal_long(cfg):
-        spoken=sum(s.target_chars/4.5 for s in slots if s.mode=='narration')
-        if estimate and spoken/estimate<.35:
-            errors.append(f'本章旁白预计{spoken:.1f}/{estimate:.1f}秒，占{spoken/estimate:.1%}，不足35%。须将已有某些长original窗口改成narration并给出完整分析，或删除重复原声；不要只改引用或重复窗口。目标45%–60%')
-        if chapter.end-chapter.start>=90 and sum(s.mode=='narration' and s.target_chars>=90 for s in slots)<2:
-            errors.append('主要章节至少安排两段90字以上的完整讲述并留足画面，不是给零碎动作说明凑字')
+    # Commentary quantity is a whole-film contract. Per-scene quotas make
+    # ordinary transitions compete with substantive scenes and encourage filler.
     if estimate > budget+1:
         errors.append(f'本章预计{estimate:.1f}秒超过预算{budget:.1f}秒，需至少减少{estimate-budget:.1f}秒；各镜头预计秒数{costs}。删重复与次要分支，必要时用简洁旁白替换完整次要原声，不能只改instruction或引用编号')
     if estimate < minimum:

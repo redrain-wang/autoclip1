@@ -114,6 +114,21 @@ def test_internal_edit_notes_and_original_dialogue_do_not_become_narration_viola
     ])
 
 
+@pytest.mark.parametrize('text',['所以转场不必细说，重点是田文镜要立规矩。','本段解说需要强调他的处境。'])
+def test_internal_editing_directions_cannot_leak_into_narration(text):
+    from autoclip.editorial import require_audience_timeline
+    with pytest.raises(RepairNeeded,match='制作或审查措辞'):
+        require_audience_timeline([{'mode':'narration','text':text}])
+
+
+def test_natural_reporting_verbs_frame_quoted_role_speech_without_allowing_bare_address():
+    from autoclip.editorial import unframed_role_speech
+    assert not unframed_role_speech('太子提醒他：你是我的人，差事办砸了我怎么保你。')
+    assert not unframed_role_speech('太子点破：你是不是想让我向皇阿玛请旨。')
+    assert unframed_role_speech('你是他的人，办砸了他怎么保你。')
+    assert unframed_role_speech('他往外看了看：你先出去。')
+
+
 @pytest.mark.parametrize('enabled',[False,True])
 def test_packaging_does_not_bypass_narration_policy_when_disabled(tmp_path,enabled):
     from autoclip.branding import BrandSettings,package_clip
