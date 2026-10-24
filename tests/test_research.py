@@ -117,11 +117,14 @@ def test_oversized_event_research_repairs_within_budget_without_dropping_evidenc
     invalid=copy.deepcopy(valid);invalid['events'][0]['evidence_ids']=list(range(26))
     class Model:
         calls=0
+        cache={}
         def json(self,system,prompt):
+            if prompt in self.cache:return self.cache[prompt]
             self.calls+=1
             if self.calls>1:
                 assert '1–24条' in prompt and '上次未通过的数据' in prompt
-            return valid if repair_succeeds and self.calls==3 else invalid
+            self.cache[prompt]=valid if repair_succeeds and self.calls==3 else invalid
+            return self.cache[prompt]
     model=Model();root=tmp_path/'research-run';cfg=Settings(repair_attempts=2)
     if repair_succeeds:
         result=prepare_research(video,root,lines,60,cfg,model)

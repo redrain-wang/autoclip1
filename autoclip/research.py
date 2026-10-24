@@ -110,7 +110,7 @@ def prepare_research(video, root, lines, seconds, cfg, llm, previous=None):
                                {'response':raw,'error':str(ex),'status':'rejected'})
                     if attempt==cfg.repair_attempts:
                         raise
-                    error = ("\n上次输出校验失败，请重核后完整返回：" + str(ex)[:1200]
+                    error = (f"\n资料修复第{attempt+1}/{cfg.repair_attempts}轮。上次输出校验失败，请重核后完整返回：" + str(ex)[:1200]
                              + "。每个事件evidence_ids须为1–24条当前区间真实编号，只选直接支持该事件的关键对白。"
                              "事件过大时拆成多个事件；不能连续枚举整个区间、伪造编号或用文字声称已修复。"
                              "仍须遵守events最多15项及各字段长度约束。"
