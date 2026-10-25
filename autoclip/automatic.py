@@ -1138,6 +1138,10 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
               f'\n可用字幕（asr_text为未核实机器转写，实际字词以附图为准）{json.dumps(review_transcript_rows([s for s in lines if s.id in eligible]),ensure_ascii=False)}'
               f'\n人物候选{json.dumps(review_voice_rows([r for r in voices.get("lines",[]) if r["line_id"] in eligible]),ensure_ascii=False)}')
         prompt+='\n面向观众的写作要求：'+WRITING_RULES+'\n人物依据：'+IDENTITY_DIALOGUE_RULES
+        if uid.startswith('original-'):
+            prompt+=('\n原声修复必须实际调整start或end，保留有据的完整对白和必要回应。'
+                '仅改reason或evidence_ids不会改变观众听到的音画，不能算解决切点、缺句或承接问题。'
+                '不能在reason声称原声真实就保留同一区间；无法核实时须继续选择可核实的合法切点，不猜对白。')
         target_issues=[i for i in issues if i['id']==uid]
         condense=editorial_repair(target_issues,target.get('text',''))
         if condense:
@@ -1203,6 +1207,11 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                 candidate = apply_plan_changes(revised,raw,{uid})
                 if candidate==revised:
                     raise ValueError('当前修订未改变稿件或镜头，不能用原稿重复核验；须落实具体问题')
+                if uid.startswith('original-'):
+                    index=int(uid.split('-')[1])
+                    after=candidate.clips[0].beats[index]
+                    if abs(after.start-target['start'])<.001 and abs(after.end-target['end'])<.001:
+                        raise ValueError('原声修复未改变实际剪辑区间；仅改内部reason或evidence_ids不能解决音画问题，须调整合法切点')
                 if uid.startswith('beat-'):
                     index=int(uid.split('-')[1])
                     minimum=max((i.get('minimum_chars',0) for i in target_issues if i.get('stage')=='commentary_balance'),default=0)
@@ -1220,7 +1229,7 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                     verify_editorial_patch(candidate.clips[0],int(uid.split('-')[1]),target_issues,lines,llm,record.parent/f'verify-{retry}',retries=cfg.repair_attempts)
                 if source_seconds is not None:
                     validate_plan(candidate,lines,source_seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening,
-                        check_duration=not condense)
+                        check_duration=not (condense or formal_long(cfg)))
                     for index,b in enumerate(candidate.clips[0].beats):
                         if uid not in {f'beat-{index}',f'original-{index}'}:
                             continue  # untouched units still undergo the full source audit

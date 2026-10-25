@@ -429,10 +429,10 @@ def test_malformed_repair_evidence_has_bounded_retries(tmp_path,cited):
 
 
 def test_original_note_can_change_without_rewriting_original_audio(tmp_path):
+    from autoclip.automatic import apply_plan_changes
     plan=sample_plan();plan.clips[0].beats[0].mode='original';plan.clips[0].beats[0].text=''
-    class Model:
-        def json(self,*args):return {'changes':[{'id':'original-0','reason':'保留完整问答，不附加人物判断'}]}
-    revised=repair_plan(plan,[{'id':'original-0','message':'内部说明不准确'}],[],{},tmp_path,Settings(),Model(),0)
+    revised=apply_plan_changes(plan,{'changes':[{'id':'original-0','reason':'保留完整问答，不附加人物判断'}]},
+                               {'original-0'})
     before=plan.clips[0].beats[0].model_dump();after=revised.clips[0].beats[0].model_dump()
     before.pop('reason');after.pop('reason')
     assert before==after

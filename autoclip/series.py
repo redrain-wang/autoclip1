@@ -296,11 +296,14 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
             if not isinstance(exc,RepairNeeded) or exc.report.get('stage')!='automatic_partial':raise
             revised = plan.model_dump()
             revised['clips'][0] = exc.report['clip']
-            plan = Plan.model_validate(revised)
+            partial = Plan.model_validate(revised)
+            if partial==plan:
+                raise  # Exhausted local attempts did not justify another full audit.
+            plan = partial
             write_json(root/f'partial-repair-{attempt}.json',{'plan':plan.model_dump(),'pending':exc.report['issues'],
                 'status':'requires_full_measurement_and_review'})
         validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening,
-            check_duration=category not in {'selection','editorial','commentary'})
+            check_duration=not formal_long(cfg))
         if validate_clip:
             validate_clip(plan.clips[0])
     raise ValueError('自动修复达到上限，本集未通过：'+json.dumps(issues,ensure_ascii=False)[:1800])
