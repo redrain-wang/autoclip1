@@ -59,10 +59,12 @@ class LLM:
         for attempt in range(3):
             retry_wait = min(30,5 * 2**attempt)
             with self._lock:
-                if self.calls >= self.settings.max_api_calls:
+                if self.settings.api_budget_mode=='fixed' and self.calls >= self.settings.max_api_calls:
                     raise RuntimeError("已达到本次 API 调用次数上限；已保存的稿件和缓存保留，可重跑原命令续作。")
                 self.calls += 1
+                call_number=self.calls
                 self.model_calls[payload["model"]] = self.model_calls.get(payload["model"], 0) + 1
+            print(f'模型请求第{call_number}次（当前请求第{attempt+1}/3次尝试）',flush=True)
             try:
                 response = self.client.post(self.settings.llm_base_url.rstrip("/") + "/chat/completions", json=payload)
                 if response.status_code >= 400:
@@ -89,16 +91,19 @@ class LLM:
                 result = json.loads(raw)
                 write_json(cache, {"result": result, "usage": body.get("usage", {}), "model": body.get("model"),
                                    "requested_model": payload["model"], "endpoint": self.settings.llm_base_url, "created": time.time()})
+                print(f'模型请求第{call_number}次已完成。',flush=True)
                 return result
             except (httpx.TransportError, RuntimeError, json.JSONDecodeError) as ex:
                 last_error = str(ex)
                 if attempt<2:
+                    print(f'模型请求暂未成功，{retry_wait:g}秒后重试（当前请求最多3次尝试）。',flush=True)
                     time.sleep(retry_wait)
         raise RuntimeError(f"模型调用失败，已重试：{last_error}")
 
     def usage(self):
         values = [read_json(p).get("usage", {}) for p in (self.root / "llm").glob("*.json")]
         return {"endpoint": self.settings.llm_base_url, "configured_model": self.settings.llm_model,
+                "request_policy":self.settings.api_call_policy(),
                 "calls_this_run_by_model": dict(self.model_calls),
                 "cached_requests": len(values), "calls_this_run": self.calls,
                 "prompt_tokens": sum(v.get("prompt_tokens", 0) for v in values),

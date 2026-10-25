@@ -172,6 +172,27 @@ def test_unknown_review_exhausts_automatically_without_approval(tmp_path,monkeyp
     assert not (tmp_path/'plan-approved.json').exists()
 
 
+def test_steps_policy_stops_a_repair_that_repeats_the_same_plan_and_issues(tmp_path,monkeypatch):
+    cfg=Settings(api_budget_mode='steps',repair_attempts=3)
+    plan=Plan(episode_summary='',genre='',style='',clips=[Clip(title='检查没有推进的修稿',angle='',hook='',beats=[
+        Beat(mode='narration',start=i*10,end=i*10+10,text='交代眼前发生的事情',evidence_ids=[i],reason='test') for i in range(4)])])
+    edits=[];audits=[]
+    def measure(video,path,transcript,cfg,root):
+        write_json(root/'plan-timed.json',read_json(path));return {'issues':[]}
+    def audit(*args):
+        audits.append(1);return {'passed':False,'issues':[{'id':'beat-1','message':'事实仍然无据'}]}
+    def unchanged(plan,*args,**kwargs):edits.append(1);return plan
+    monkeypatch.setattr(module,'measure_sample_plan',measure)
+    monkeypatch.setattr(module,'audit_plan',audit)
+    monkeypatch.setattr(module,'repair_plan',unchanged)
+    monkeypatch.setattr(module,'duration',lambda _:40)
+    monkeypatch.setattr(module,'validate_plan',lambda *a,**k:None)
+    with pytest.raises(ValueError,match='同一稿件重复出现相同问题'):
+        module.complete_long_plan(tmp_path/'source',plan,[],{},tmp_path,cfg,None)
+    assert len(edits)==1 and len(audits)==2
+    assert not (tmp_path/'plan-approved.json').exists()
+
+
 @pytest.mark.parametrize('content_passes',[False,True])
 def test_timing_repairs_leave_separate_bounded_content_allowance(tmp_path,monkeypatch,content_passes):
     plan=Plan(episode_summary='',genre='',style='',clips=[Clip(title='自动修复边界',angle='',hook='',beats=[

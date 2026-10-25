@@ -28,4 +28,5 @@ identity_gate = true
 identity_registry = "output/人物锚点/registry.json"
 tts_rate = "+8%"
 output = "output/顺叙解读-第九集"
-max_api_calls = 100
+api_budget_mode = "steps"
+max_api_calls = 100 # 仅api_budget_mode="fixed"时启用总量上限

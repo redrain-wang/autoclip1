@@ -997,7 +997,12 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
         def needs_explanation(uid):
             return any(i['id']==uid and re.search(r'没有(?:说明|解释|点出)|未(?:交代|说明|讲清|解释)|缺(?:少|乏).{0,12}(?:因果|解释|分析)',i['message']) for i in issues)
         units.sort(key=lambda uid:not needs_explanation(uid))
-    for uid in units:
+    for unit_number,uid in enumerate(units,1):
+        label={'title':'标题','angle':'解读角度','hook':'主问题'}.get(uid)
+        if label is None and uid.startswith(('beat-','original-')):
+            label=f'第{int(uid.split("-")[1])+1}个片段'+('旁白' if uid.startswith('beat-') else '原声')
+        label=label or uid
+        print(f'局部修稿：{label}（本轮第{unit_number}/{len(units)}项）',flush=True)
         clip = revised.clips[0]
         targets = {u['id']:u for u in units_for_clip(clip)}
         targets.update({f'original-{i}':{'id':f'original-{i}',**b.model_dump()} for i,b in enumerate(clip.beats) if b.mode=='original'})
@@ -1097,6 +1102,7 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                 review_voice_rows([r for r in voices.get('lines',[]) if r['line_id'] in eligible]))
         feedback = ''
         for retry in range(cfg.repair_attempts+1):
+            print(f'局部修稿：{label}，第{retry+1}/{cfg.repair_attempts+1}次修订',flush=True)
             raw = (llm.json('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback,repair_images)
                    if repair_images else llm.json('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback))
             record = root/'automatic-repairs'/str(attempt)/uid/f'attempt-{retry}.json'
@@ -1116,6 +1122,8 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                 if not set(cited).issubset(eligible):
                     raise ValueError(f'当前单位引用了未允许证据；只能使用{sorted(eligible)}')
                 candidate = apply_plan_changes(revised,raw,{uid})
+                if candidate==revised:
+                    raise ValueError('当前修订未改变稿件或镜头，不能用原稿重复核验；须落实具体问题')
                 if uid.startswith('beat-'):
                     index=int(uid.split('-')[1])
                     if max_characters is None:
@@ -1175,7 +1183,7 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                     failed.extend({**i,'code':'voice_alignment' if i.get('measurement') else 'semantic_review',
                         'message':i['message']+'；局部修订未完成：'+str(exc)} for i in issues if i['id']==uid)
                     break
-                feedback = '\n上轮局部修订未通过程序检查：'+str(exc)[:1800]+'\n上轮修订：'+json.dumps(raw,ensure_ascii=False)+'\n只返回当前target的合法修改，不能换段、清空口播、变更mode或突破原片时间线。'
+                feedback = f'\n上轮局部修订未通过程序检查（第{retry+1}次）：'+str(exc)[:1800]+'\n上轮修订：'+json.dumps(raw,ensure_ascii=False)+'\n只返回当前target的合法修改，不能换段、清空口播、变更mode或突破原片时间线。'
         if accepted:
             write_json(root/'pending-repair.json',{'base_plan_digest':digest(plan.model_dump()),
                 'voice_digest':digest(voices),'plan':revised.model_dump(),

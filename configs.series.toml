@@ -16,5 +16,6 @@ oral_edit = true
 vision = true
 research_before_produce = true
 conflict_brief = true
-max_api_calls = 100
+api_budget_mode = "steps"
+max_api_calls = 100 # 仅api_budget_mode="fixed"时启用总量上限
 repair_attempts = 3

@@ -14,4 +14,5 @@ tts = "edge"
 voice = "zh-CN-YunyangNeural"
 tts_rate = "+8%"
 output = "output"
-max_api_calls = 100
+api_budget_mode = "steps"
+max_api_calls = 100 # 仅api_budget_mode="fixed"时启用总量上限

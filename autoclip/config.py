@@ -45,8 +45,17 @@ class Settings(BaseModel):
     conflict_brief: bool = Field(default=False, exclude=True)
     llm_model: str = "deepseek-flash"
     llm_base_url: str = "https://api.deepseek.com"
-    max_api_calls: int = 100
+    max_api_calls: int = Field(default=100, ge=1)
+    # Request scheduling is operational, not an editorial/source input. Changing
+    # it must not discard transcripts, drafts, voices or existing approvals.
+    api_budget_mode: Literal['fixed', 'steps'] = Field(default='fixed', exclude=True)
     repair_attempts: int = Field(default=3, ge=0, le=5)
+
+    def api_call_policy(self):
+        return {'mode':self.api_budget_mode,
+                'global_request_limit':self.max_api_calls if self.api_budget_mode=='fixed' else None,
+                'transport_attempts_per_request':3,
+                'repair_retries_per_step':self.repair_attempts}
 
     @model_validator(mode="after")
     def duration_range(self):

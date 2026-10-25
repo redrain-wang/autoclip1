@@ -186,6 +186,7 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
     issues = []
     repairs = {'timing':0, 'content':0}
     if formal_long(cfg):repairs['selection']=0
+    reviewed_failures=set()
     # TTS alignment must not consume the later factual repair allowance.
     # Each category remains bounded, including regressions after a content edit.
     for attempt in range(len(repairs)*cfg.repair_attempts+2):
@@ -262,6 +263,11 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
                 write_json(root/'plan-approved.json',plan.model_dump())
                 return plan, report
         write_json(root/f'issues-{attempt}.json',issues)
+        failure=digest({'category':category,'plan':plan.model_dump(),'issues':issues})
+        if failure in reviewed_failures:
+            raise ValueError('自动修复没有推进：同一稿件重复出现相同问题，停止重复请求；'
+                +json.dumps(issues,ensure_ascii=False)[:1500])
+        reviewed_failures.add(failure)
         write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':category})
         if repairs[category] >= cfg.repair_attempts:
             break
@@ -596,6 +602,7 @@ def _run_series(source,output,series,config,library,voice_manifest,model_path,vo
     project = {'version':VERSION,'source':str(source),'series':cfg.series,'config':str(config),
                'purpose':purpose,'duration_policy':delivery_policy(cfg,test_sample),'editorial_policy':'story_first',
                'effective_settings':cfg.model_dump(mode='json'),
+               'request_policy':cfg.api_call_policy(),
                'library':str(library),'voice_manifest':str(voice_manifest) if voice_manifest else None,
                'model_path':str(model_path) if model_path else None,'voice_python':str(voice_python) if voice_python else None,
                'episodes':[str(p) for p in paths]}
