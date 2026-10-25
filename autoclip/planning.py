@@ -13,10 +13,11 @@ from pydantic import BaseModel, Field
 from .conflict import prepare_conflict_brief, brief_context
 from .continuity import load_continuity, continuity_prompt
 from .director import compact
+from .llm import review_json
 from .models import Beat, Clip, Plan, validate_plan
 from .util import digest, read_json, source_identity, write_json
 
-VERSION = 'planning-12'
+VERSION = 'planning-13'
 
 
 class Chapter(BaseModel):
@@ -60,6 +61,26 @@ class WindowChoices(BaseModel):
     beats: list[WindowChoice] = Field(min_length=1)
 
 
+class WindowSelection(BaseModel):
+    mode: Literal['original','narration']
+    instruction: str = Field(min_length=1)
+    evidence_ids: list[int] = Field(min_length=1)
+
+
+class WindowSelections(BaseModel):
+    # One object entry per source window avoids asking the planner to enforce
+    # uniqueness while also deciding how many original/narration beats to use.
+    windows: dict[str, WindowSelection] = Field(min_length=1)
+
+
+def window_selection_schema(windows):
+    schema=WindowSelections.model_json_schema()
+    schema['properties']['windows']={
+        'type':'object','minProperties':1,'additionalProperties':False,
+        'properties':{str(w['window']):{'$ref':'#/$defs/WindowSelection'} for w in windows}}
+    return schema
+
+
 def chapter_windows(chapter, lines):
     """Offer legal, continuous footage windows instead of asking for invented cuts."""
     edges=sorted({s.end for s in lines if chapter.start<s.end<chapter.end
@@ -86,7 +107,16 @@ def chapter_windows(chapter, lines):
 
 
 def compile_window_choices(raw, windows, shown_evidence=()):
-    selected=WindowChoices.model_validate(raw).beats
+    if isinstance(raw,dict) and 'windows' in raw:
+        choices=WindowSelections.model_validate(raw).windows
+        if any(key not in {str(i) for i in range(len(windows))} for key in choices):
+            raise ValueError(f'窗口键只能使用程序给出的编号0–{len(windows)-1}，不得另编或重复编号')
+        selected=[WindowChoice(window=int(key),**value.model_dump())
+                  for key,value in sorted(choices.items(),key=lambda item:int(item[0]))]
+    else:
+        # Keep reading saved list-shaped drafts, but never silently discard a
+        # duplicate whose original/narration alternatives have different meaning.
+        selected=WindowChoices.model_validate(raw).beats
     numbers=[b.window for b in selected]
     if numbers!=sorted(set(numbers)) or any(i>=len(windows) for i in numbers):
         raise ValueError(f'窗口编号必须递增且每个最多一次；收到{numbers}，合法编号0–{len(windows)-1}。同一窗口不能同时做original和narration，只能二选一；不要求凑镜头数量')
@@ -162,7 +192,8 @@ def revise_chapter_budget(previous, chapter, structure, lines, index, budget, mi
             f'\n本章原片对白{compact(evidence)}\n格式{json.dumps(BudgetSelection.model_json_schema(),ensure_ascii=False)}')
     feedback=''
     for attempt in range(cfg.repair_attempts+1):
-        raw=llm.json('你是影视解说剪辑编辑，以完整剧情为先，在真实素材中选择删减与转述。',prompt+feedback)
+        args=('你是影视解说剪辑编辑，以完整剧情为先，在真实素材中选择删减与转述。',prompt+feedback)
+        raw=review_json(llm,*args) if attempt else llm.json(*args)
         prefix=f'chapter-{index}-budget-{round_number}-{attempt}'
         write_json(folder/f'{prefix}-selection.json',raw)
         try:
@@ -406,19 +437,25 @@ def plan_outline(video, root, lines, seconds, cfg, llm, start=0, end=None, notes
         windows=chapter_windows(chapter,lines) if formal_long(cfg) else None
         opening_evidence = [s for s in lines if s.start<structure.opening_end and s.end>structure.opening_start] if index==0 else []
         if windows is not None:
+            lookup={s.id:s for s in lines}
+            window_evidence=[{**w,'source_lines':[lookup[i].model_dump() for i in w['evidence_ids']]}
+                             for w in windows]
             prompt=(f'为《{chapter.title}》选择连贯讲述与关键原声。章节任务：{chapter.purpose}。'+DEPTH_RULES+SELECTION_RULES+
-                '下面的窗口已由程序确定起止时间，禁止另写时间戳。仅按编号选择窗口并指定mode、instruction、evidence_ids。'
-                '每个window编号最多出现一次，不能同一窗口既选narration又选original，不能播放两遍。'
-                '例如只有两个窗口时，可返回window=0的narration和window=1的original，共两项即可，不必凑四项。'
+                '下面的窗口已由程序确定起止时间，禁止另写时间戳。返回windows对象，键为所选窗口编号字符串，值为mode、instruction、evidence_ids。'
+                '每个键只填一次，每个窗口只选一种mode；程序按编号排序，不播放两遍。不要返回beats列表或另填window字段。'
+                '例如两个窗口只需两个键：{"windows":{"0":{"mode":"narration","instruction":"交代处境","evidence_ids":[实际编号]},'
+                '"1":{"mode":"original","instruction":"保留关键回应","evidence_ids":[实际编号]}}}。示例编号须换成本窗口的真实字幕编号。'
                 '窗口编号就是唯一镜头，一个长窗口就是一个完整讲述段，不要把同一编号拆成多项。'
                 '相邻解说组成连贯段落，instruction交代本段处境、推理与后果的推进，不重复观点。'
                 '解说字数预算已给定；优先选长窗口承载完整解释，全片预计旁白占45%–60%。'
                 '核心交锋可用多段完整讲述展开；短转场不强制长解说，不要求每章凑两段90字。原声选能展示冲突或关键决定的完整对白，不照放整章。'
                 '第一章第一项必须narration承接原声开场。允许不选窗口，但不能让问答或剧情断裂。'
-                '证据只能引用当前窗口或已选择的前文，original_allowed=false不能选original。人物候选不是确定身份。'
-                f'本章最多{limit}个窗口、预计成片最多{budget:.1f}秒；要保留完整事件。'
-                f'\n窗口{json.dumps(windows,ensure_ascii=False)}\n本章对白{compact(evidence)}'
-                f'\n人物候选{chapter_voice_notes(notes,evidence)}\n格式{json.dumps(WindowChoices.model_json_schema(),ensure_ascii=False)}')
+                '每个窗口的source_lines就是该窗口实际对白，evidence_ids与其逐条对应，不要按自己概括的剧情段落重新编号窗口。'
+                '解说可引用当前窗口或此前已保留原声的对白及前段已引证据；跳过窗口的对白不可引用。original_allowed=false不能选original。人物候选不是确定身份。'
+                f'本章实际只有{len(windows)}个可用窗口，合法键仅{[str(w["window"]) for w in windows]}；最多选择{min(limit,len(windows))}个，预计成片最多{budget:.1f}秒。'
+                '每个窗口只能在自身起止范围内安排instruction；可省略次要内容，不得为了写完整事件添加窗口或挪用其他窗口对白。'
+                f'\n窗口及各自对白{json.dumps(window_evidence,ensure_ascii=False)}'
+                f'\n人物候选{chapter_voice_notes(notes,evidence)}\n格式{json.dumps(window_selection_schema(windows),ensure_ascii=False)}')
             if opening_evidence:
                 prompt += '\n开场已经实际播放，可作首段承接依据：'+compact(opening_evidence)
         feedback = ''
@@ -431,7 +468,10 @@ def plan_outline(video, root, lines, seconds, cfg, llm, start=0, end=None, notes
                        '过短仅补入本章尚未展示的必要剧情与完整对白，证据不足不编造，不扩写空话；'
                        '不能删掉关键问话却保留其回答造成虚假衔接。\n上版本章：'+json.dumps(previous,ensure_ascii=False))
         for attempt in range(cfg.repair_attempts+1):
-            draft = llm.json('你是影视剪辑师，按当前原片证据安排镜头。', prompt+feedback)
+            args=('你是影视剪辑师，按当前原片证据安排镜头。', prompt+feedback)
+            # Escalate repeated constraint mistakes within the existing repair
+            # allowance; provider, model and total request cap stay unchanged.
+            draft = review_json(llm,*args) if windows is not None and attempt else llm.json(*args)
             raw_draft = draft
             prefix = f'chapter-{index}' + (f'-balance-{round_number}' if previous is not None else '')
             write_json(folder/f'{prefix}-attempt-{attempt}.json', draft)

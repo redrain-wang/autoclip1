@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from .models import Beat, Clip, Line, Plan, validate_plan
 from .editorial import WRITING_RULES, polish_clip
+from .llm import review_json
 from .narrative import narration_minimum, require_commentary, formal_long, DEPTH_RULES
 from .util import digest, duration, read_json, source_identity, write_json
 
@@ -153,13 +154,16 @@ def compose_outline(video, transcript, outline_path, root, cfg, llm):
                             continue
                         local_feedback = ''
                         for local_attempt in range(2):
-                            patched = llm.json('你是影视解说局部修稿编辑，保留原意、证据与推断边界。',
+                            repair_prompt=(
                                 f"只修这一个口播。原稿实数{len(b.text)}字，目标{slot['target_chars']}字，至少{low}、最多{high}字。"
                                 '太短就展开必要因果与取舍，太长就删重复与修饰，不能增加情节、年份或心理定论。'
                                 f"\n编辑角度{slot['instruction']}\n原稿{b.model_dump_json()}"
                                 f"\n允许证据{compact([s for s in evidence if s.id in slot['allowed_evidence_ids']])}\n证据ID仅限{slot['allowed_evidence_ids']}"
                                 + f'\n只返回数据对象，形如{{"id":{b.id},"text":"完整中文口播","evidence_ids":[真实字幕编号]}}。不要输出JSON schema或properties。'
                                 + WRITING_RULES + local_feedback)
+                            patched = review_json(llm,
+                                '你是影视解说局部修稿编辑，保留原意、证据与推断边界；逐字满足给出的长度范围。',
+                                repair_prompt)
                             write_json(folder/f'chapter-{number}-beat-{b.id}-repair-{local_attempt}.json',patched)
                             try:
                                 revised = WrittenBeat.model_validate(patched)

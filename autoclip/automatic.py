@@ -1,6 +1,7 @@
 """Source-bound automated review and local repair, separate from human approval."""
 import json
 import re
+import threading
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -489,8 +490,9 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
     # Keep the exact reviewed draft even when later measurement overwrites the
     # mutable plan-timed.json or a subsequent review is interrupted.
     write_json(folder/'plan.json',plan.model_dump())
-    write_json(root/'automatic-review-state.json',{'status':'running','plan_digest':digest(plan.model_dump()),
-        'review_root':str(folder.resolve())})
+    review_state={'status':'running','plan_digest':digest(plan.model_dump()),
+        'review_root':str(folder.resolve()),'completed_batches':0}
+    write_json(root/'automatic-review-state.json',review_state)
     all_issues=[{'id':f'beat-{row["beat"]}','message':'旁白混入制作或审查话术，必须面向观众直接讲剧情，不能照读核对记录：'
         +json.dumps(row['phrases'],ensure_ascii=False)} for row in prose_signals(clip)]
     all_issues.extend(title_issues(clip.title))
@@ -504,8 +506,19 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
             group = subset[start:start+size]
             groups.append((offset,group))
             offset += len(group)
+    review_state['total_batches']=len(groups)
+    progress_lock=threading.Lock()
+    def progress(event, group, issue_count=0):
+        with progress_lock:
+            if event=='completed':review_state['completed_batches']+=1
+            label='、'.join(u['id'] for u in group)
+            review_state.update(current_units=[u['id'] for u in group],event=event)
+            write_json(root/'automatic-review-state.json',review_state)
+            detail='开始' if event=='started' else f'完成，待修{issue_count}项'
+            print(f'{video.stem}：内容核对 {review_state["completed_batches"]}/{len(groups)}（{label}，{detail}）',flush=True)
     def review_group(job):
         offset,group = job
+        progress('started',group)
         original = all(u.get('mode')=='original' for u in group)
         ids = {i for u in group for i in u.get('evidence_ids',[]) + u.get('shown_evidence',[])}
         # Metadata is checked against the actual selected footage, not an invented summary.
@@ -587,7 +600,21 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 '声音记录status=human_confirmed仅表示该source与start/end区间的说话人已人工确认，不自动延伸到邻近声音或被提及者。'
                 '对明确建立在已播事实上的分析，核查推理是否成立，而不是要求逐字找到同样台词。'
                 '不能为回避推断把完整解释退化成动作复述；修改只针对无据主张，保留有依据的分析与必要上下文。')
-        feedback = ''
+        # A syntactically valid JSON response can still fail schema/citation
+        # validation. Replaying that same cached response after an exhausted
+        # retry loop cannot recover. Carry its actual feedback into a new,
+        # bounded review request; retain this seed after recovery for cache reuse.
+        resume_path=folder/f'batch-{offset}-protocol-resume.json'
+        resume=read_json(resume_path) if resume_path.exists() else None
+        previous_failure=folder/f'batch-{offset}-protocol-{cfg.repair_attempts}.json'
+        if resume is None and not (folder/f'batch-{offset}.json').exists() and previous_failure.exists():
+            resume={**read_json(previous_failure),'round':1}
+            write_json(resume_path,resume)
+        feedback = ('\n上次运行本批审核响应未通过格式/引用检查；本次只重核同一批，不修改稿件。'
+            +f'恢复轮次{resume["round"]}。校验错误：'+resume['error'][:1800]
+            +'\n上次无效响应：'+json.dumps(resume['raw'],ensure_ascii=False)
+            +'\n逐项引用边界='+json.dumps(review_citation_limits(group,selected,evidence),ensure_ascii=False)
+            +'\n须返回本批全部units对象和issues数组；真实未知或错误仍须拒绝，不能为了恢复而放行。') if resume else ''
         review_images = [sheet]
         caption_sheet = None
         boundary_sheet = None
@@ -628,7 +655,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 '只有确实虚构动作、错配人物或将别处事件说成当前发生才拒绝，不能把未见当成相反事实。')
         rejected_record = None
         for retry in range(cfg.repair_attempts+1):
-            call=(lambda *args:review_json(llm,*args)) if retry else llm.json
+            call=(lambda *args:review_json(llm,*args)) if retry or resume else llm.json
             raw = call('你是独立的影视内容与人物证据审核员。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,review_images)
             try:
                 decisions = (OriginalReviewBatch if original else UnitReviews).model_validate(raw)
@@ -731,6 +758,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                         write_json(folder/f'batch-{offset}-recheck-failed.json',
                             {'error':str(exc),'action':'retain_last_valid_rejection'})
                         break
+                    write_json(resume_path,{'round':(resume or {}).get('round',0)+1,'raw':raw,'error':str(exc)})
                     raise ValueError(f'自动审核批次{offset}格式或引用校验失败，未改写稿件：{str(exc)[:1200]}') from exc
                 feedback = ('\n上次审核响应未通过格式/引用检查：'+str(exc)[:1800]
                     +'\n原响应：'+json.dumps(raw,ensure_ascii=False)
@@ -746,6 +774,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
         write_json(folder/f'batch-{offset}.json',record)
         frames = [{'path':str(p.resolve()),'sha256':file_hash(p),
             **({'purpose':'metadata_captions'} if metadata and p==caption_sheet else {})} for p in review_images]
+        progress('completed',group,len(issues))
         return issues,str((folder/f'batch-{offset}.json').resolve()),frames
     # Batches are independent; keep results in source order and share LLM's
     # locked request allowance. No partial batch constitutes an approval.
@@ -755,8 +784,11 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 all_issues.extend(issues)
                 batches.append(batch)
                 frames.extend(frame)
-        except BaseException:
+        except BaseException as exc:
             pool.shutdown(wait=True,cancel_futures=True)
+            review_state.update(status='failed' if isinstance(exc,Exception) else 'interrupted',
+                error=str(exc)[:1500] or type(exc).__name__)
+            write_json(root/'automatic-review-state.json',review_state)
             raise
     report = {'mode':'automatic_source_review','version':VERSION,'metadata_caption_policy':METADATA_CAPTION_POLICY,
               'scene_observation_policy':SCENE_OBSERVATION_POLICY,'title_policy':TITLE_POLICY,'source':source_identity(video),
@@ -765,8 +797,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
               'limitations':['机器审核可能误判；声纹候选不等于人工确定身份。']}
     write_json(folder/'report.json',report)
     write_json(root/'automatic-review.json',report)
-    write_json(root/'automatic-review-state.json',{'status':'completed','plan_digest':report['plan_digest'],
-        'review_root':str(folder.resolve())})
+    write_json(root/'automatic-review-state.json',{**review_state,'status':'completed'})
     return report
 
 

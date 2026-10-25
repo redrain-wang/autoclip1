@@ -459,7 +459,11 @@ def test_budget_editor_checks_real_cost_and_retries_only_selection(tmp_path):
     from autoclip.planning import revise_chapter_budget, chapter_seconds
     _,structure,drafts,lines,_,cfg=fixture(tmp_path)
     calls=[]
+    repairs=[]
     class Model:
+        def review_json(self,system,prompt):
+            repairs.append(prompt)
+            return self.json(system,prompt)
         def json(self,system,prompt):
             calls.append(prompt)
             return {'keep':[0,1,2,3] if len(calls)==1 else [0,1,3],
@@ -467,4 +471,74 @@ def test_budget_editor_checks_real_cost_and_retries_only_selection(tmp_path):
                     'rationale':'保留起因结果与必要转场'}
     result=revise_chapter_budget(drafts[0],structure.chapters[0],structure,lines,0,50,0,3,cfg,Model(),tmp_path,1)
     assert len(calls)==2 and chapter_seconds(result)==50
+    assert len(repairs)==1
     assert '超过预算' in calls[1] and '不要重写时间戳' in calls[0]
+
+
+def test_window_map_compiles_once_in_source_order_without_inventing_cuts():
+    from autoclip.planning import compile_window_choices
+    windows=[dict(window=i,start=i*30,end=(i+1)*30,evidence_ids=[i],
+                  original_allowed=True,target_chars=120) for i in range(3)]
+    raw={'windows':{'2':dict(mode='narration',instruction='承接已经播放的交锋',evidence_ids=[0,2]),
+                    '0':dict(mode='original',instruction='关键交锋',evidence_ids=[0])}}
+    result=compile_window_choices(raw,windows)['beats']
+    assert [(b['start'],b['end'],b['mode']) for b in result]==[(0,30,'original'),(60,90,'narration')]
+    assert result[1]['evidence_ids']==[0,2] and result[1]['target_chars']==120
+    raw['windows']['2']['evidence_ids']=[1,2]
+    with pytest.raises(ValueError,match='未选用或未来'):compile_window_choices(raw,windows)
+    raw['windows']['2']['evidence_ids']=[0,2]
+    windows[0]['original_allowed']=False
+    with pytest.raises(ValueError,match='完整原声边界'):compile_window_choices(raw,windows)
+
+
+@pytest.mark.parametrize('key',['-1','01','1.0','3','first'])
+def test_window_map_rejects_invented_or_aliased_window_numbers(key):
+    from autoclip.planning import compile_window_choices
+    windows=[dict(window=0,start=0,end=30,evidence_ids=[0],original_allowed=True,target_chars=120)]
+    with pytest.raises(ValueError,match='窗口键'):
+        compile_window_choices({'windows':{key:dict(mode='narration',instruction='叙事',evidence_ids=[0])}},windows)
+
+
+@pytest.mark.parametrize('needs_repair',[False,True])
+def test_formal_planner_uses_window_map_and_window_local_dialogue(tmp_path,monkeypatch,needs_repair):
+    import json
+    from autoclip import planning as module
+    video=tmp_path/'source.mp4';video.write_bytes(b'fixture')
+    cfg=Settings(duration_profile='long',opening='original',target_seconds=1200,min_seconds=1080,max_seconds=1320)
+    structure=Structure(title='完整剧情',angle='',hook='',opening_start=0,opening_end=20,opening_reason='完整对白',
+        chapters=[dict(title='开端',start=20,end=100,purpose='说明处境'),
+                  dict(title='转折',start=100,end=180,purpose='交锋与结果')])
+    lines=[Line(id=i,start=i*20,end=(i+1)*20,text=f'本地对白{i}') for i in range(9)]
+    monkeypatch.setattr(module,'load_continuity',lambda *a:{'signature':'prior'})
+    monkeypatch.setattr(module,'continuity_prompt',lambda *a:'')
+    monkeypatch.setattr(module,'prepare_conflict_brief',lambda *a,**k:{})
+    monkeypatch.setattr(module,'brief_context',lambda _: {})
+    prompts=[]
+    repairs=[]
+    class Model:
+        def json(self,system,prompt):
+            if '先定章节' in prompt:return structure.model_dump()
+            if needs_repair:
+                return {'windows':{'999':dict(mode='narration',instruction='虚构窗口',evidence_ids=[1])}}
+            return self.choose(prompt)
+        def review_json(self,system,prompt):
+            repairs.append(prompt)
+            assert '窗口键只能使用程序给出的编号' in prompt
+            return self.choose(prompt)
+        def choose(self,prompt):
+            prompts.append(prompt)
+            offered=json.loads(prompt.split('\n窗口及各自对白',1)[1].split('\n人物候选',1)[0])
+            assert len(offered)==2
+            schema,_=json.JSONDecoder().raw_decode(prompt.split('\n格式',1)[1])
+            assert schema['properties']['windows']['additionalProperties'] is False
+            assert set(schema['properties']['windows']['properties'])=={'0','1'}
+            assert all(w['evidence_ids']==[s['id'] for s in w['source_lines']] for w in offered)
+            assert '不要求每章凑两段90字' in prompt
+            assert '不要返回beats列表' in prompt
+            return {'windows':{str(w['window']):dict(mode='narration' if w['window']==0 else 'original',
+                instruction='讲清剧情',evidence_ids=w['evidence_ids']) for w in reversed(offered)}}
+    result=module.plan_outline(video,tmp_path/'run',lines,180,cfg,Model())
+    assert len(prompts)==2
+    assert len(repairs)==(2 if needs_repair else 0)
+    assert [(b['start'],b['end']) for c in result['chapters'] for b in c['beats']]==[
+        (0,20),(20,60),(60,100),(100,140),(140,180)]

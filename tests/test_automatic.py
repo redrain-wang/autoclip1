@@ -1078,8 +1078,51 @@ def test_malformed_recheck_only_preserves_valid_rejection_never_creates_approval
             monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
             module.audit_plan(video,plan,lines,voices,tmp_path,Settings(repair_attempts=1),model)
         assert not (tmp_path/'automatic-review.json').exists()
-        assert read_json(tmp_path/'automatic-review-state.json')['status']=='running'
+        assert read_json(tmp_path/'automatic-review-state.json')['status']=='failed'
     assert model.attempts==2 and not (tmp_path/'plan-approved.json').exists()
+
+
+def test_audit_resume_does_not_replay_exhausted_invalid_response_cache(tmp_path,monkeypatch,capsys):
+    import json
+    import autoclip.automatic as module
+    from autoclip.util import read_json
+    video=tmp_path/'source.mp4';video.write_bytes(b'source')
+    frame=tmp_path/'frame.jpg';frame.write_bytes(b'frame')
+    monkeypatch.setattr(module,'contact_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'subtitle_evidence_sheet',lambda *a:frame)
+    monkeypatch.setattr(module,'read_scene_observations',_scene_stub)
+    plan=sample_plan();before=plan.model_dump()
+    lines=[Line(id=i,start=i*10+.5,end=i*10+5,text='对白') for i in range(4)]
+    voices={'source':source_identity(video),'transcript_digest':digest([s.model_dump() for s in lines]),'lines':[]}
+    class CachedModel:
+        def __init__(self):self.cache={};self.requests=[]
+        def json(self,system,prompt,images):
+            if prompt in self.cache:return self.cache[prompt]
+            self.requests.append(prompt)
+            group=json.JSONDecoder().raw_decode(prompt.split('\nunits=',1)[1])[0]
+            if group[0]['id']=='title' and '恢复轮次' not in prompt:
+                result={'units':['title'],'issues':[]}
+            else:
+                result={'issues':[],'units':[{'id':u['id'],'verdict':'supported','reason':'原片支持',
+                    'evidence_ids':u.get('evidence_ids',[0]),'frame_ids':[0],
+                    'identity_basis':'no_identity_claim','subjects':[]} for u in group]}
+            self.cache[prompt]=result
+            return result
+    model=CachedModel();cfg=Settings(repair_attempts=1)
+    with pytest.raises(ValueError,match='格式或引用校验失败'):
+        module.audit_plan(video,plan,lines,voices,tmp_path,cfg,model)
+    assert not (tmp_path/'automatic-review.json').exists()
+    assert read_json(tmp_path/'automatic-review-state.json')['status']=='failed'
+    assert list(tmp_path.glob('automatic-review/*/batch-0-protocol-resume.json'))
+    report=module.audit_plan(video,plan,lines,voices,tmp_path,cfg,model)
+    assert report['passed'] and any('恢复轮次1' in p for p in model.requests)
+    requests=len(model.requests)
+    assert module.audit_plan(video,plan,lines,voices,tmp_path,cfg,model)['passed']
+    assert len(model.requests)==requests and plan.model_dump()==before
+    state=read_json(tmp_path/'automatic-review-state.json')
+    assert state['completed_batches']==state['total_batches'] and state['status']=='completed'
+    assert '内容核对' in capsys.readouterr().out
+    assert not (tmp_path/'plan-approved.json').exists()
 
 
 @pytest.mark.parametrize('bad',['missing','duplicate','out_of_range','malformed'])

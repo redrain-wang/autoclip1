@@ -2,8 +2,11 @@
 import fcntl
 import json
 import re
+import signal
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .automatic import (VERSION as REVIEW_VERSION, FrozenAutomaticScript, assert_approval, audit_plan,
@@ -109,8 +112,10 @@ def checkpoint(root, name, inputs, action):
         write_json(marker, {'signature':signature,'status':'completed','result':result,
                            'result_digest':digest(result),'artifacts':hashes,'seconds':round(time.monotonic()-started,3)})
         return result
-    except Exception as exc:
-        write_json(marker, {'signature':signature,'status':'failed','error':str(exc)[:2000]})
+    except BaseException as exc:
+        write_json(marker, {'signature':signature,
+            'status':'failed' if isinstance(exc,Exception) else 'interrupted',
+            'error':str(exc)[:2000] or type(exc).__name__})
         raise
 
 
@@ -384,6 +389,12 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
     llm = LLM(cfg,root)
     def state(stage):
         write_json(base/'status.json',{'stage':stage,'source':str(video),'run':str(root)})
+        project_status=base.parent.parent/'series-status.json'
+        if project_status.exists():
+            current=read_json(project_status)
+            if current.get('current_episode')==str(video):
+                write_json(project_status,{**current,'stage':stage})
+        print(f'{video.stem}：{stage}',flush=True)
     try:
         def analysis_action():
             state('整理本集与前情')
@@ -461,13 +472,59 @@ def run_episode(video, base, input_root, lines, seconds, cfg, bank, manifest, br
         llm.client.close()
 
 
+@contextmanager
+def production_interrupts():
+    """Record terminal close/termination through the same path as Ctrl+C."""
+    previous={}
+    def stop(signum,frame):
+        raise KeyboardInterrupt(f'收到{signal.Signals(signum).name}，制作中断，已完成缓存保留')
+    if threading.current_thread() is threading.main_thread():
+        for name in ('SIGTERM','SIGHUP'):
+            if hasattr(signal,name):
+                signum=getattr(signal,name)
+                previous[signum]=signal.signal(signum,stop)
+    try:
+        yield
+    finally:
+        for signum,handler in previous.items():signal.signal(signum,handler)
+
+
 def run_series(source, output=None, series=None, config=None, library=None, voice_manifest=None,
                model_path=None, voice_python=None, limit=None, stage='all', test_sample=False):
     output = Path(output or default_project_output(source,test_sample)).resolve()
     output.mkdir(parents=True,exist_ok=True)
     with (output/'project.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        return _run_series(source,output,series,config,library,voice_manifest,model_path,voice_python,limit,stage,test_sample)
+        status_path=output/'series-status.json'
+        if status_path.exists() and (old:=read_json(status_path)).get('status')=='running':
+            # We hold the exclusive project lock: this is a stale status, not
+            # evidence of a live job. Hard kills cannot execute cleanup handlers.
+            write_json(output/'last-interruption.json',{'previous_status':old,
+                'reason':'上次未正常结束，退出原因未记录；按有效断点继续'})
+            print('检测到上次未正常结束，将复用已完成步骤继续。',flush=True)
+        try:
+            with production_interrupts():
+                return _run_series(source,output,series,config,library,voice_manifest,model_path,voice_python,limit,stage,test_sample)
+        except BaseException as exc:
+            if status_path.exists():
+                current=read_json(status_path)
+                if current.get('status')=='running':
+                    state='failed' if isinstance(exc,Exception) else 'interrupted'
+                    message=str(exc)[:2000] or type(exc).__name__
+                    outcomes=list(current.get('episodes',[]))
+                    video=Path(current['current_episode']) if current.get('current_episode') else None
+                    if video and video.is_file():
+                        base=output/'episodes'/(video.stem+'-'+digest(source_identity(video)))
+                        active=read_json(base/'status.json') if (base/'status.json').exists() else {}
+                        if active.get('stage')!='已完成':
+                            outcome={'source':str(video),'status':state,'error':message,
+                                'run':active.get('run'),'interrupted_stage':active.get('stage',current.get('stage'))}
+                            write_json(base/'status.json',{**outcome,'stage':'制作中断，可续跑' if state=='interrupted' else '自动处理失败，可续跑'})
+                            outcomes=[o for o in outcomes if o.get('source')!=str(video)]+[outcome]
+                    write_json(status_path,{**current,'status':state,'error':message,'episodes':outcomes})
+                    from .feedback import summarize_project
+                    summarize_project(output)
+            raise
 
 
 def failed_episode_voice_followup(video, base, lines, voices, cfg, library, model_path=None, voice_python=None):

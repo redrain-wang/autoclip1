@@ -35,11 +35,20 @@ def series_production(source: Path, output: Path | None = typer.Option(None, hel
     from .series import run_series
     try:
         result = run_series(source,output,series,config,library,voice_manifest,model_path,voice_python,limit,stage,test_sample)
+    except KeyboardInterrupt as exc:
+        console.print(str(exc) or '制作已中断，进度已保存；可用原命令续跑。',markup=False)
+        raise typer.Exit(130) from exc
     except (ValueError, OSError) as exc:
         console.print(str(exc),markup=False)
         raise typer.Exit(1) from exc
     console.print(json.dumps(result,ensure_ascii=False,indent=2),markup=False)
     if result['status'] == 'partial_failure':
+        completed=sum(e.get('status')=='completed' for e in result.get('episodes',[]))
+        console.print(f'已完成{completed}集，其余失败。' if completed else
+                      '本次未产出成片。进度已保存，修复问题后可用原命令续跑。',markup=False)
+        for episode in result.get('episodes',[]):
+            if episode.get('status')=='failed':
+                console.print(f'{Path(episode["source"]).name}：{episode.get("error","未知错误")}',markup=False)
         raise typer.Exit(1)
     if result['status'] == 'waiting_voice_confirmation':
         raise typer.Exit(2)

@@ -28,6 +28,56 @@ def test_failed_stage_is_retried_not_marked_completed(tmp_path):
     assert module.checkpoint(tmp_path,'one',{},lambda:('ready',[]))=='ready'
 
 
+@pytest.mark.parametrize('interruption',[KeyboardInterrupt(),SystemExit(143)])
+def test_interrupted_checkpoint_is_recorded_and_resumed(tmp_path,interruption):
+    def stop():raise interruption
+    with pytest.raises(type(interruption)):
+        module.checkpoint(tmp_path,'one',{},stop)
+    assert read_json(tmp_path/'stages/one.json')['status']=='interrupted'
+    assert module.checkpoint(tmp_path,'one',{},lambda:('resumed',[]))=='resumed'
+
+
+@pytest.mark.parametrize('kind',['keyboard','SIGTERM','SIGHUP'])
+def test_series_records_terminal_interrupt_in_project_episode_and_checkpoint(tmp_path,monkeypatch,kind):
+    import signal
+    video=tmp_path/'02.mp4';video.write_bytes(b'video')
+    output=tmp_path/'project'
+    base=output/'episodes'/(video.stem+'-'+module.digest(source_identity(video)))
+    root=base/'runs/fixture'
+    previous={name:signal.getsignal(getattr(signal,name)) for name in ('SIGTERM','SIGHUP')}
+    def interrupted(*args):
+        write_json(output/'series-status.json',{'status':'running','current_episode':str(video),'episodes':[]})
+        write_json(base/'status.json',{'stage':'自动测时、内容核对与局部修复','run':str(root)})
+        def stop():
+            if kind=='keyboard':raise KeyboardInterrupt()
+            signal.raise_signal(getattr(signal,kind))
+        module.checkpoint(root,'approval',{},stop)
+    monkeypatch.setattr(module,'_run_series',interrupted)
+    with pytest.raises(KeyboardInterrupt):module.run_series(video,output)
+    assert read_json(output/'series-status.json')['status']=='interrupted'
+    assert read_json(base/'status.json')['status']=='interrupted'
+    assert read_json(root/'stages/approval.json')['status']=='interrupted'
+    assert read_json(output/'project-report.json')['episodes'][0]['status']=='interrupted'
+    assert all(signal.getsignal(getattr(signal,name))==handler for name,handler in previous.items())
+    monkeypatch.setattr(module,'_run_series',lambda *a:{'status':'completed'})
+    assert module.run_series(video,output)['status']=='completed'
+
+
+def test_stale_running_state_is_detected_only_after_acquiring_project_lock(tmp_path,monkeypatch,capsys):
+    import fcntl
+    output=tmp_path/'project';output.mkdir()
+    old={'status':'running','stage':'preparing_episode','episodes':[]}
+    write_json(output/'series-status.json',old)
+    monkeypatch.setattr(module,'_run_series',lambda *a:{'status':'completed'})
+    with (output/'project.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        with pytest.raises(BlockingIOError):module.run_series(tmp_path/'02.mp4',output)
+        assert not (output/'last-interruption.json').exists()
+    assert module.run_series(tmp_path/'02.mp4',output)['status']=='completed'
+    assert read_json(output/'last-interruption.json')['previous_status']==old
+    assert '上次未正常结束' in capsys.readouterr().out
+
+
 def test_discovery_naturally_sorts_and_excludes_output(tmp_path):
     for name in ['10.mp4','2.mp4','1.mp4']:(tmp_path/name).write_bytes(b'v')
     output=tmp_path/'output';output.mkdir();(output/'new.mp4').write_bytes(b'render')
@@ -319,3 +369,18 @@ def test_command_can_start_without_output_and_defaults_to_production(tmp_path,mo
     assert sample.exit_code==0 and calls[-1][-1] is True
     assert module.default_project_output(video)!=module.default_project_output(video,True)
     assert module.default_project_output(video)==module.default_project_output(video)
+
+
+@pytest.mark.parametrize('completed',[False,True])
+def test_failed_series_command_clearly_reports_whether_any_film_was_produced(tmp_path,monkeypatch,completed):
+    from typer.testing import CliRunner
+    from autoclip.cli import app
+    video=tmp_path/'02.mp4'
+    episodes=[{'source':str(video),'status':'failed','error':'窗口编号重复[0, 0]'}]
+    if completed:episodes.append({'source':str(tmp_path/'01.mp4'),'status':'completed'})
+    monkeypatch.setattr(module,'run_series',lambda *a:{'status':'partial_failure','episodes':episodes})
+    result=CliRunner().invoke(app,['series',str(video)])
+    assert result.exit_code==1
+    assert '02.mp4：窗口编号重复[0, 0]' in result.output
+    assert ('本次未产出成片' in result.output) is not completed
+    if completed:assert '已完成1集，其余失败' in result.output
