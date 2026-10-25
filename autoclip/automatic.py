@@ -463,9 +463,19 @@ def assess_batch(raw, units, lines, frame_count, voice_rows, caption_readings=()
                 missing=[name for name in subjects if len(name)<2 or not explicit_reference_in_source(name,cited_text,context)
                          or not explicit_reference_in_source(name,target['text'],context)]
                 if not subjects or missing:
+                    cited_rows=[{'id':i,'text':caption_text.get(i,lookup[i].text)} for i in cited_ids]
+                    literal_names=[name for name in missing if len(name)>=2 and name in target['text']]
+                    detail='\n该proof实际引用='+json.dumps(cited_rows,ensure_ascii=False)
+                    if literal_names:
+                        candidates=[{'id':s.id,'text':caption_text.get(s.id,s.text)} for s in lines
+                            if ('end' not in target or s.start<target['end']
+                                or s.id in target.get('shown_evidence',[])
+                                or (target.get('mode')=='original' and s.start<target['end']+8))
+                            and any(name in caption_text.get(s.id,s.text) for name in literal_names)][:6]
+                        detail+='\n同名字面候选（供对图复核，非身份认定，不自动补引用或放行）='+json.dumps(candidates,ensure_ascii=False)
                     issues.append({'id':unit.id,'message':'被提及人物须在所引对白及当前稿中明确出现，不能靠未引用的声音候选补出身份；'
                         '本次未满足的subjects='+json.dumps(missing or subjects,ensure_ascii=False)
-                        +'。如人物需通过称呼、回应或声音认定，须重核实际依据，不能将认人标成仅被提及。'})
+                        +'。如人物需通过称呼、回应或声音认定，须重核实际依据，不能将认人标成仅被提及。'+detail})
             if basis == 'voice_and_context':
                 associated = [voices.get(i, {}) for i in cited_ids]
                 candidate_names = {name for r in associated for s in r.get('samples',[])
