@@ -1,5 +1,6 @@
 """Long commentary must remain commentary after timing and factual repairs."""
 import json
+import math
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
@@ -83,6 +84,89 @@ def require_commentary(clip, cfg, timing=None):
                             or metrics['substantial_paragraphs']<8):
         raise ValueError('长片解说退化为碎片过场，须重新安排章节解说与原声，不能靠扩写空话放行：'+str(metrics))
     return metrics
+
+
+def commentary_balance_issues(clip, cfg, timing, lines, llm=None, root=None):
+    """Return bounded expansion work after factual edits reduce whole-film depth.
+
+    Keep the existing quantity thresholds. Prefer developed commentary with
+    evidence and measured footage headroom; no original is converted or padded.
+    Proposed text still needs local source verification and all final reviews.
+    """
+    if not formal_long(cfg) or not timing or 'beats' not in timing:return []
+    metrics=commentary_metrics(clip,timing)
+    missing_chars=max(0,1800-metrics['narration_chars'])
+    missing_paragraphs=max(0,8-metrics['substantial_paragraphs'])
+    total=sum(row['output_seconds'] for row in timing['beats'])
+    missing_seconds=max(0,(.30*total-metrics['narration_seconds'])/.70)
+    if not (missing_chars or missing_paragraphs or missing_seconds):return []
+    remaining=max(missing_chars,math.ceil(missing_seconds*4.5))
+    lookup={s.id:s for s in lines}
+    candidates=[]
+    for index,beat in enumerate(clip.beats):
+        if beat.mode!='narration':continue
+        own=[lookup[i] for i in beat.evidence_ids if i in lookup and lookup[i].start<beat.end and lookup[i].end>beat.start]
+        if len(own)<2:continue
+        chars=spoken_characters(beat.text)
+        row=timing['beats'][index]
+        room=max(0,(beat.end-beat.start)*1.4-.35-row['output_seconds'])
+        capacity=min(120,math.floor(room*4.5))
+        if capacity<8:continue
+        candidates.append((index,chars,capacity,len(own)))
+    candidates.sort(key=lambda r:(not (missing_paragraphs and r[1]<80),r[1]<80,-r[2],-r[3]))
+    rationales={}
+    if candidates and llm is not None:
+        from .editorial import audience_script
+        offered={r[0]:r for r in candidates[:8]}
+        choices=[{'beat':i,'current_chars':chars,'maximum_added_chars':capacity,
+            'text':clip.beats[i].text,'editorial_note_not_fact':clip.beats[i].reason,
+            'source_lines':[lookup[e].model_dump() for e in clip.beats[i].evidence_ids if e in lookup]}
+            for i,chars,capacity,_ in offered.values()]
+        prompt=('事实删改后全片的讲述分量不足。只选择1–3个值得补充有据解释的主要交锋段，不写稿、不改时间。'
+            '选择尚未讲透的必要处境、行动约束、真实取舍或已发生后果；不能仅因有画面空间就挑普通待客、铺床、端水、走路、问候来凑字。'
+            '优先把关键冲突说清楚；旧稿和内部编辑备注不是事实依据，ASR也可能有错字。选段理由只是后续编辑建议，不能当成新事实。'
+            '每个beat必须来自offered，evidence_ids仅用该候选source_lines内的实际编号，不能引用后文。'
+            '只返回JSON {"choices":[{"beat":整数编号,"reason":"还缺哪一点必要解释","evidence_ids":[实际编号]}]}。'
+            +f'\n当前全片指标{json.dumps(metrics,ensure_ascii=False)}'
+            +'\naudience='+json.dumps(audience_script(clip),ensure_ascii=False)
+            +'\noffered='+json.dumps(choices,ensure_ascii=False))
+        feedback=''
+        for attempt in range(cfg.repair_attempts+1):
+            raw=review_json(llm,'你是剧情解说编辑，只选择有真实讲述价值的展开位置，拒绝为下限凑字。',prompt+feedback)
+            if root:write_json(root/'commentary-balance'/digest(clip.model_dump())/f'selection-{attempt}.json',raw)
+            try:
+                picked=raw.get('choices') if isinstance(raw,dict) else None
+                if not isinstance(picked,list) or not 1<=len(picked)<=3:raise ValueError('须返回1–3个候选位置')
+                ids=[]
+                for choice in picked:
+                    index=choice.get('beat')
+                    if type(index) is not int or index not in offered or index in ids:raise ValueError('只能选择给定候选编号一次')
+                    cited=choice.get('evidence_ids')
+                    if (not isinstance(cited,list) or not cited or any(type(i) is not int for i in cited)
+                            or not set(cited).issubset(clip.beats[index].evidence_ids)):raise ValueError('选段引用必须来自本候选')
+                    reason=choice.get('reason')
+                    if not isinstance(reason,str) or not reason.strip():raise ValueError('须说明还缺少的必要解释')
+                    ids.append(index);rationales[index]=reason
+                candidates=[offered[index] for index in ids]
+                break
+            except ValueError as exc:
+                if attempt==cfg.repair_attempts:raise ValueError('讲述补充位置选择未通过：'+str(exc)) from exc
+                feedback=f'\n第{attempt+1}轮位置选择无效：{exc}；只依据给定候选重选，不扩大事实范围。'
+    issues=[]
+    for index,chars,capacity,_ in candidates[:3]:
+        increase=min(capacity,max(24,remaining,90-chars if missing_paragraphs and chars<80 else 0))
+        if increase<=0:continue
+        issues.append({'id':f'beat-{index}','stage':'commentary_balance','minimum_chars':chars+increase,
+            'message':f'事实修订后全片解说尚差{missing_chars}个有效字、约{missing_seconds:.1f}秒、{missing_paragraphs}个展开段。'
+                f'本段已有{chars}个有效字，实测画面尚有空间；至少写到{chars+increase}个有效字。'
+                '只补充当前原片证据支持、尚未讲清的必要处境、选择约束或因果；保留原有正确解释。'
+                '不要扩写普通落座、走路等短转场，不重复原声，不编内心或后续结果，不用空话凑数。'
+                '若本段证据不足以展开则不得编造；修改后仍须实配、逐段原片和整稿五项核验。'
+                +'选段编辑建议（不是新事实）：'+rationales.get(index,'补充已有依据但尚未说清的必要解释')})
+        remaining=max(0,remaining-increase)
+        if chars<80<=chars+increase:missing_paragraphs=max(0,missing_paragraphs-1)
+        if not remaining and not missing_paragraphs:break
+    return issues
 
 
 class NarrativeFinding(BaseModel):

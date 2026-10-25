@@ -1169,8 +1169,9 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
         feedback = ''
         for retry in range(cfg.repair_attempts+1):
             print(f'局部修稿：{label}，第{retry+1}/{cfg.repair_attempts+1}次修订',flush=True)
-            raw = (llm.json('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback,repair_images)
-                   if repair_images else llm.json('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback))
+            writer=(lambda *args:review_json(llm,*args)) if retry else llm.json
+            raw = (writer('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback,repair_images)
+                   if repair_images else writer('你是局部修稿编辑，只依据提供证据修复当前一个单位。',prompt+feedback))
             record = root/'automatic-repairs'/str(attempt)/uid/f'attempt-{retry}.json'
             try:
                 if uid == 'title':
@@ -1192,6 +1193,11 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                     raise ValueError('当前修订未改变稿件或镜头，不能用原稿重复核验；须落实具体问题')
                 if uid.startswith('beat-'):
                     index=int(uid.split('-')[1])
+                    minimum=max((i.get('minimum_chars',0) for i in target_issues if i.get('stage')=='commentary_balance'),default=0)
+                    if minimum:
+                        from .budget import spoken_characters
+                        if spoken_characters(candidate.clips[0].beats[index].text)<minimum:
+                            raise ValueError(f'全片讲述补充未落实，本段须至少{minimum}个有效字；只补有据解释，不能重复或编造')
                     if max_characters is None:
                         require_paragraph_preserved(target['text'],candidate.clips[0].beats[index].text,cfg,issues=target_issues)
                         if condense:require_commentary(candidate.clips[0],cfg)

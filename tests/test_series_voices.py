@@ -49,6 +49,16 @@ def test_service_interruption_resumes_review_instead_of_requesting_human_voice_c
     assert not (root/'plan-approved.json').exists()
 
 
+def test_commentary_deficit_does_not_recycle_an_old_voice_problem(tmp_path,monkeypatch):
+    video,library,bank,cfg,base,lines,voices,root,report,calls=failed_run(tmp_path,monkeypatch)
+    assert series.failed_episode_voice_followup(video,base,lines,voices,cfg,library)
+    write_json(base/'status.json',{'status':'waiting_voice_confirmation','run':str(root),
+        'error':'长片解说退化为碎片过场，须重新安排章节解说与原声：少33字'})
+    assert series.failed_episode_voice_followup(video,base,lines,voices,cfg,library) is None
+    assert read_json(base/'voice-followup.json')['status']=='superseded'
+    assert len(calls)==1 and read_json(library)==bank
+
+
 @pytest.mark.parametrize('state,matching',[('running',True),('completed',False),('completed',True)])
 def test_followup_requires_latest_review_to_finish(tmp_path,monkeypatch,state,matching):
     video,library,bank,cfg,base,lines,voices,root,report,calls=failed_run(tmp_path,monkeypatch)

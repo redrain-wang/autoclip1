@@ -24,7 +24,7 @@ from .models import Line, Plan, validate_plan
 from .outline import compose_outline
 from .planning import VERSION as PLANNING_VERSION, plan_outline
 from .render import render_clip, VERSION as RENDER_VERSION
-from .narrative import NARRATIVE_POLICY, NARRATIVE_REVIEW_POLICY, require_commentary, review_commentary, require_commentary_review, formal_long
+from .narrative import NARRATIVE_POLICY, NARRATIVE_REVIEW_POLICY, require_commentary, review_commentary, require_commentary_review, formal_long, commentary_balance_issues
 from .report import build_report
 from .research import prepare_research
 from .sample import measure_sample_plan
@@ -185,7 +185,7 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
     """Shared long/short measurement and source review; no human approval artifact."""
     issues = []
     repairs = {'timing':0, 'content':0}
-    if formal_long(cfg):repairs['selection']=0
+    if formal_long(cfg):repairs.update(selection=0,commentary=0)
     reviewed_failures=set()
     # TTS alignment must not consume the later factual repair allowance.
     # Each category remains bounded, including regressions after a content edit.
@@ -232,36 +232,40 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
                     issues.append({'id':f'beat-{index}', 'message':item['message'], 'measurement':row})
         else:
             category = 'content'
-            metrics=require_commentary(plan.clips[0],cfg,timing)
-            write_json(root/'commentary-quality.json',{'policy':NARRATIVE_POLICY,**metrics})
-            report = audit_plan(video,plan,lines,voices,root,cfg,llm)
-            issues = report['issues']
-            if report['passed']:
-                narrative=review_commentary(plan.clips[0],lines,cfg,llm,root,timing=timing)
-                if narrative is not None:
-                    report={**report,'narrative_review':narrative}
-                    issues=[({'id':f'original-{i["beat"]}','stage':'selection_review',
-                             'action':i['action'],'review_policy':NARRATIVE_REVIEW_POLICY,
-                             'clip_digest':digest(plan.clips[0].model_dump()),
-                             'beat_digest':digest(plan.clips[0].beats[i['beat']].model_dump()),
-                             'message':'原声选材与节奏：'+i['problem']+'；修订方向：'+i['direction']}
-                            if plan.clips[0].beats[i['beat']].mode=='original' else
-                            {'id':f'beat-{i["beat"]}','stage':'narrative_review',
-                             'text_digest':digest(plan.clips[0].beats[i['beat']].text),
-                             'message':'整稿解说质量：'+i['problem']+'；修订方向：'+i['direction']})
-                            for i in narrative['issues']]
-                    if any(i['stage']=='selection_review' for i in issues):
-                        category='selection'
-                        # Structural edits change paragraph numbers. Re-review
-                        # the result before using any old narration findings.
-                        issues=[i for i in issues if i['stage']=='selection_review']
-                    report['passed']=narrative['passed']
-                    report['issues']=issues
-                    write_json(root/'automatic-review.json',report)
-            if report['passed']:
-                write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':None})
-                write_json(root/'plan-approved.json',plan.model_dump())
-                return plan, report
+            issues=commentary_balance_issues(plan.clips[0],cfg,timing,lines,llm,root)
+            if issues:
+                category='commentary'
+            else:
+                metrics=require_commentary(plan.clips[0],cfg,timing)
+                write_json(root/'commentary-quality.json',{'policy':NARRATIVE_POLICY,**metrics})
+                report = audit_plan(video,plan,lines,voices,root,cfg,llm)
+                issues = report['issues']
+                if report['passed']:
+                    narrative=review_commentary(plan.clips[0],lines,cfg,llm,root,timing=timing)
+                    if narrative is not None:
+                        report={**report,'narrative_review':narrative}
+                        issues=[({'id':f'original-{i["beat"]}','stage':'selection_review',
+                                 'action':i['action'],'review_policy':NARRATIVE_REVIEW_POLICY,
+                                 'clip_digest':digest(plan.clips[0].model_dump()),
+                                 'beat_digest':digest(plan.clips[0].beats[i['beat']].model_dump()),
+                                 'message':'原声选材与节奏：'+i['problem']+'；修订方向：'+i['direction']}
+                                if plan.clips[0].beats[i['beat']].mode=='original' else
+                                {'id':f'beat-{i["beat"]}','stage':'narrative_review',
+                                 'text_digest':digest(plan.clips[0].beats[i['beat']].text),
+                                 'message':'整稿解说质量：'+i['problem']+'；修订方向：'+i['direction']})
+                                for i in narrative['issues']]
+                        if any(i['stage']=='selection_review' for i in issues):
+                            category='selection'
+                            # Structural edits change paragraph numbers. Re-review
+                            # the result before using any old narration findings.
+                            issues=[i for i in issues if i['stage']=='selection_review']
+                        report['passed']=narrative['passed']
+                        report['issues']=issues
+                        write_json(root/'automatic-review.json',report)
+                if report['passed']:
+                    write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':None})
+                    write_json(root/'plan-approved.json',plan.model_dump())
+                    return plan, report
         write_json(root/f'issues-{attempt}.json',issues)
         failure=digest({'category':category,'plan':plan.model_dump(),'issues':issues})
         if failure in reviewed_failures:
@@ -544,15 +548,16 @@ def failed_episode_voice_followup(video, base, lines, voices, cfg, library, mode
     if previous and previous.parent==(base/'runs').resolve() and (previous/'stages/approval.json').is_file():
         approval=read_json(previous/'stages/approval.json')
         if approval.get('status')=='failed' and not error:error=str(approval.get('error',''))
-    interrupted=error.startswith(('已达到本次 API 调用次数上限','模型调用失败','模型接口 HTTP','配音服务失败'))
-    if interrupted or (error.startswith('自动审核批次') and '格式或引用校验失败' in error):
+    automatic_pending=error.startswith(('已达到本次 API 调用次数上限','模型调用失败','模型接口 HTTP','配音服务失败',
+                                       '长片解说退化为碎片过场'))
+    if automatic_pending or (error.startswith('自动审核批次') and '格式或引用校验失败' in error):
         # Older versions could create a voice task from a stale report after a
         # protocol failure. Such a task has no completed current identity audit.
         pointer=base/'voice-followup.json'
         if pointer.exists():
             task=read_json(pointer)
             if task.get('status')=='waiting_voice_confirmation':
-                write_json(pointer,{**task,'status':'superseded','reason':'服务中断或审核响应校验失败，先继续自动核对'})
+                write_json(pointer,{**task,'status':'superseded','reason':'当前自动处理尚未完成，先继续核对，不能用旧问题要求人工补录'})
         return None
     pending=pending_voice_followup(video,lines,voices,base,cfg,library)
     if pending:return pending
