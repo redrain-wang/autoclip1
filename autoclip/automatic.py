@@ -2,12 +2,13 @@
 import json
 import re
 import threading
+from copy import deepcopy
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 from .identity import units_for_clip, file_hash
 from .editorial import audience_script, prose_signals, require_oral_style, WRITING_RULES
@@ -107,11 +108,68 @@ class UnitIssue(BaseModel):
     message: str = Field(min_length=1)
 
 
+def normalize_review_response(raw):
+    """Recover harmless format drift, retaining every substantive assertion.
+
+    Empty extension fields carry no review decision. Nonempty unit notes move
+    to the existing batch-note channel, which still checks required corrections.
+    Required fields, verdicts, citations and unknown nonempty fields stay strict.
+    The caller keeps the untouched model response as the audit trail.
+    """
+    if not isinstance(raw,dict):return raw,[]
+    normalized=deepcopy(raw)
+    changes=[]
+    def empty(value):
+        return value is None or (isinstance(value,(str,list,dict)) and len(value)==0)
+    def remove_empty_extensions(row,allowed,path):
+        for key in list(row):
+            if key not in allowed and empty(row[key]):
+                del row[key]
+                changes.append({'path':f'{path}.{key}','operation':'remove_empty_extension'})
+    # Keep passed strict in UnitReviews; only ReviewBatch accepts that field.
+    remove_empty_extensions(normalized,{'units','issues','notes','passed'},'response')
+    units=normalized.get('units')
+    if not isinstance(units,list):return normalized,changes
+    for index,unit in enumerate(units):
+        if not isinstance(unit,dict):continue
+        path=f'units[{index}]'
+        notes=unit.get('notes')
+        if notes and isinstance(unit.get('id'),str):
+            entries=notes if isinstance(notes,list) else [notes]
+            lifted=[]
+            for note in entries:
+                if isinstance(note,str) and note.strip():
+                    lifted.append({'id':unit['id'],'message':note})
+                elif (isinstance(note,dict) and set(note).issubset({'id','message'})
+                        and note.get('id',unit['id'])==unit['id']
+                        and isinstance(note.get('message'),str) and note['message'].strip()):
+                    lifted.append({'id':unit['id'],'message':note['message']})
+                else:break
+            else:
+                batch_notes=normalized.get('notes',[])
+                if isinstance(batch_notes,list):
+                    normalized['notes']=[*batch_notes,*lifted]
+                    del unit['notes']
+                    changes.append({'path':path+'.notes','operation':'move_to_batch_notes','count':len(lifted)})
+        remove_empty_extensions(unit,set(UnitDecision.model_fields),path)
+        proofs=unit.get('subject_evidence')
+        if isinstance(proofs,list):
+            for number,proof in enumerate(proofs):
+                if isinstance(proof,dict):
+                    remove_empty_extensions(proof,set(SubjectIdentity.model_fields),f'{path}.subject_evidence[{number}]')
+    return normalized,changes
+
+
 class UnitReviews(BaseModel):
     model_config = ConfigDict(extra='forbid')
     units: list[UnitDecision]
     issues: list[UnitIssue]
     notes: list[UnitIssue] = Field(default_factory=list)
+
+    @model_validator(mode='before')
+    @classmethod
+    def recover_review_format(cls,raw):
+        return normalize_review_response(raw)[0]
 
 
 class ReviewBatch(UnitReviews):
@@ -656,7 +714,13 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
         rejected_record = None
         for retry in range(cfg.repair_attempts+1):
             call=(lambda *args:review_json(llm,*args)) if retry or resume else llm.json
-            raw = call('你是独立的影视内容与人物证据审核员。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,review_images)
+            recovered=None
+            if retry==0 and resume:
+                try:
+                    (OriginalReviewBatch if original else UnitReviews).model_validate(resume['raw'])
+                    recovered=resume['raw']
+                except ValueError:pass
+            raw = recovered if recovered is not None else call('你是独立的影视内容与人物证据审核员。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,review_images)
             try:
                 decisions = (OriginalReviewBatch if original else UnitReviews).model_validate(raw)
                 checked = decisions.model_dump()
@@ -770,7 +834,8 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                     'units必须是对象数组，每项完整包含id/verdict/reason/evidence_ids/frame_ids/identity_basis/subjects，'
                     '不能以单位ID字符串代替对象；顶层必须包含issues数组，无附加问题时返回空数组。'
                     '请重审同一批units，不要直接修改稿件，不得为了修复格式把存疑内容放行。')
-        record = {'units':group,'times':times,'raw':raw,'issues':issues}
+        record = {'units':group,'times':times,'raw':raw,'issues':issues,
+                  'format_repairs':normalize_review_response(raw)[1]}
         write_json(folder/f'batch-{offset}.json',record)
         frames = [{'path':str(p.resolve()),'sha256':file_hash(p),
             **({'purpose':'metadata_captions'} if metadata and p==caption_sheet else {})} for p in review_images]
@@ -980,6 +1045,7 @@ def verify_narration_patch(video, candidate, uid, prior_claims, lines, voices, r
                 'voice_and_context必须使用给定候选名；explicit_address_response须有至少两条明确称呼及回应。'
                 '没有依据就unknown并说明缺口，不能仅切换标签放行。返回完整units和issues对象。')
     write_json(root/'verification.json',{'raw':raw,'passed':not issues,'issues':issues,
+        'format_repairs':normalize_review_response(raw)[1],
         'unit':unit,'frames':[{'path':str(p.resolve()),'sha256':file_hash(p)} for p in images]})
     if issues:raise ValueError('局部修订仍未解决原片问题：'+json.dumps(issues,ensure_ascii=False))
 
