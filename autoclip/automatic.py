@@ -922,7 +922,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
 
 
 def retain_short_source_audio(plan, uid, lines, cfg, source_seconds):
-    """Keep real dialogue after bounded prose repairs, with whole-film safeguards."""
+    """Keep complete dialogue pending full measurement and whole-film review."""
     if source_seconds is None or not uid.startswith('beat-'):
         return None
     index = int(uid.split('-')[1])
@@ -952,8 +952,9 @@ def retain_short_source_audio(plan, uid, lines, cfg, source_seconds):
     revised.clips[0].beats[index] = Beat(mode='original',start=start,end=end,
         text='',evidence_ids=ids,reason='局部口播修稿未通过，保留本区间完整真实对白；仍须重新测时及核对剪辑和全稿')
     try:
-        require_commentary(revised.clips[0],cfg)
-        validate_plan(revised,lines,source_seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+        if not formal_long(cfg):require_commentary(revised.clips[0],cfg)
+        validate_plan(revised,lines,source_seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening,
+            check_duration=not formal_long(cfg))
     except ValueError:
         return None
     return revised

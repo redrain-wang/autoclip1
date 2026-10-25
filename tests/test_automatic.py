@@ -1410,7 +1410,7 @@ def test_scoped_finding_suffix_keeps_rejection_without_accepting_other_beats():
 
 
 @pytest.mark.parametrize('case',['complete','trimmed_sentence','neighbor_overlap','too_little_commentary'])
-def test_failed_long_narration_can_keep_source_only_with_safe_cuts_and_enough_remaining_commentary(case):
+def test_failed_long_narration_can_keep_safe_source_pending_final_commentary_balance(case):
     from autoclip.automatic import retain_short_source_audio
     cfg=Settings(duration_profile='long',target_seconds=1200,min_seconds=1080,max_seconds=1320,opening='original')
     text='已经明确的处境和选择'*10
@@ -1424,7 +1424,10 @@ def test_failed_long_narration_can_keep_source_only_with_safe_cuts_and_enough_re
     if case=='neighbor_overlap':lines[3].start=119
     before=plan.model_dump()
     result=retain_short_source_audio(plan,'beat-3',lines,cfg,1600)
-    assert (result is None)==(case in ('neighbor_overlap','too_little_commentary'))
+    assert (result is None)==(case=='neighbor_overlap')
+    if case=='too_little_commentary':
+        from autoclip.narrative import require_commentary
+        with pytest.raises(ValueError,match='碎片过场'):require_commentary(result.clips[0],cfg)
     if result is not None:
         changed=result.clips[0].beats[3]
         assert changed.mode=='original' and changed.text=='' and changed.evidence_ids==[3]
