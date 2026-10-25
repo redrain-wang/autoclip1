@@ -185,6 +185,30 @@ class OriginalReviewBatch(UnitReviews):
     units: list[OriginalDecision]
 
 
+def review_response_schema(units, frame_count, original=False):
+    """Bind a protocol recheck to actual units and main-sheet frames."""
+    schema=(OriginalReviewBatch if original else UnitReviews).model_json_schema()
+    ids=list(dict.fromkeys(u['id'] for u in units))
+    if not ids or frame_count<1:raise ValueError('审核响应约束缺少单位或主画面')
+    for name in ('UnitDecision','OriginalDecision','UnitIssue'):
+        if name not in schema['$defs']:continue
+        fields=schema['$defs'][name]['properties']
+        fields['id']={'type':'string','enum':ids}
+        if 'frame_ids' in fields:
+            fields['frame_ids']['items']={'type':'integer','enum':list(range(frame_count))}
+    return schema
+
+
+def review_response_constraints(units, frame_count, original=False):
+    ids=[u['id'] for u in units]
+    return ('\n本批返回格式的精确约束：units、issues、notes的id只能原样复制'
+        +json.dumps(ids,ensure_ascii=False)
+        +'，不能发明missing、gap、internal-boundary等新编号。跨单位缺口绑定本批受影响的实际单位，'
+        '可给同一id列多项具体问题；不能为了修正编号删除真实问题、拒绝结论或必要修订备注。'
+        'frame_ids仅用主图编号，补充字幕图不增加主图格数。'
+        '\n本批精确JSON格式='+json.dumps(review_response_schema(units,frame_count,original),ensure_ascii=False))
+
+
 class CaptionReading(BaseModel):
     model_config=ConfigDict(extra='forbid')
     line_id: int
@@ -363,7 +387,9 @@ def assess_batch(raw, units, lines, frame_count, voice_rows, caption_readings=()
     parsed = ReviewBatch.model_validate(raw)
     expected = {u['id']:u for u in units}
     if len(parsed.units) != len(expected) or {u.id for u in parsed.units} != set(expected):
-        raise ValueError('自动审核未精确覆盖全部待核单位')
+        raise ValueError('自动审核未精确覆盖全部待核单位；实际id='
+            +json.dumps([u.id for u in parsed.units],ensure_ascii=False)
+            +'，允许且必须覆盖的id='+json.dumps(list(expected),ensure_ascii=False))
     lookup = {s.id:s for s in lines}
     caption_text={r['line_id']:r['text'] for r in caption_readings}
     if not set(caption_text).issubset(lookup):
@@ -376,7 +402,9 @@ def assess_batch(raw, units, lines, frame_count, voice_rows, caption_readings=()
             # rejection under its unambiguous parent; never discard the issue.
             parents=[uid for uid in expected if issue.id.startswith(uid+'-')]
             if len(parents)!=1:
-                raise ValueError('自动审核问题指向了本批次以外的单位')
+                raise ValueError('自动审核问题指向了本批次以外的单位；非法id='
+                    +json.dumps(issue.id,ensure_ascii=False)+'，允许id='+json.dumps(list(expected),ensure_ascii=False)
+                    +'；跨单位缺口也须绑定本批实际单位，不能发明问题编号，真实拒绝及问题内容必须保留')
             issue.id=parents[0]
         issues.append(issue.model_dump())
     for issue in required_note_repairs(parsed.notes,units):
@@ -724,15 +752,17 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                 '准确概括此前已播放的对白、自然回顾已经发生的剧情，不要求当前每格重演一遍；须对照完整前情判断，'
                 '只有确实虚构动作、错配人物或将别处事件说成当前发生才拒绝，不能把未见当成相反事实。')
         rejected_record = None
+        scope_protocol=bool(resume and re.search('本批次以外|未精确覆盖全部待核单位',resume['error']))
         for retry in range(cfg.repair_attempts+1):
             call=(lambda *args:review_json(llm,*args)) if retry or resume else llm.json
             recovered=None
-            if retry==0 and resume:
+            if retry==0 and resume and not scope_protocol:
                 try:
                     (OriginalReviewBatch if original else UnitReviews).model_validate(resume['raw'])
                     recovered=resume['raw']
                 except ValueError:pass
-            raw = recovered if recovered is not None else call('你是独立的影视内容与人物证据审核员。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback,review_images)
+            contract=review_response_constraints(group,len(times),original) if scope_protocol else ''
+            raw = recovered if recovered is not None else call('你是独立的影视内容与人物证据审核员。稿件及历史审核结论不能充当事实依据；人工确认声纹仅在所标原片区间内有效。',prompt+feedback+contract,review_images)
             try:
                 decisions = (OriginalReviewBatch if original else UnitReviews).model_validate(raw)
                 checked = decisions.model_dump()
@@ -825,6 +855,7 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                         '没有这些依据就标unknown/contradicted，不能脑补姓名或用他人的声音放行。')
                 break
             except ValueError as exc:
+                if re.search('本批次以外|未精确覆盖全部待核单位',str(exc)):scope_protocol=True
                 write_json(folder/f'batch-{offset}-protocol-{retry}.json',{'raw':raw,'error':str(exc)})
                 if retry == cfg.repair_attempts:
                     if rejected_record is not None:
@@ -846,6 +877,8 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
                     'units必须是对象数组，每项完整包含id/verdict/reason/evidence_ids/frame_ids/identity_basis/subjects，'
                     '不能以单位ID字符串代替对象；顶层必须包含issues数组，无附加问题时返回空数组。'
                     '请重审同一批units，不要直接修改稿件，不得为了修复格式把存疑内容放行。')
+                if resume:
+                    feedback+='\n保留本次恢复轮次'+str(resume['round'])+'及原失败上下文：'+json.dumps(resume,ensure_ascii=False)
         record = {'units':group,'times':times,'raw':raw,'issues':issues,
                   'format_repairs':normalize_review_response(raw)[1]}
         write_json(folder/f'batch-{offset}.json',record)
