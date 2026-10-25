@@ -240,36 +240,45 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
             else:
                 metrics=require_commentary(plan.clips[0],cfg,timing)
                 write_json(root/'commentary-quality.json',{'policy':NARRATIVE_POLICY,**metrics})
-                report = audit_plan(video,plan,lines,voices,root,cfg,llm)
-                issues = report['issues']
-                if report['passed']:
+                narrative=None
+                if formal_long(cfg):
                     narrative=review_commentary(plan.clips[0],lines,cfg,llm,root,timing=timing)
-                    if narrative is not None:
-                        report={**report,'narrative_review':narrative}
-                        issues=[({'id':f'original-{i["beat"]}','stage':'selection_review',
-                                 'action':i['action'],'review_policy':NARRATIVE_REVIEW_POLICY,
-                                 'clip_digest':digest(plan.clips[0].model_dump()),
-                                 'beat_digest':digest(plan.clips[0].beats[i['beat']].model_dump()),
-                                 'message':'原声选材与节奏：'+i['problem']+'；修订方向：'+i['direction']}
-                                if plan.clips[0].beats[i['beat']].mode=='original' else
-                                {'id':f'beat-{i["beat"]}','stage':'narrative_review',
-                                 'text_digest':digest(plan.clips[0].beats[i['beat']].text),
-                                 'message':'整稿解说质量：'+i['problem']+'；修订方向：'+i['direction']})
-                                for i in narrative['issues']]
-                        if any(i['stage']=='selection_review' for i in issues):
-                            category='selection'
-                            # Structural edits change paragraph numbers. Re-review
-                            # the result before using any old narration findings.
-                            issues=[i for i in issues if i['stage']=='selection_review']
-                        elif issues:
-                            category='editorial'
-                        report['passed']=narrative['passed']
-                        report['issues']=issues
-                        write_json(root/'automatic-review.json',report)
-                if report['passed']:
-                    write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':None})
-                    write_json(root/'plan-approved.json',plan.model_dump())
-                    return plan, report
+                    if not isinstance(narrative,dict):
+                        raise ValueError('正式长片缺少当前实配稿的五项编辑预检')
+                    issues=[({'id':f'original-{i["beat"]}','stage':'selection_review',
+                             'action':i['action'],'review_policy':NARRATIVE_REVIEW_POLICY,
+                             'clip_digest':digest(plan.clips[0].model_dump()),
+                             'beat_digest':digest(plan.clips[0].beats[i['beat']].model_dump()),
+                             'message':'原声选材与节奏：'+i['problem']+'；修订方向：'+i['direction']}
+                            if plan.clips[0].beats[i['beat']].mode=='original' else
+                            {'id':f'beat-{i["beat"]}','stage':'narrative_review',
+                             'text_digest':digest(plan.clips[0].beats[i['beat']].text),
+                             'message':'整稿解说质量：'+i['problem']+'；修订方向：'+i['direction']})
+                            for i in narrative['issues']]
+                    if any(i['stage']=='selection_review' for i in issues):
+                        category='selection'
+                        # Structural edits change paragraph numbers. Re-review
+                        # the result before using any old narration findings.
+                        issues=[i for i in issues if i['stage']=='selection_review']
+                    elif issues:
+                        category='editorial'
+                    else:
+                        require_commentary_review(narrative,plan.clips[0])
+                    write_json(root/'editorial-preflight.json',{'plan_digest':digest(plan.model_dump()),
+                        'narrative_review':narrative,'status':'requires_editorial_repair' if issues else 'passed'})
+                if not issues:
+                    report = audit_plan(video,plan,lines,voices,root,cfg,llm)
+                    issues = report['issues']
+                    if report.get('passed') is True and not issues:
+                        if formal_long(cfg):
+                            # The source audit is read-only. Its approval may use
+                            # the preflight only while the measured clip is exact.
+                            require_commentary_review(narrative,plan.clips[0])
+                            report={**report,'narrative_review':narrative}
+                            write_json(root/'automatic-review.json',report)
+                        write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':None})
+                        write_json(root/'plan-approved.json',plan.model_dump())
+                        return plan, report
         write_json(root/f'issues-{attempt}.json',issues)
         failure=digest({'category':category,'plan':plan.model_dump(),'issues':issues})
         if failure in reviewed_failures:

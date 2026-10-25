@@ -5,8 +5,9 @@ import json
 import pytest
 
 from autoclip.models import Plan, validate_plan
+from autoclip.narrative import NARRATIVE_CRITERIA, NARRATIVE_POLICY, NARRATIVE_REVIEW_POLICY
 from autoclip.repair import RepairNeeded
-from autoclip.util import read_json, write_json
+from autoclip.util import digest, read_json, write_json
 from test_commentary_balance import fixture
 
 
@@ -86,6 +87,14 @@ def test_exhausted_ineffective_original_repairs_do_not_repeat_whole_film_audit(t
         events.append('audit')
         return {'passed': False, 'issues': [issue]}
 
+    def preflight(clip,*args,**kwargs):
+        events.append('preflight')
+        assert not (tmp_path/'plan-approved.json').exists()
+        return {'policy':NARRATIVE_POLICY,'review_policy':NARRATIVE_REVIEW_POLICY,
+                'clip_digest':digest(clip.model_dump()),'passed':True,'issues':[],
+                'checks':[{'criterion':c,'passed':True,'reason':'编辑预检通过，不代表原片通过'}
+                          for c in sorted(NARRATIVE_CRITERIA)]}
+
     class Model:
         def json(self, system, prompt):
             assert '局部修稿编辑' in system
@@ -96,13 +105,13 @@ def test_exhausted_ineffective_original_repairs_do_not_repeat_whole_film_audit(t
     monkeypatch.setattr(series, 'measure_sample_plan', measure)
     monkeypatch.setattr(series, 'audit_plan', audit)
     monkeypatch.setattr(series, 'duration', lambda _: 1480)
-    monkeypatch.setattr(series, 'review_commentary', lambda *a, **k: pytest.fail('源片核对未通过，不得进入整稿审核'))
+    monkeypatch.setattr(series, 'review_commentary', preflight)
     with pytest.raises(RepairNeeded) as caught:
         series.complete_long_plan(tmp_path / 'video.mp4', plan, lines, {}, tmp_path, cfg, Model())
 
     assert caught.value.report['stage'] == 'automatic_partial'
     assert caught.value.report['clip'] == plan.clips[0].model_dump()
-    assert events == ['measure', 'audit', 'write', 'write']
+    assert events == ['measure', 'preflight', 'audit', 'write', 'write']
     assert len(prompts) == cfg.repair_attempts + 1 == 2
     assert '上轮局部修订未通过程序检查' in prompts[1]
     assert json.dumps(invalid, ensure_ascii=False) in prompts[1]
@@ -115,6 +124,7 @@ def test_exhausted_ineffective_original_repairs_do_not_repeat_whole_film_audit(t
     assert not (tmp_path / 'pending-repair.json').exists()
     assert not (tmp_path / 'partial-repair-0.json').exists()
     assert not (tmp_path / 'plan-approved.json').exists()
+    assert read_json(tmp_path/'editorial-preflight.json')['status']=='passed'
 
 
 def test_formal_original_trim_can_await_measurement_below_the_rough_duration_floor(tmp_path, monkeypatch):

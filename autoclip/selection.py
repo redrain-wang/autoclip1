@@ -54,7 +54,7 @@ class OriginalEdits(BaseModel):
 def repair_original_selection(plan, issues, lines, root, cfg, llm, attempt, source_seconds):
     """Apply only explicitly reviewed original edits, then require full re-review."""
     from .editorial import WRITING_RULES
-    from .narrative import NARRATIVE_REVIEW_POLICY, require_commentary
+    from .narrative import NARRATIVE_REVIEW_POLICY
     clip=plan.clips[0];targets={}
     for issue in issues:
         index=int(issue['id'].split('-')[1]);beat=clip.beats[index]
@@ -142,7 +142,8 @@ def repair_original_selection(plan, issues, lines, root, cfg, llm, attempt, sour
             revised.clips[0].beats=[segment for i,b in enumerate(clip.beats)
                 if i not in targets or targets[i]['action']!='drop' for segment in replacements.get(i,[b])]
             revised=Plan.model_validate(revised.model_dump())
-            require_commentary(revised.clips[0],cfg)
+            # This is an intermediate edit. Whole-film commentary and duration
+            # are measured and balanced before source review and approval.
             validate_plan(revised,lines,source_seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,
                 cfg.opening,check_duration=False)
             write_json(folder/'result.json',{'before_digest':before_digest,'issue_digest':issue_digest,'issues':issues,

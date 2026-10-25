@@ -61,7 +61,7 @@ def test_duration_only_shortfall_selects_core_units_instead_of_rewriting_every_n
     final,report=module.complete_long_plan(tmp_path/'video.mp4',plan,lines,{'lines':[]},tmp_path,cfg,Model())
     assert report['passed'] and measured(final,cfg)['measured_total_seconds']>=1080
     assert targets==['beat-0','beat-1'] and len(targets)<18
-    assert events==['measure','choose','write','write','measure','audit','whole']
+    assert events==['measure','choose','write','write','measure','whole','audit']
     budget=read_json(tmp_path/'repair-budget.json')['used']
     assert budget['commentary']==1 and budget['timing']==0
     assert final.clips[0].beats[2:]==plan.clips[0].beats[2:]

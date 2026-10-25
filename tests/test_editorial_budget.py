@@ -43,10 +43,11 @@ def test_exhausted_content_budget_does_not_prevent_editorial_cleanup(tmp_path,mo
         whole.append(clip.model_dump());events.append('whole')
         assert not (tmp_path/'plan-approved.json').exists()
         narration={'beat':1,'quote':clip.beats[1].text,'problem':'需要衔接','direction':'补清承接','action':'rewrite'}
-        if mixed_selection and len(whole)==1:
+        if len(whole)==1:return whole_report(clip,[])
+        if mixed_selection and len(whole)==2:
             return whole_report(clip,[narration,{'beat':36,'quote':'原声过场','problem':'不推进主线',
                 'direction':'删除','action':'drop'}])
-        if len(whole)==(2 if mixed_selection else 1):return whole_report(clip,[narration])
+        if len(whole)==(3 if mixed_selection else 2):return whole_report(clip,[narration])
         return whole_report(clip,[])
     def repair(current,issues,*args,**kwargs):
         kind='editorial' if all(i.get('stage')=='narrative_review' for i in issues) else 'content'
@@ -54,6 +55,7 @@ def test_exhausted_content_budget_does_not_prevent_editorial_cleanup(tmp_path,mo
         budget=read_json(tmp_path/'repair-budget.json')['used']
         assert budget['content']==1  # The single factual repair allowance is spent.
         if kind=='editorial':assert budget['editorial']==1
+        else:assert budget['editorial']==0
         revised=current.model_copy(deep=True);revised.clips[0].beats[1].text+='据'
         return revised
     def drop(current,issues,*args,**kwargs):
@@ -73,8 +75,10 @@ def test_exhausted_content_budget_does_not_prevent_editorial_cleanup(tmp_path,mo
     assert events.count('repair_content')==events.count('repair_editorial')==1
     assert events.count('selection')==int(mixed_selection)
     if mixed_selection:assert events.index('selection')<events.index('repair_editorial')
-    assert len(audits)==(4 if mixed_selection else 3)
-    assert len(whole)==(3 if mixed_selection else 2)
+    assert len(audits)==2  # Only the editorially complete draft reaches source review.
+    assert len(whole)==(4 if mixed_selection else 3)  # Source changes invalidate the preflight.
+    assert events.index('audit')<events.index('repair_content')<events.index('repair_editorial')
+    assert events[-2:]==['whole','audit']
     used=read_json(tmp_path/'repair-budget.json')['used']
     assert used=={'timing':0,'content':1,'selection':int(mixed_selection),'commentary':0,'editorial':1}
     assert require_commentary(final.clips[0],cfg)['narration_chars']>=1800
