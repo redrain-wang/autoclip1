@@ -6,11 +6,12 @@ import re
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from .narrative import DEPTH_RULES, formal_long, require_commentary
+from .selection import SELECTION_RULES
 from .repair import RepairNeeded
 from .budget import spoken_characters
 from .util import digest, write_json
 
-VERSION = "oral-edit-20"
+VERSION = "oral-edit-21"
 AUDIENCE_STYLE_POLICY = 'audience-narration-10'
 WRITING_RULES = """
 剧情优先是所有新稿始终遵循的规则，优先于风格参考中的观点或分析要求。
@@ -37,7 +38,7 @@ WRITING_RULES = """
 旁白承接本段画面正在发生的事，不给无关的诵读、送别或下一场养伤画面强加人物与意义。
 """
 
-WRITING_RULES += DEPTH_RULES
+WRITING_RULES += DEPTH_RULES + SELECTION_RULES
 
 # These signals flag prose for rewriting. They are never automatically removed.
 _CLINICAL = re.compile(r"客观定论|人格结论|控诉方的推论|证据只到|证据局限|不能顺势坐实|"

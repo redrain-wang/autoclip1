@@ -7,10 +7,11 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from .budget import spoken_characters
 from .util import digest, write_json
 from .llm import review_json
+from .selection import SELECTION_RULES, original_runs
 
 NARRATIVE_POLICY = 'connected-commentary-2'
-NARRATIVE_REVIEW_POLICY = 'listening-only-4'
-NARRATIVE_CRITERIA = {'continuity', 'analysis', 'non_repetition', 'naturalness'}
+NARRATIVE_REVIEW_POLICY = 'selection-and-listening-5'
+NARRATIVE_CRITERIA = {'continuity', 'analysis', 'non_repetition', 'naturalness', 'selection'}
 NATURAL_ORAL_RULES = (
     '口播像一个熟悉剧情的人把事情讲给别人听，先说具体的人做了什么、卡在哪里，再解释关键交锋。'
     '不用论文或工作汇报的口气替人物贴标签；把“拆掉怀才不遇的叙事”“收回道义解释权”等抽象概括，'
@@ -90,11 +91,12 @@ class NarrativeFinding(BaseModel):
     quote: str = Field(min_length=1)
     problem: str = Field(min_length=1)
     direction: str = Field(min_length=1)
+    action: Literal['rewrite','drop','trim','narrate'] = 'rewrite'
 
 
 class NarrativeCheck(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    criterion: Literal['continuity','analysis','non_repetition','naturalness']
+    criterion: Literal['continuity','analysis','non_repetition','naturalness','selection']
     passed: StrictBool
     reason: str = Field(min_length=1)
 
@@ -170,13 +172,14 @@ def verify_editorial_patch(clip, index, issues, lines, llm, root):
         raise ValueError('整稿修订仍未落实：'+result.reason+'；当前原句：'+result.remaining_quote)
 
 
-def review_commentary(clip, lines, cfg, llm, root):
+def review_commentary(clip, lines, cfg, llm, root, timing=None):
     """Check the final listening experience, including all factual/timing repairs."""
     if not formal_long(cfg):
         return None
     rows,source=narrative_context(clip,lines)
-    prompt=(DEPTH_RULES+LISTENING_RULES+'\n审核整片最终听感，不写稿，不重新认人，不替代原片事实核对。'
-        '按continuity、analysis、non_repetition、naturalness四个维度分别给结论，每项恰好一次。'
+    runs=original_runs(clip,timing)
+    prompt=(DEPTH_RULES+SELECTION_RULES+LISTENING_RULES+'\n审核整片最终听感，不写稿，不重新认人，不替代原片事实核对。'
+        '按continuity、analysis、non_repetition、naturalness、selection五个维度分别给结论，每项恰好一次。'
         'continuity检查主线是否连贯、相邻段是否真正推进，而非每两句重起话头。'
         'analysis检查主要冲突是否解释处境、行动依据、约束或代价，而非把动作复述包装成分析；'
         '允许简短转场，不要求每段凑齐所有分析要素，不强求角色未表露的内心或额外历史知识。'
@@ -184,13 +187,21 @@ def review_commentary(clip, lines, cfg, llm, root):
         'naturalness检查读出来是否像自然讲述：抽象术语代替具体解释、普通动作硬拔高、连续套用整齐句式、'
         '每段都补一句没有信息增量的总结，均须指出实际原句。不能因没有“字幕里说”等禁词就认定自然。'
         '这是表达检查，不判断作者是否使用AI，不给检测概率；不要求删掉所有分析，也不把必要的官名和事实术语当问题。'
+        'selection检查原声是否值得保留及连续播放是否拖沓。original_runs按成片相邻原声累计秒数，'
+        'review_focus=true的长段须重点判断每段是否持续推进，不能因单个镜头不足40秒就放过整段。'
+        '短而无价值的过场也应指出；长而完整有力的交锋允许通过，不能仅因超过90秒判失败。'
+        'restored_beats仅标记修稿后恢复原声，不是保留价值证明。没有可辨对白也不等于没有戏，不能凭转写缺失臆断。'
         '字数多、解说占比高不等于合格，空话填字、换词重复、逐镜头报幕仍需指出。'
-        '只把必须修的问题列issues，绑定实际narration段号并逐字引用该段quote；不能修改original。'
+        '只把必须修的问题列issues。旁白问题action=rewrite，逐字引用当前旁白；'
+        '原声选材问题逐字引用audience中该段原声，action明确选drop、trim或narrate，说明删哪里、留什么及必要承接。'
+        '不能建议删除或改配音取代原声开场，开场只能在合法长度内trim；不要为时长或单纯插一句话建议改编原声。'
         'direction说明如何利用已展示内容改好，不直接给新稿或编造新事实。'
         '没有问题则issues为空；任一维度未通过，必须给出具体问题，不能只给泛泛评价。'
         '\n原声text为机器转写，仅用于理解节目结构；疑似同音字不在这里当作事实错误。'
         '\n格式'+json.dumps(NarrativeReview.model_json_schema(),ensure_ascii=False)
-        +'\naudience='+json.dumps(rows,ensure_ascii=False))
+        +'\neditorial_goal='+json.dumps({'title':clip.title,'angle':clip.angle},ensure_ascii=False)
+        +'\naudience='+json.dumps(rows,ensure_ascii=False)
+        +'\noriginal_runs='+json.dumps(runs,ensure_ascii=False))
     folder=root/'narrative-review'/digest({'policy':NARRATIVE_POLICY,'review_policy':NARRATIVE_REVIEW_POLICY,
         'clip':clip.model_dump(),'rows':rows,'source':source})
     feedback=''
@@ -201,20 +212,25 @@ def review_commentary(clip, lines, cfg, llm, root):
             result=NarrativeReview.model_validate(raw)
             if (len(result.checks)!=len(NARRATIVE_CRITERIA) or {c.criterion for c in result.checks}
                     != NARRATIVE_CRITERIA):
-                raise ValueError('整稿检查须精确覆盖四个维度，包括口播自然度')
+                raise ValueError('整稿检查须精确覆盖五个维度，包括口播自然度和原声选材')
             if any(not c.passed for c in result.checks) and not result.issues:
                 raise ValueError('未通过的整稿检查必须指出具体段落问题')
             for issue in result.issues:
-                if (issue.beat>=len(clip.beats) or clip.beats[issue.beat].mode!='narration'
-                        or issue.quote not in clip.beats[issue.beat].text):
-                    raise ValueError('整稿问题必须引用当前旁白的实际原句与段号')
+                if issue.beat>=len(rows) or issue.quote not in rows[issue.beat]['text']:
+                    raise ValueError('整稿问题必须引用当前实际音轨的原句与段号')
+                if ((rows[issue.beat]['mode']=='narration')!=(issue.action=='rewrite')
+                        or (issue.beat==0 and rows[0]['mode']=='original' and issue.action!='trim')):
+                    raise ValueError('旁白只可rewrite；原声选材须drop/trim/narrate，原声开场只可trim')
+            for index in {i.beat for i in result.issues}:
+                if len({i.action for i in result.issues if i.beat==index})>1:
+                    raise ValueError('同一段落的选材操作不能相互冲突')
             break
         except ValueError as exc:
             if attempt==cfg.repair_attempts:raise
             feedback='\n上轮格式或引用无效：'+str(exc)+'。重核实际稿件，不修改或放行存疑内容。'
     report={'policy':NARRATIVE_POLICY,'review_policy':NARRATIVE_REVIEW_POLICY,'clip_digest':digest(clip.model_dump()),
             'passed':not result.issues and all(c.passed for c in result.checks),
-            **result.model_dump()}
+            'original_runs':runs,**result.model_dump()}
     write_json(folder/'report.json',report)
     write_json(root/'narrative-review.json',report)
     return report
@@ -229,4 +245,4 @@ def require_commentary_review(report, clip):
     checks=NarrativeReview.model_validate({'checks':report.get('checks'),'issues':report['issues']}).checks
     if (len(checks)!=len(NARRATIVE_CRITERIA) or {c.criterion for c in checks}!=NARRATIVE_CRITERIA
             or not all(c.passed for c in checks)):
-        raise ValueError('整稿连贯性、分析、重复与口播自然度检查未完整通过')
+        raise ValueError('整稿连贯性、分析、重复、口播自然度与原声选材检查未完整通过')

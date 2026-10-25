@@ -3,6 +3,7 @@ import json
 
 from .titles import TITLE_RULES
 from .narrative import DEPTH_RULES, formal_long
+from .selection import SELECTION_RULES
 import math
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Literal
@@ -15,7 +16,7 @@ from .director import compact
 from .models import Beat, Clip, Plan, validate_plan
 from .util import digest, read_json, source_identity, write_json
 
-VERSION = 'planning-11'
+VERSION = 'planning-12'
 
 
 class Chapter(BaseModel):
@@ -341,7 +342,7 @@ def plan_outline(video, root, lines, seconds, cfg, llm, start=0, end=None, notes
             f'\n经开发核对备注（可能为空）{notes}\n格式{json.dumps(Structure.model_json_schema(),ensure_ascii=False)}'
             f'\n本集字幕{compact(selected)}'+continuity_prompt(previous,compact(selected)))
     if formal_long(cfg):
-        prompt += (DEPTH_RULES+f'为剪辑留出选择余地，尽可能让chapters的end-start之和达到{cfg.target_seconds*1.5:.0f}秒。'
+        prompt += (DEPTH_RULES+SELECTION_RULES+f'为剪辑留出选择余地，尽可能让chapters的end-start之和达到{cfg.target_seconds*1.5:.0f}秒。'
             f'原片有{end-start:.0f}秒，不能只选后半段当作可选素材池。纳入前段人物处境和中段铺垫，再进入主要冲突与结局。'
             '章节范围是候选素材池，并非全部照放；同一场交锋中的不同发言合成一章，不拆成很多几十秒小章。')
     feedback=''
@@ -400,12 +401,12 @@ def plan_outline(video, root, lines, seconds, cfg, llm, start=0, end=None, notes
             + f'\n主问题{structure.hook}\n人物候选与依据（不是确定答案）{chapter_voice_notes(notes, evidence)}'
             + f'\n格式{json.dumps(Slots.model_json_schema(),ensure_ascii=False)}\n本章字幕{compact(evidence)}')
         if formal_long(cfg):
-            prompt += (DEPTH_RULES+'本章预计旁白占45%–60%，至少35%；优先安排90–170字的完整讲述段。'
+            prompt += (DEPTH_RULES+SELECTION_RULES+'本章预计旁白占45%–60%，至少35%；优先安排90–170字的完整讲述段。'
                 '90秒以上的主要章节至少两段target_chars>=90的解说，保留关键原声，其余问答合并转述。')
         windows=chapter_windows(chapter,lines) if formal_long(cfg) else None
         opening_evidence = [s for s in lines if s.start<structure.opening_end and s.end>structure.opening_start] if index==0 else []
         if windows is not None:
-            prompt=(f'为《{chapter.title}》选择连贯讲述与关键原声。章节任务：{chapter.purpose}。'+DEPTH_RULES+
+            prompt=(f'为《{chapter.title}》选择连贯讲述与关键原声。章节任务：{chapter.purpose}。'+DEPTH_RULES+SELECTION_RULES+
                 '下面的窗口已由程序确定起止时间，禁止另写时间戳。仅按编号选择窗口并指定mode、instruction、evidence_ids。'
                 '每个window编号最多出现一次，不能同一窗口既选narration又选original，不能播放两遍。'
                 '例如只有两个窗口时，可返回window=0的narration和window=1的original，共两项即可，不必凑四项。'

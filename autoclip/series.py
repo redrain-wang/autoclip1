@@ -180,9 +180,10 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
     """Shared long/short measurement and source review; no human approval artifact."""
     issues = []
     repairs = {'timing':0, 'content':0}
+    if formal_long(cfg):repairs['selection']=0
     # TTS alignment must not consume the later factual repair allowance.
     # Each category remains bounded, including regressions after a content edit.
-    for attempt in range(2*cfg.repair_attempts+2):
+    for attempt in range(len(repairs)*cfg.repair_attempts+2):
         write_json(root/f'plan-attempt-{attempt}.json',plan.model_dump())
         write_json(root/'plan.json',plan.model_dump())
         timing = measure_sample_plan(video,root/'plan.json',root/'transcript.json',cfg,root)
@@ -230,13 +231,24 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
             report = audit_plan(video,plan,lines,voices,root,cfg,llm)
             issues = report['issues']
             if report['passed']:
-                narrative=review_commentary(plan.clips[0],lines,cfg,llm,root)
+                narrative=review_commentary(plan.clips[0],lines,cfg,llm,root,timing=timing)
                 if narrative is not None:
                     report={**report,'narrative_review':narrative}
-                    issues=[{'id':f'beat-{i["beat"]}','stage':'narrative_review',
+                    issues=[({'id':f'original-{i["beat"]}','stage':'selection_review',
+                             'action':i['action'],'review_policy':NARRATIVE_REVIEW_POLICY,
+                             'clip_digest':digest(plan.clips[0].model_dump()),
+                             'beat_digest':digest(plan.clips[0].beats[i['beat']].model_dump()),
+                             'message':'原声选材与节奏：'+i['problem']+'；修订方向：'+i['direction']}
+                            if plan.clips[0].beats[i['beat']].mode=='original' else
+                            {'id':f'beat-{i["beat"]}','stage':'narrative_review',
                              'text_digest':digest(plan.clips[0].beats[i['beat']].text),
-                             'message':'整稿解说质量：'+i['problem']+'；修订方向：'+i['direction']}
+                             'message':'整稿解说质量：'+i['problem']+'；修订方向：'+i['direction']})
                             for i in narrative['issues']]
+                    if any(i['stage']=='selection_review' for i in issues):
+                        category='selection'
+                        # Structural edits change paragraph numbers. Re-review
+                        # the result before using any old narration findings.
+                        issues=[i for i in issues if i['stage']=='selection_review']
                     report['passed']=narrative['passed']
                     report['issues']=issues
                     write_json(root/'automatic-review.json',report)
@@ -251,7 +263,15 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
         repairs[category] += 1
         write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':category})
         try:
-            plan = repair_plan(plan,issues,lines,voices,root,cfg,llm,attempt,source_seconds=duration(video))
+            if category=='selection':
+                from .selection import repair_original_selection
+                selection_base=digest(plan.model_dump())
+                plan=repair_original_selection(plan,issues,lines,root,cfg,llm,attempt,duration(video))
+                write_json(root/'pending-repair.json',{'base_plan_digest':selection_base,
+                    'voice_digest':digest(voices),'plan':plan.model_dump(),
+                    'status':'requires_full_measurement_and_review'})
+            else:
+                plan = repair_plan(plan,issues,lines,voices,root,cfg,llm,attempt,source_seconds=duration(video))
         except ValueError as exc:
             from .repair import RepairNeeded
             if not isinstance(exc,RepairNeeded) or exc.report.get('stage')!='automatic_partial':raise
@@ -260,7 +280,8 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
             plan = Plan.model_validate(revised)
             write_json(root/f'partial-repair-{attempt}.json',{'plan':plan.model_dump(),'pending':exc.report['issues'],
                 'status':'requires_full_measurement_and_review'})
-        validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+        validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening,
+            check_duration=category!='selection')
         if validate_clip:
             validate_clip(plan.clips[0])
     raise ValueError('自动修复达到上限，本集未通过：'+json.dumps(issues,ensure_ascii=False)[:1800])

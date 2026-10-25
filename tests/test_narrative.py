@@ -101,7 +101,7 @@ def test_long_asr_span_never_claims_a_safe_original_cut():
 
 @pytest.mark.parametrize('series',['另一部剧','没有集数的新项目'])
 def test_long_enough_but_repetitive_script_is_rejected_and_bound_to_actual_text(tmp_path,series):
-    from autoclip.narrative import review_commentary,require_commentary_review
+    from autoclip.narrative import review_commentary,require_commentary_review,NARRATIVE_CRITERIA
     from autoclip.util import digest
     cfg=Settings(series=series,duration_profile='long',target_seconds=1200,min_seconds=1080,max_seconds=1320)
     clip=Clip(title='冲突标题',angle='',hook='',beats=[
@@ -112,7 +112,7 @@ def test_long_enough_but_repetitive_script_is_rejected_and_bound_to_actual_text(
         def json(self,system,prompt):
             assert '内部说明不是正文' not in prompt
             return {'checks':[{'criterion':c,'passed':c=='continuity','reason':'有顺序，但只在重复原声'}
-                for c in ['continuity','analysis','non_repetition','naturalness']],
+                for c in sorted(NARRATIVE_CRITERIA)],
                 'issues':[{'beat':0,'quote':'他答应之后又答应','problem':'换词复述，没有解释行动的约束',
                            'direction':'用已展示的条件解释为什么答应，删除重复复述'}]}
     result=review_commentary(clip,[],cfg,Model(),tmp_path)
