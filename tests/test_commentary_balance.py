@@ -97,6 +97,6 @@ def test_public_pipeline_balances_then_remeasures_source_checks_and_reviews_whol
     assert events==(['measure','choose','write','write','verify','measure','audit','whole'] if retry_writer else
                     ['measure','choose','write','verify','measure','audit','whole'])
     assert len(reasoning_writes)==int(retry_writer)
-    assert read_json(tmp_path/'repair-budget.json')['used']=={'timing':0,'content':0,'selection':0,'commentary':1}
+    assert read_json(tmp_path/'repair-budget.json')['used']=={'timing':0,'content':0,'selection':0,'commentary':1,'editorial':0}
     assert final.clips[0].beats[1:]==plan.clips[0].beats[1:]
     assert (tmp_path/'plan-approved.json').exists()

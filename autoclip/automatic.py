@@ -473,11 +473,19 @@ def review_citation_limits(units, lines, voice_rows):
 def review_recheck_reason(issues, units):
     """Request a bounded source recheck, never silently dismiss a failed unit."""
     original={u['id'] for u in units if u.get('mode')=='original'}
+    metadata={u['id'] for u in units if u['id'] in {'title','angle','hook'} and 'start' not in u}
     text_by_id={u['id']:u.get('text','') for u in units}
     normalize=lambda text:re.sub(r'[\s，,。；;：:！？!?“”「」"、]','',text)
     reasons=[]
     for issue in issues:
         message=issue['message']
+        if issue['id'] in metadata and re.search(
+                r'(?:当前|本)(?:单位|段|批次|镜头).{0,35}(?:后文|尚未出现|预支)|'
+                r'后(?:文|续).{0,20}(?:提前|预支)|并非紧接|压缩过度|中间.{0,20}(?:问答|穿插)|过程.{0,12}(?:省略|压缩)',message):
+            reasons.append('先核对元信息的范围：title/angle/hook按全片实际选用内容审核，没有单镜头的end截止。'
+                '摘要可以省略中间问答和反应镜头，“随后”不等于无间隔紧接；不能要求摘要逐步复盘。'
+                '请引用全片所选的实际对白核实主体、必要因果和承诺/结果，不因提及后半场景判预支；'
+                '若事件未在选用素材出现、来自别集，或省略确实改变事实/因果，仍须明确拒绝，不能仅换标签放行。')
         if (re.search(r'候选|candidate|human_confirmed',message,re.IGNORECASE)
                 and re.search(r'(?:未见|没有|缺少|并非|不是|未经|未).{0,12}(?:人工确认|human_confirmed)'
                     r'|(?:应|需|必须).{0,12}(?:说明|标明|注明).{0,12}候选',message,re.IGNORECASE)):
@@ -679,7 +687,11 @@ def audit_plan(video, plan, lines, voices, root, cfg, llm):
         caption_observations=None
         metadata=any('start' not in u for u in group)
         if metadata:
-            prompt += ('\n标题编辑审核规则（只作用于title单位）：'+TITLE_RULES+
+            prompt += ('\n元信息范围：title/angle/hook是全片梗概、角度与设问，不是当前镜头的口播。'
+                '按全片实际选用证据核查，允许概括、省略中间过程和提及本片后半场景；没有单镜头的end截止。'
+                '“随后”不等于无间隔紧接，不因中间有问答或反应镜头就判时间错误；不要求摘要逐步复盘全部对白。'
+                '概括仍必须保留真实行动主体、必要因果及结果边界，不能把认捐写成钱已到账；未选用情节或其他集事实仍拒绝。'
+                '\n标题编辑审核规则（只作用于title单位）：'+TITLE_RULES+
                 '分别检查剧情准确性、具体看点、精炼程度；任何不满足均列id=title的具体issues，不能只查事实就放行。'
                 '不因另一种措辞更喜欢而拒绝合格标题；不要求标题覆盖所有支线。')
             caption_lines=metadata_caption_lines(group,selected)
@@ -1200,15 +1212,15 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                             raise ValueError(f'全片讲述补充未落实，本段须至少{minimum}个有效字；只补有据解释，不能重复或编造')
                     if max_characters is None:
                         require_paragraph_preserved(target['text'],candidate.clips[0].beats[index].text,cfg,issues=target_issues)
-                        if condense:require_commentary(candidate.clips[0],cfg)
                     if signals:=[s for s in prose_signals(candidate.clips[0]) if s['beat']==index]:
                         raise ValueError('当前旁白仍混入制作或审查话术，不能进入配音：'+json.dumps(signals,ensure_ascii=False))
                 if max_characters is not None and spoken_characters(candidate.clips[0].beats[int(uid.split('-')[1])].text)>max_characters:
                     raise ValueError(f'实测时长修复没有落实缩写：当前口播必须不超过{max_characters}个有效字')
                 if condense and uid.startswith('beat-'):
-                    verify_editorial_patch(candidate.clips[0],int(uid.split('-')[1]),target_issues,lines,llm,record.parent/f'verify-{retry}')
+                    verify_editorial_patch(candidate.clips[0],int(uid.split('-')[1]),target_issues,lines,llm,record.parent/f'verify-{retry}',retries=cfg.repair_attempts)
                 if source_seconds is not None:
-                    validate_plan(candidate,lines,source_seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+                    validate_plan(candidate,lines,source_seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening,
+                        check_duration=not condense)
                     for index,b in enumerate(candidate.clips[0].beats):
                         if uid not in {f'beat-{index}',f'original-{index}'}:
                             continue  # untouched units still undergo the full source audit

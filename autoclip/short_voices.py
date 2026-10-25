@@ -6,6 +6,10 @@ from .models import Plan, validate_plan
 from .util import digest, read_json, source_identity, write_json
 
 
+EDITORIAL_REVIEW_STAGES = frozenset({'narrative_review','commentary_balance','selection_review',
+                                    'editorial_review','editorial'})
+
+
 def prepare_project(source, paths, cfg, library=None, voice_manifest=None, model_path=None, voice_python=None):
     from .series import ingest_episode, prepare_audio_candidates
     output = cfg.output
@@ -143,6 +147,8 @@ def prepare_voice_followup(video, lines, voices, root, cfg, library, story_roots
                 or report.get('plan_digest')!=digest(plan.model_dump()) or report.get('voice_digest')!=digest(voices)):
             continue
         for issue in report.get('issues',[]):
+            if issue.get('stage') in EDITORIAL_REVIEW_STAGES:
+                continue  # Editorial wording/continuity is not missing speaker evidence.
             match = re.fullmatch(r'beat-(\d+)',issue['id'])
             if not match or not needs_voice_confirmation(issue['message']):continue
             index=int(match[1])
@@ -153,7 +159,9 @@ def prepare_voice_followup(video, lines, voices, root, cfg, library, story_roots
             candidates=sorted((s for s in possible if s.id in valid_ids and s.confidence>=.4),
                                key=lambda s:-(s.end-s.start)*s.confidence)[:2]
             selected.update((s.id,s) for s in candidates)
-            requests.append({'unit':issue['id'],'reason':issue['message'],'line_ids':[s.id for s in candidates]})
+            requests.append({'unit':issue['id'],'reason':issue['message'],'line_ids':[s.id for s in candidates],
+                'stage':issue.get('stage') or 'source_review','review_run':str(folder.resolve()),
+                'plan_digest':report['plan_digest'],'issue_digest':digest(issue)})
     if not selected:return None
     chosen=sorted(selected.values(),key=lambda s:(s.start,s.id))[:12]
     bank=read_json(library)
@@ -176,6 +184,11 @@ def prepare_voice_followup(video, lines, voices, root, cfg, library, story_roots
         write_json(folder/'baseline-library.json',bank)
         write_json(folder/'manifest.json',manifest)
     if manifest['baseline_library_digest']!=digest(bank):raise ValueError('新增声音批次基础库不一致')
+    if manifest.get('automatic_gap_requests')!=requests:
+        # The same source samples may be requested by a newer review. Keep the
+        # human dataset intact, but bind the request reasons to that review.
+        manifest={**manifest,'automatic_gap_requests':requests}
+        write_json(folder/'manifest.json',manifest)
     ReviewStore(folder)  # exports an empty local bank; only the human may name a sample
     task={'status':'waiting_voice_confirmation','review_root':str(folder.resolve()),
           'identity_name_policy':IDENTITY_NAME_POLICY,
@@ -185,6 +198,46 @@ def prepare_voice_followup(video, lines, voices, root, cfg, library, story_roots
           'instruction':f'voice-review --output "{folder.resolve()}"；试听确认后重跑原制作命令，系统会备份并合并新增人工参考。'}
     write_json(root/'voice-followup.json',task)
     return task
+
+
+def _current_followup_report(video, lines, voices, root, cfg):
+    """Identify one current review for legacy requests that lack stage metadata.
+
+    A saved old review snapshot is useful for listening, but cannot establish
+    that an untyped request belongs to the current working draft. Ambiguous,
+    stale or incomplete reports therefore never retire a genuine voice task.
+    """
+    folders=[]
+    status_path=root/'status.json'
+    if status_path.is_file():
+        try:
+            active=read_json(status_path).get('run')
+            if active:
+                folder=Path(active).resolve()
+                if root.resolve() not in folder.parents:return None
+                folders=[folder]
+        except (OSError,ValueError,TypeError):return None
+    if not folders:
+        folders=[p.parent for p in root.rglob('automatic-review.json')]
+    eligible=[]
+    for folder in folders:
+        try:
+            report=read_json(folder/'automatic-review.json')
+            if (report.get('source')!=source_identity(video)
+                    or report.get('transcript_digest')!=digest([s.model_dump() for s in lines])
+                    or report.get('voice_digest')!=digest(voices)):
+                continue
+            state_path=folder/'automatic-review-state.json'
+            if state_path.exists():
+                state=read_json(state_path)
+                if state.get('status')!='completed' or state.get('plan_digest')!=report.get('plan_digest'):continue
+            settings=folder/'settings.json'
+            if settings.exists() and read_json(settings)!=cfg.model_dump(mode='json'):continue
+            plan=Plan.model_validate(read_json(folder/'plan-timed.json'))
+            if digest(plan.model_dump())!=report.get('plan_digest'):continue
+            eligible.append(report)
+        except (OSError,ValueError,KeyError,TypeError):continue
+    return eligible[0] if len(eligible)==1 else None
 
 
 def pending_voice_followup(video, lines, voices, root, cfg, library):
@@ -198,7 +251,20 @@ def pending_voice_followup(video, lines, voices, root, cfg, library):
     if task.get('status')=='waiting_voice_confirmation' and task.get('review_root'):
         manifest_path=Path(task['review_root'])/'manifest.json'
         requests=read_json(manifest_path).get('automatic_gap_requests',[]) if manifest_path.is_file() else []
-        if requests and all(not needs_voice_confirmation(r.get('reason','')) for r in requests):
+        bound=(task.get('source')==source_identity(video)
+            and task.get('library')==str(library.resolve()) and task.get('library_digest')==digest(read_json(library))
+            and task.get('voice_digest')==digest(voices)
+            and task.get('transcript_digest')==digest([s.model_dump() for s in lines])
+            and task.get('settings_digest')==digest(cfg.model_dump(mode='json')))
+        current_report=(_current_followup_report(video,lines,voices,root,cfg)
+            if bound and any(not r.get('stage') for r in requests) else None)
+        def editorial_request(request):
+            if request.get('stage') in EDITORIAL_REVIEW_STAGES:return True
+            if request.get('stage') or current_report is None:return False
+            matched=[i for i in current_report.get('issues',[]) if i.get('id')==request.get('unit')
+                     and i.get('message')==request.get('reason')]
+            return bool(matched) and all(i.get('stage') in EDITORIAL_REVIEW_STAGES for i in matched)
+        if requests and all(editorial_request(r) or not needs_voice_confirmation(r.get('reason','')) for r in requests):
             write_json(pointer,{**task,'status':'superseded','reason':'事实、表达或被提及者引用问题，先继续自动核验，不要求新增声纹'})
             return None
     if (task.get('status')=='waiting_voice_confirmation' and task.get('source')==source_identity(video)

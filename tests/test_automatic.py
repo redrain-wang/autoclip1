@@ -1444,7 +1444,7 @@ def test_editor_fills_missing_explanation_before_removing_repetition_near_global
     plan=Plan(episode_summary='',genre='',style='',clips=[Clip(title='具体冲突',angle='',hook='',beats=beats)])
     issues=[{'id':f'beat-{i}','stage':'narrative_review','text_digest':digest(beats[i].text),'message':message}
         for i,message in [(1,'删去重复复述'),(3,'没有说明行动依据，需要用已有事实解释选择')]]
-    monkeypatch.setattr(module,'verify_editorial_patch',lambda *a:None)
+    monkeypatch.setattr(module,'verify_editorial_patch',lambda *a,**k:None)
     order=[]
     class Model:
         def json(self,system,prompt):

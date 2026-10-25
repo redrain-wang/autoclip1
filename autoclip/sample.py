@@ -106,12 +106,15 @@ def measure_sample_plan(video, plan_path, transcript, cfg, output):
     from concurrent.futures import ThreadPoolExecutor
     from .render import synthesize
     from .repair import timing_report, voice_fits
+    from .narrative import formal_long
     plan = Plan.model_validate(read_json(plan_path))
     lines = [Line.model_validate(x) for x in read_json(transcript)]
     if read_json(transcript.parent/'source.json') != source_identity(video):
         raise ValueError('配音预检字幕与原片版本不匹配')
     seconds = duration(video)
-    validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+    check_estimate=not formal_long(cfg)
+    validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening,
+                  check_duration=check_estimate)
     stage = output/'voice-preflight'
     stage.mkdir(parents=True, exist_ok=True)
     clip = plan.clips[0]
@@ -132,12 +135,14 @@ def measure_sample_plan(video, plan_path, transcript, cfg, output):
         selected = max(1, spoken/.9)
         b.start = round(b.end-selected,3)
         try:
-            validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+            validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening,
+                          check_duration=check_estimate)
         except ValueError:
             b.start = original['start']
             b.end = round(b.start+selected,3)
             try:
-                validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening)
+                validate_plan(plan,lines,seconds,1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening,
+                              check_duration=check_estimate)
             except ValueError:
                 b.start,b.end = original['start'],original['end']
                 continue

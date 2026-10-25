@@ -98,9 +98,10 @@ def commentary_balance_issues(clip, cfg, timing, lines, llm=None, root=None):
     missing_chars=max(0,1800-metrics['narration_chars'])
     missing_paragraphs=max(0,8-metrics['substantial_paragraphs'])
     total=sum(row['output_seconds'] for row in timing['beats'])
-    missing_seconds=max(0,(.30*total-metrics['narration_seconds'])/.70)
-    if not (missing_chars or missing_paragraphs or missing_seconds):return []
-    remaining=max(missing_chars,math.ceil(missing_seconds*4.5))
+    missing_seconds=max(0,(.30*total-metrics['narration_seconds'])/.70) if metrics['narration_ratio']<.30 else 0
+    missing_duration=max(0,(cfg.min_seconds or 0)-total)
+    if not (missing_chars or missing_paragraphs or missing_seconds or missing_duration):return []
+    remaining=max(missing_chars,math.ceil(max(missing_seconds,missing_duration)*4.5))
     lookup={s.id:s for s in lines}
     candidates=[]
     for index,beat in enumerate(clip.beats):
@@ -157,7 +158,7 @@ def commentary_balance_issues(clip, cfg, timing, lines, llm=None, root=None):
         increase=min(capacity,max(24,remaining,90-chars if missing_paragraphs and chars<80 else 0))
         if increase<=0:continue
         issues.append({'id':f'beat-{index}','stage':'commentary_balance','minimum_chars':chars+increase,
-            'message':f'事实修订后全片解说尚差{missing_chars}个有效字、约{missing_seconds:.1f}秒、{missing_paragraphs}个展开段。'
+            'message':f'事实修订后全片解说尚差{missing_chars}个有效字、旁白约{missing_seconds:.1f}秒、{missing_paragraphs}个展开段；总时长尚差{missing_duration:.1f}秒。'
                 f'本段已有{chars}个有效字，实测画面尚有空间；至少写到{chars+increase}个有效字。'
                 '只补充当前原片证据支持、尚未讲清的必要处境、选择约束或因果；保留原有正确解释。'
                 '不要扩写普通落座、走路等短转场，不重复原声，不编内心或后续结果，不用空话凑数。'
@@ -229,7 +230,7 @@ class EditorialPatchReview(BaseModel):
     remaining_quote: str
 
 
-def verify_editorial_patch(clip, index, issues, lines, llm, root):
+def verify_editorial_patch(clip, index, issues, lines, llm, root, *, retries=0):
     """A factually valid edit must also address its whole-script editorial finding."""
     audience,source=narrative_context(clip,lines)
     context=[r for r in audience if abs(r['beat']-index)<=3]
@@ -245,11 +246,21 @@ def verify_editorial_patch(clip, index, issues, lines, llm, root):
         +'\neditorial_findings='+json.dumps(issues,ensure_ascii=False)
         +'\naudience='+json.dumps(context,ensure_ascii=False)
         +'\nsource_context='+json.dumps([r for r in source if r['beat']==index],ensure_ascii=False))
-    raw=review_json(llm,'你是局部整稿编辑，核对修订是否真正解决重复、衔接、分析或口播自然度问题。',prompt)
-    result=EditorialPatchReview.model_validate(raw)
-    if ((result.resolved and result.remaining_quote) or
-            (not result.resolved and (not result.remaining_quote or result.remaining_quote not in clip.beats[index].text))):
-        raise ValueError('整稿修订核验须引用当前问题原句，不能沿用旧稿或虚构引用')
+    feedback=''
+    for attempt in range(retries+1):
+        raw=review_json(llm,'你是局部整稿编辑，核对修订是否真正解决重复、衔接、分析或口播自然度问题。',prompt+feedback)
+        try:
+            result=EditorialPatchReview.model_validate(raw)
+            if ((result.resolved and result.remaining_quote) or
+                    (not result.resolved and (not result.remaining_quote or result.remaining_quote not in clip.beats[index].text))):
+                raise ValueError('整稿修订核验须引用当前问题原句，不能沿用旧稿或虚构引用')
+            break
+        except ValueError as exc:
+            write_json(root/f'editorial-protocol-{attempt}.json',{'error':str(exc),'raw':raw})
+            if attempt==retries:raise
+            feedback=f'\n第{attempt+1}次核验响应的格式或引用无效：{exc}。先修正核验响应，稿件不变。'
+            feedback+='\n当前实际target全文：'+clip.beats[index].text+'\n上轮核验：'+json.dumps(raw,ensure_ascii=False)
+            feedback+='\n真实编辑问题仍须resolved=false并逐字引用当前target；不能为了修格式宣布通过，也不要求作者重写已合规的候选。'
     write_json(root/'editorial-verification.json',{'policy':NARRATIVE_REVIEW_POLICY,
         'clip_digest':digest(clip.model_dump()),'beat':index,**result.model_dump()})
     if not result.resolved:
@@ -290,6 +301,7 @@ def review_commentary(clip, lines, cfg, llm, root, timing=None):
         'clip':clip.model_dump(),'rows':rows,'source':source})
     feedback=''
     for attempt in range(cfg.repair_attempts+1):
+        print(f'整稿五项检查：第{attempt+1}/{cfg.repair_attempts+1}次核对',flush=True)
         raw=review_json(llm,'你是影视解说的整稿编辑，检查连贯性、分析质量和自然口播。',prompt+feedback)
         write_json(folder/f'attempt-{attempt}.json',raw)
         try:
@@ -299,19 +311,28 @@ def review_commentary(clip, lines, cfg, llm, root, timing=None):
                 raise ValueError('整稿检查须精确覆盖五个维度，包括口播自然度和原声选材')
             if any(not c.passed for c in result.checks) and not result.issues:
                 raise ValueError('未通过的整稿检查必须指出具体段落问题')
-            for issue in result.issues:
-                if issue.beat>=len(rows) or issue.quote not in rows[issue.beat]['text']:
-                    raise ValueError('整稿问题必须引用当前实际音轨的原句与段号')
-                if ((rows[issue.beat]['mode']=='narration')!=(issue.action=='rewrite')
-                        or (issue.beat==0 and rows[0]['mode']=='original' and issue.action!='trim')):
-                    raise ValueError('旁白只可rewrite；原声选材须drop/trim/narrate，原声开场只可trim')
+            invalid=[]
+            for number,issue in enumerate(result.issues):
+                if issue.beat>=len(rows):
+                    invalid.append({'issue':number,'beat':issue.beat,'error':'段号不存在','allowed_beats':list(range(len(rows)))})
+                    continue
+                row=rows[issue.beat]
+                allowed=['rewrite'] if row['mode']=='narration' else ['trim'] if issue.beat==0 else ['drop','trim','narrate']
+                if issue.quote not in row['text'] or issue.action not in allowed:
+                    invalid.append({'issue':number,'beat':issue.beat,'mode':row['mode'],
+                        'error':'整稿问题必须引用当前实际音轨的原句与段号，并使用合法操作',
+                        'submitted_quote':issue.quote,'actual_text':row['text'],
+                        'submitted_action':issue.action,'allowed_actions':allowed})
             for index in {i.beat for i in result.issues}:
                 if len({i.action for i in result.issues if i.beat==index})>1:
-                    raise ValueError('同一段落的选材操作不能相互冲突')
+                    invalid.append({'beat':index,'error':'同一段落的选材操作不能相互冲突'})
+            if invalid:raise ValueError('请同时修正所有整稿引用和操作问题：'+json.dumps(invalid,ensure_ascii=False))
             break
         except ValueError as exc:
+            write_json(folder/f'protocol-{attempt}.json',{'error':str(exc),'raw':raw})
             if attempt==cfg.repair_attempts:raise
-            feedback='\n上轮格式或引用无效：'+str(exc)+'。重核实际稿件，不修改或放行存疑内容。'
+            feedback=f'\n第{attempt+1}轮格式或引用无效：'+str(exc)+'。重核实际稿件，不修改或放行存疑内容。'
+            feedback+='\n上轮完整响应：'+json.dumps(raw,ensure_ascii=False)+'\n一次修正全部引用、段号与操作，保留仍然存在的编辑问题；不得为了修格式把问题清空。'
     report={'policy':NARRATIVE_POLICY,'review_policy':NARRATIVE_REVIEW_POLICY,'clip_digest':digest(clip.model_dump()),
             'passed':not result.issues and all(c.passed for c in result.checks),
             'original_runs':runs,**result.model_dump()}

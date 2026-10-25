@@ -185,7 +185,7 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
     """Shared long/short measurement and source review; no human approval artifact."""
     issues = []
     repairs = {'timing':0, 'content':0}
-    if formal_long(cfg):repairs.update(selection=0,commentary=0)
+    if formal_long(cfg):repairs.update(selection=0,commentary=0,editorial=0)
     reviewed_failures=set()
     # TTS alignment must not consume the later factual repair allowance.
     # Each category remains bounded, including regressions after a content edit.
@@ -196,7 +196,7 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
         plan = Plan.model_validate(read_json(root/'plan-timed.json'))
         if validate_clip:
             validate_clip(plan.clips[0])
-        if timing['issues']:
+        if timing['issues'] and not all(i.get('code')=='duration_short' for i in timing['issues']):
             from .recut import cut_candidates
             candidates = cut_candidates(plan.clips[0],timing,lines,cfg,allow_original=False)
             chosen = None
@@ -223,13 +223,15 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
                 if validate_clip:
                     validate_clip(plan.clips[0])
         if timing['issues']:
-            category = 'timing'
-            issues = []
-            for item in timing['issues']:
-                targets = [item['beat']] if 'beat' in item else [i for i,b in enumerate(plan.clips[0].beats) if b.mode=='narration']
-                for index in targets:
-                    row = timing['beats'][index]
-                    issues.append({'id':f'beat-{index}', 'message':item['message'], 'measurement':row})
+            issues=(commentary_balance_issues(plan.clips[0],cfg,timing,lines,llm,root)
+                    if all(i.get('code')=='duration_short' for i in timing['issues']) else [])
+            category='commentary' if issues else 'timing'
+            if not issues:
+                for item in timing['issues']:
+                    targets = [item['beat']] if 'beat' in item else [i for i,b in enumerate(plan.clips[0].beats) if b.mode=='narration']
+                    for index in targets:
+                        row = timing['beats'][index]
+                        issues.append({'id':f'beat-{index}', 'message':item['message'], 'measurement':row})
         else:
             category = 'content'
             issues=commentary_balance_issues(plan.clips[0],cfg,timing,lines,llm,root)
@@ -259,6 +261,8 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
                             # Structural edits change paragraph numbers. Re-review
                             # the result before using any old narration findings.
                             issues=[i for i in issues if i['stage']=='selection_review']
+                        elif issues:
+                            category='editorial'
                         report['passed']=narrative['passed']
                         report['issues']=issues
                         write_json(root/'automatic-review.json',report)
@@ -296,7 +300,7 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
             write_json(root/f'partial-repair-{attempt}.json',{'plan':plan.model_dump(),'pending':exc.report['issues'],
                 'status':'requires_full_measurement_and_review'})
         validate_plan(plan,lines,duration(video),1,cfg.target_seconds,cfg.min_seconds,cfg.max_seconds,cfg.opening,
-            check_duration=category!='selection')
+            check_duration=category not in {'selection','editorial','commentary'})
         if validate_clip:
             validate_clip(plan.clips[0])
     raise ValueError('自动修复达到上限，本集未通过：'+json.dumps(issues,ensure_ascii=False)[:1800])

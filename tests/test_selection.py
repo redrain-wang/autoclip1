@@ -154,6 +154,6 @@ def test_pipeline_remeasures_reaudits_and_rechecks_selection_after_drop(tmp_path
     final,report=module.complete_long_plan(tmp_path/'source.mp4',plan,lines,{},tmp_path,cfg,Model())
     assert report['passed'] and len(final.clips[0].beats)==31
     assert len(measurements)==len(audits)==len(heard)==2
-    assert read_json(tmp_path/'repair-budget.json')['used']=={'timing':0,'content':0,'selection':1,'commentary':0}
+    assert read_json(tmp_path/'repair-budget.json')['used']=={'timing':0,'content':0,'selection':1,'commentary':0,'editorial':0}
     assert read_json(tmp_path/'pending-repair.json')['status']=='requires_full_measurement_and_review'
     require_commentary_review(report['narrative_review'],final.clips[0])
