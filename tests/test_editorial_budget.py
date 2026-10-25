@@ -129,6 +129,7 @@ def test_verified_editorial_condensation_can_create_a_temporary_global_deficit(t
     class Picker:
         def json(self,*args):return {'choices':[{'beat':1,'reason':'主要交锋还需讲清约束','evidence_ids':[2,3]}]}
     monkeypatch.setattr(series,'measure_sample_plan',measure)
+    monkeypatch.setattr(series,'review_commentary',lambda clip,*a,**k:whole_report(clip,[]))
     monkeypatch.setattr(series,'audit_plan',lambda *a:pytest.fail('未补足前不能宣布进入最终审核通过'))
     with pytest.raises(ValueError,match='自动修复达到上限'):
         series.complete_long_plan(video,revised,lines,{},tmp_path,cfg.model_copy(update={'repair_attempts':0}),Picker())

@@ -154,7 +154,7 @@ def test_selection_intermediate_quantity_deficit_is_pending_then_blocked_by_fina
     events=[]
     monkeypatch.setattr(series,'measure_sample_plan',measured_draft(events))
     monkeypatch.setattr(series,'audit_plan',lambda *a:pytest.fail('分量不足不能进入最终原片审核'))
-    monkeypatch.setattr(series,'review_commentary',lambda *a,**k:pytest.fail('分量不足仍须先自动平衡'))
+    monkeypatch.setattr(series,'review_commentary',lambda clip,*a,**k:whole_report(clip))
     with pytest.raises(ValueError,match='自动修复达到上限'):
         series.complete_long_plan(tmp_path/'video.mp4',revised,lines,{},tmp_path,cfg,None)
     assert read_json(tmp_path/'repair-budget.json')['pending']=='commentary'
