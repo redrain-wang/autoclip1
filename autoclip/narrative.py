@@ -242,6 +242,9 @@ def verify_editorial_patch(clip, index, issues, lines, llm, root, *, retries=0):
         '若要求去重，换词缩写但仍逐句预告或复述相邻原声，仍未解决；保留必要一句提示可以。'
         '若要求衔接，必须实际交代切换关系；字数长短不能代替判断。'
         '编辑意见也可能误读原片顺序，须对照source_context；不能为迎合错误意见而重排真实事件。'
+        '修订方向提到的人名、关系和因果也不是已核实事实；source_context不支持时，'
+        '不能以“未照方向保留这些分析”为由要求作者补回。删去无据分析、只留必要的有据承接，'
+        '仍可解决当前去重或衔接问题；全片分析分量另行检查，不强迫这一短段凑分析。'
         'resolved=false时remaining_quote必须逐字引用当前target仍有问题的原句；'
         'resolved=true时remaining_quote必须为空。只核当前修订，不复制已被删除的旧句。'
         '\n格式'+json.dumps(EditorialPatchReview.model_json_schema(),ensure_ascii=False)
