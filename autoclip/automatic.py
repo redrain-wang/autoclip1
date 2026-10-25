@@ -1230,6 +1230,7 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                 review_transcript_rows([s for s in lines if s.id in eligible]),
                 review_voice_rows([r for r in voices.get('lines',[]) if r['line_id'] in eligible]))
         feedback = ''
+        failed_patches = []
         for retry in range(cfg.repair_attempts+1):
             print(f'局部修稿：{label}，第{retry+1}/{cfg.repair_attempts+1}次修订',flush=True)
             writer=(lambda *args:review_json(llm,*args)) if retry else llm.json
@@ -1295,6 +1296,7 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                 break
             except ValueError as exc:
                 write_json(record,{'raw':raw,'error':str(exc)})
+                failed_patches.append({'attempt':retry+1,'error':str(exc)[:1800],'patch':raw})
                 if retry == cfg.repair_attempts:
                     fallback = retain_short_source_audio(revised,uid,lines,cfg,source_seconds)
                     if fallback is not None:
@@ -1323,7 +1325,11 @@ def repair_plan(plan, issues, lines, voices, root, cfg, llm, attempt, *, source_
                     failed.extend({**i,'code':'voice_alignment' if i.get('measurement') else 'semantic_review',
                         'message':i['message']+'；局部修订未完成：'+str(exc)} for i in issues if i['id']==uid)
                     break
-                feedback = f'\n上轮局部修订未通过程序检查（第{retry+1}次）：'+str(exc)[:1800]+'\n上轮修订：'+json.dumps(raw,ensure_ascii=False)+'\n只返回当前target的合法修改，不能换段、清空口播、变更mode或突破原片时间线。'
+                feedback = ('\n上轮局部修订未通过程序检查；此前所有失败稿与原因：'
+                    +json.dumps(failed_patches,ensure_ascii=False)
+                    +'\n同时解决仍成立的全部问题，不能改回更早已被否决的版本。编辑方向不是已核实事实，'
+                     '不得照抄其中被原片核验否决的姓名、动作或未来信息；必要时用有据的简洁承接。'
+                     '只返回当前target的合法修改，不能换段、清空口播、变更mode或突破原片时间线。')
         if accepted:
             write_json(root/'pending-repair.json',{'base_plan_digest':digest(plan.model_dump()),
                 'voice_digest':digest(voices),'plan':revised.model_dump(),

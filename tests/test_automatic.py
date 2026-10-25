@@ -846,6 +846,26 @@ def test_local_repair_rejects_process_language_without_blocking_other_pending_un
     assert '制作或审查话术' in read_json(tmp_path/'automatic-repairs/0/beat-1/attempt-0.json')['error']
 
 
+def test_local_writer_keeps_all_prior_rejection_reasons_instead_of_oscillating(tmp_path):
+    plan=sample_plan();before=plan.model_dump()
+    class Model:
+        calls=0
+        def json(self,system,prompt):
+            self.calls+=1
+            if self.calls==1:return {'changes':[{'id':'beat-99','text':'换错了段落'}]}
+            if self.calls==2:return {'changes':[{'id':'beat-1','text':'字幕里说，这事没弄明白。'}]}
+            assert '单段修订id必须是beat-1' in prompt
+            assert '制作或审查话术' in prompt
+            assert '换错了段落' in prompt and '字幕里说，这事没弄明白。' in prompt
+            return {'changes':[{'id':'beat-1','text':'他仍不明白这次来意。'}]}
+    model=Model()
+    revised=repair_plan(plan,[{'id':'beat-1','message':'修正当前段落'}],[],{},tmp_path,
+                        Settings(repair_attempts=2),model,0)
+    assert model.calls==3 and revised.clips[0].beats[1].text=='他仍不明白这次来意。'
+    assert plan.model_dump()==before and revised.clips[0].beats[2:]==plan.clips[0].beats[2:]
+    assert not (tmp_path/'plan-approved.json').exists()
+
+
 def test_supported_model_verdict_cannot_approve_production_language(tmp_path,monkeypatch):
     import json
     import autoclip.automatic as module
