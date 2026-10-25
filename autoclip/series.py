@@ -186,14 +186,40 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
     issues = []
     repairs = {'timing':0, 'content':0}
     if formal_long(cfg):repairs.update(selection=0,commentary=0,editorial=0)
+    # A new finding on a different shot must not inherit an unrelated shot's
+    # exhausted allowance. Bind local allowances to the source ranges present
+    # at entry, so trimming, splitting and renumbering do not reset them.
+    anchors=[(b.start,b.end) for b in plan.clips[0].beats]
+    target_repairs={}
+    local_categories={'timing','content','selection','editorial'} if formal_long(cfg) else set()
+    def repair_targets(category,issues):
+        targets=set()
+        for issue in issues:
+            uid=issue['id']
+            if uid.startswith(('beat-','original-')):
+                beat=plan.clips[0].beats[int(uid.split('-')[1])]
+                overlaps=[max(0.,min(beat.end,b)-max(beat.start,a)) for a,b in anchors]
+                if max(overlaps,default=0)<=0:
+                    raise ValueError('修订目标已超出原稿素材范围，不能重置修订次数')
+                uid=f'source-{max(range(len(anchors)),key=overlaps.__getitem__)}'
+            targets.add(f'{category}:{uid}')
+        return targets
+    def save_repair_budget(pending):
+        data={'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':pending}
+        if local_categories:
+            data.update(local_categories=sorted(local_categories),used_per_target=target_repairs,
+                        limit_per_target=cfg.repair_attempts,source_anchors=anchors)
+        write_json(root/'repair-budget.json',data)
     def pending_timing(report):
         # Finish removing redundancy before filling a temporary duration deficit.
         # Per-shot alignment and the upper duration bound still need repair.
         return [i for i in report['issues'] if not (formal_long(cfg) and i.get('code')=='duration_short')]
     reviewed_failures=set()
     # TTS alignment must not consume the later factual repair allowance.
-    # Each category remains bounded, including regressions after a content edit.
-    for attempt in range(len(repairs)*cfg.repair_attempts+2):
+    # Every original shot has a finite allowance in each local category;
+    # whole-film commentary balancing retains its separate global allowance.
+    allowances=(1+len(local_categories)*(len(anchors)+3)) if local_categories else len(repairs)
+    for attempt in range(allowances*cfg.repair_attempts+2):
         write_json(root/f'plan-attempt-{attempt}.json',plan.model_dump())
         write_json(root/'plan.json',plan.model_dump())
         timing = measure_sample_plan(video,root/'plan.json',root/'transcript.json',cfg,root)
@@ -282,7 +308,7 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
                         require_commentary_review(narrative,plan.clips[0])
                         report={**report,'narrative_review':narrative}
                         write_json(root/'automatic-review.json',report)
-                    write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':None})
+                    save_repair_budget(None)
                     write_json(root/'plan-approved.json',plan.model_dump())
                     return plan, report
         write_json(root/f'issues-{attempt}.json',issues)
@@ -291,11 +317,15 @@ def complete_long_plan(video, plan, lines, voices, root, cfg, llm, validate_clip
             raise ValueError('自动修复没有推进：同一稿件重复出现相同问题，停止重复请求；'
                 +json.dumps(issues,ensure_ascii=False)[:1500])
         reviewed_failures.add(failure)
-        write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':category})
-        if repairs[category] >= cfg.repair_attempts:
+        save_repair_budget(category)
+        targets=repair_targets(category,issues) if category in local_categories else set()
+        exhausted=(any(target_repairs.get(uid,0)>=cfg.repair_attempts for uid in targets)
+                   if targets else repairs[category]>=cfg.repair_attempts)
+        if exhausted:
             break
         repairs[category] += 1
-        write_json(root/'repair-budget.json',{'used':repairs,'limit_per_category':cfg.repair_attempts,'pending':category})
+        for uid in targets:target_repairs[uid]=target_repairs.get(uid,0)+1
+        save_repair_budget(category)
         try:
             if category=='selection':
                 from .selection import repair_original_selection
